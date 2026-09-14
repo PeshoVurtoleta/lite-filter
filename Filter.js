@@ -45,15 +45,32 @@
  * -- fpp() reports the plain closed-form as a labeled FLOOR and the bench prints the two
  * members side by side (query ns down, FPR up). No "same fpp for free" claim.
  *
+ * The 4th member -- `Cuckoo` (Fan, Andersen, Kaminsky & Mitzenmacher, "Cuckoo Filter:
+ * Practically Better Than Bloom", CoNEXT 2014) -- stores a small nonzero FINGERPRINT per
+ * key in one of TWO candidate buckets of b=4 slots each, chosen by partial-key cuckoo
+ * hashing: `i1 = hash(key) & (nb-1)`, `i2 = (i1 XOR hash(fp)) & (nb-1)` (an INVOLUTION --
+ * `i1 = (i2 XOR hash(fp)) & (nb-1)` -- so an evicted fingerprint finds its alternate
+ * bucket from the fingerprint alone). add scans i1 then i2 for an empty slot; on a full
+ * pair it KICKS a random victim to its alternate bucket up to 500 times using a SINGLE
+ * scalar victim register (no scratch array). It DELETES (remove -> boolean) and its FPR
+ * is width-quantized to ~2b/2^f (decisions/0014). Two honest fail-closed rulings: an
+ * insert that exhausts 500 kicks THROWS (the table is at capacity -- fail closed, never a
+ * silent drop, decisions/0014), and deleting a NEVER-INSERTED key whose fingerprint
+ * collides removes a DIFFERENT real key's fingerprint -> a false negative for that key
+ * (decisions/0015). Fingerprint 0 is the empty-slot sentinel; the fingerprint hash never
+ * emits 0. The store is ONE `Uint8Array` (f<=8) or `Uint16Array` (9..16 bits) of nb*b
+ * slots, sized once and reused; clear() zeroes it in place.
+ *
  * Design decisions live in decisions/ (0001 hashing; 0002 sizing; 0003 remove +
  * count; 0004 fpp; 0005 snapshot; 0006 deferred static-build API; 0007 counter
  * width; 0008 saturation; 0009 remove caveat; 0010 count deferred; 0011 CBF
- * snapshot; 0012 block size; 0013 FPR locality) and are summarized in ROADMAP.md.
+ * snapshot; 0012 block size; 0013 FPR locality; 0014 Cuckoo sizing/overload; 0015
+ * Cuckoo delete caveat) and are summarized in ROADMAP.md.
  *
  * @license MIT
  */
 
-export const VERSION = "0.3.0";
+export const VERSION = "0.4.0";
 
 /* -------------------------------------------------------------------------- *
  * Constants + fail-closed messages (built ONCE, thrown only on misuse).
@@ -113,6 +130,40 @@ const BB_REMOVE_MSG =
     "[lite-filter] BlockedBloom is add-only and cannot remove(); clearing bits would " +
     "cause false negatives for other keys. Use a deletable member (Counting Bloom / " +
     "Cuckoo) when the roster ships one.";
+
+/** Cuckoo bucket size b (decisions/0014): 4 slots per bucket, PINNED (not configurable).
+ *  b=4 is the classic Cuckoo-filter sweet spot -- it reaches ~95% load before insert
+ *  failures while keeping the fingerprint width (and thus the FPR) small. */
+const CUCKOO_B = 4;
+
+/** Cuckoo maximum eviction chain length (decisions/0014): 500 kicks, PINNED. Beyond this
+ *  the table is treated as full and add() throws (fail closed). 500 is the reference
+ *  ceiling from Fan et al. 2014 -- long enough that a real insert almost never hits it
+ *  below the load target, short enough that a genuinely full table fails fast. */
+const CUCKOO_KICKS = 500;
+
+/** Cuckoo load target for bucket-count derivation (decisions/0014): 0.95. The bucket
+ *  count is ceil(capacity / (b * load)) rounded UP to a power of two, so the REAL slot
+ *  capacity is nb*b >= capacity/0.95 -- headroom before the kick ceiling bites. */
+const CUCKOO_LOAD = 0.95;
+
+/** Fail-closed message when the requested fpp needs a fingerprint wider than 16 bits
+ *  (decisions/0014). f = ceil(log2(2b/fpp)) = ceil(log2(8/fpp)) at b=4; f>16 means
+ *  fpp < 8/65536. Built once, thrown only at construction. */
+const CUCKOO_FPP_MSG =
+    "[lite-filter] Cuckoo fpp too small: the derived fingerprint width would exceed 16 " +
+    "bits; the smallest supported fpp at b=4 (16-bit fingerprints) is 8/65536 " +
+    "(~0.000122). Raise the fpp, or use a space-optimal static member (XOR / Binary " +
+    "Fuse) when the roster ships one.";
+
+/** Fail-closed message when an insert exhausts CUCKOO_KICKS evictions (decisions/0014).
+ *  The table is at capacity (load factor too high); add() THROWS rather than silently
+ *  dropping the fingerprint (which would be a false negative). Built once, thrown only on
+ *  a genuinely full table. */
+const CUCKOO_FULL_MSG =
+    "[lite-filter] Cuckoo insert failed after 500 kicks: the filter is at capacity (load " +
+    "factor too high). Raise the capacity (size up) -- the overload is FAIL-CLOSED, never " +
+    "a silent drop. Observe headroom via size vs capacity before it bites.";
 
 /** Default target false-positive probability when the caller omits `fpp`
  *  (decisions/0002): the textbook 1% baseline. Explicit and documented, never a
@@ -206,6 +257,57 @@ function sizeFor(n, fpp) {
     let k = Math.round((m / n) * LN2);
     if (k < 1) k = 1;
     return { m: m, k: k };
+}
+
+/**
+ * Derive the Cuckoo geometry for a target (n, fpp) (decisions/0014). Cold -- called ONCE
+ * per constructor, never on a hot path. Three fail-closed doors and two derivations:
+ *
+ *   - fingerprint width  f  = ceil(log2(2b/fpp)) = ceil(log2(8/fpp)) at b=4, then BYTE-
+ *     ALIGNED UP: f<=8 -> an 8-bit store, 9..16 -> a 16-bit store. f>16 (fpp < 8/65536)
+ *     throws (the store never widens past 16 bits). `bits` is the store element width.
+ *   - bucket count       nb = ceil(n / (b * load)) rounded UP to a power of two, so the
+ *     index math is a `& (nb-1)` mask and the alt-bucket XOR is an involution. The REAL
+ *     slot capacity is nb*b >= n/load (headroom before the 500-kick ceiling bites).
+ *
+ * Returns a plain `{ f, bits, nb }` (cold path -- allocation here never runs on add/query).
+ */
+function cuckooSizeFor(n, fpp) {
+    if (!Number.isInteger(n) || n < 1) {
+        throw new RangeError(
+            "[lite-filter] capacity must be an integer >= 1, got " + String(n));
+    }
+    if (typeof fpp !== "number" || !(fpp > 0) || !(fpp < 1)) {
+        throw new RangeError(
+            "[lite-filter] fpp must be a number in the open interval (0, 1), got " + String(fpp));
+    }
+    // Fingerprint width from the target FPR (~2b/2^f), byte-aligned UP. Fail closed when
+    // the width would exceed the 16-bit store (fpp < 8/65536); null is not zero.
+    let f = Math.ceil(Math.log2((2 * CUCKOO_B) / fpp));
+    if (f < 1) f = 1;
+    if (f > 16) {
+        throw new RangeError(CUCKOO_FPP_MSG);
+    }
+    const bits = f <= 8 ? 8 : 16;
+    // Bucket count: pow2 >= ceil(n / (b * load)). Rounding UP to a power of two makes the
+    // bucket index a mask and keeps the alt-bucket XOR an involution (decisions/0014).
+    // The largest bucket count whose store (nb*b slots) stays within a safe typed-array
+    // length is 2^28 (2^28 * 4 = 0x40000000 <= 0x7fffffff); any request needing more is
+    // rejected BEFORE the doubling loop, so the count is derived entirely in the Number
+    // domain and can never 32-bit-overflow into an infinite loop (null is not zero -- an
+    // unsized filter is never valid). Mirrors the other members' "too large" doors.
+    const MAX_NB = 0x10000000; // 2^28 buckets -> nb*b = 0x40000000 slots (fits Uint*Array)
+    const need = Math.ceil(n / (CUCKOO_B * CUCKOO_LOAD));
+    if (!Number.isFinite(need) || need > MAX_NB) {
+        throw new RangeError(
+            "[lite-filter] requested Cuckoo filter is too large (needs ~" + String(need) +
+            " buckets, max " + MAX_NB + "); lower the capacity or raise the fpp");
+    }
+    // Number-domain doubling (never `<<`, which would wrap at 2^31): `need <= 2^28` here, so
+    // this runs at most 28 iterations and `nb` stays an exact power-of-two safe integer.
+    let nb = 1;
+    while (nb < need) nb *= 2;
+    return { f: f, bits: bits, nb: nb };
 }
 
 /* -------------------------------------------------------------------------- *
@@ -1161,6 +1263,411 @@ export class BlockedBloom {
             }
         }
         for (let i = 0; i < bits.length; i++) inst._words[i] = bits[i];
+        inst._count = snap.count;
+        return inst;
+    }
+}
+
+/* -------------------------------------------------------------------------- *
+ * Cuckoo -- the space-lean deletable member (decisions/0014, 0015). A partial-key
+ * cuckoo hash table of b=4-slot buckets, each slot holding a small NONZERO fingerprint
+ * (0 = empty). A key lives in ONE of two candidate buckets:
+ *     i1 = hash(key) & (nb-1)
+ *     fp = nonzero fingerprint(key)
+ *     i2 = (i1 XOR hash(fp)) & (nb-1)     -- an INVOLUTION: i1 = (i2 XOR hash(fp)) & mask
+ * so an evicted fingerprint recovers its alternate bucket from the fingerprint alone --
+ * no key needed. add scans i1 then i2 for an empty slot; a full pair KICKS a random
+ * victim to its alternate bucket up to 500 times via a SINGLE scalar victim register
+ * (no scratch array, zero allocation). It DELETES (remove -> boolean). Two honest
+ * fail-closed rulings: 500 exhausted kicks THROW (at capacity, never a silent drop --
+ * decisions/0014), and deleting a NEVER-INSERTED key whose fingerprint collides removes
+ * a DIFFERENT real key's fingerprint -> a false negative for that key (decisions/0015).
+ * The FPR is width-quantized to ~2b/2^f, typically BELOW the configured target because f
+ * is byte-aligned UP (the family's measure-vs-configured honesty hook).
+ * -------------------------------------------------------------------------- */
+
+export class Cuckoo {
+    /**
+     * @param {number} capacity  Items the filter is sized for. Integer >= 1.
+     * @param {{ fpp?: number, seed?: number, keys?: 'int', stats?: boolean }} [options]
+     */
+    constructor(capacity, options) {
+        // Cold sizing door: fail closed on every impossible request (decisions/0014).
+        const fpp = (options && options.fpp !== undefined) ? options.fpp : DEFAULT_FPP;
+        const dims = cuckooSizeFor(capacity, fpp);
+
+        this._cap = capacity;              // items sized for (the configured capacity)
+        this._fpp = fpp;                   // the CONFIGURED target fpp (decisions/0004)
+        this._f = dims.f;                  // fingerprint width in bits (derived, 1..16)
+        this._b = CUCKOO_B;                // bucket size (4, pinned)
+        this._nb = dims.nb;                // bucket count (power of two)
+        this._mask = dims.nb - 1;          // bucket-index mask (nb is a power of two)
+        this._fpMask = (1 << dims.f) - 1;  // fingerprint value mask ((1<<f)-1)
+
+        this._int = validateKeys(options && options.keys);
+        this._seed = validateSeed(options && options.seed);
+        this._seed2 = fmix32(this._seed ^ 0x9e3779b9);
+
+        // The ONE preallocated fingerprint store: nb*b slots, 8-bit or 16-bit per the
+        // derived width. Slot value 0 is the empty sentinel (decisions/0014). Sized once
+        // and reused forever; clear() zeroes it in place -- same ArrayBuffer identity.
+        this._store = dims.bits <= 8
+            ? new Uint8Array(dims.nb * CUCKOO_B)
+            : new Uint16Array(dims.nb * CUCKOO_B);
+
+        // Presence counter (decisions/0003): net add() minus successful remove(). It
+        // equals the number of NONZERO slots exactly (each add stores one fingerprint,
+        // each remove clears one), so validateCuckoo can cross-check it.
+        this._count = 0;
+
+        // Kick PRNG state (deterministic from the seed): a zero-alloc xorshift32 advanced
+        // in place on the eviction path. Never touches the direct-insert hot path.
+        this._rng = ((this._seed ^ 0x2545f491) >>> 0) || 1;
+
+        // Preallocated eviction-chain trail (decisions/0014): the absolute slot index each
+        // of the up-to-500 kicks touched. Sized ONCE, reused forever, written only while
+        // kicking (zero allocation). It lets an OVERLOADED add UNWIND the chain back to the
+        // exact pre-add state before it throws, so a failed add mutates NOTHING -- no
+        // existing fingerprint is dropped (the no-false-negative guarantee holds even on
+        // overflow). Never touched by the direct-insert path.
+        this._kickPath = new Uint32Array(CUCKOO_KICKS);
+
+        // Opt-in stats (decisions/0004): null when off so the hot path writes NOTHING.
+        this._stats = validateStats(options && options.stats);
+    }
+
+    get size() { return this._count; }
+    get count() { return this._count; }
+    get capacity() { return this._cap; }
+
+    // --- hot path (zero allocation; strict on keys:'int') ---------------------
+
+    /**
+     * Record a key (decisions/0014). Computes a nonzero fingerprint and two candidate
+     * buckets, scans i1 then i2 for an empty slot, and on a full pair KICKS a random
+     * victim to its alternate bucket up to 500 times using a SINGLE scalar victim register
+     * (no scratch array -- zero allocation on the int + string paths). If 500 kicks are
+     * exhausted the table is at capacity and this THROWS (fail closed -- never a silent
+     * drop, decisions/0014). Uniform surface: `add(key) -> void`, headroom via size/capacity.
+     */
+    add(key) {
+        let a, fpsrc;
+        if (this._int) {
+            if (!Number.isInteger(key) || key < INT_MIN || key > INT_MAX) {
+                throw new TypeError(INT_KEY_MSG + String(key));
+            }
+            a = fmix32((key ^ this._seed) | 0);
+            fpsrc = fmix32((Math.imul(key | 0, 0x9e3779b1) ^ this._seed2) | 0);
+        } else {
+            a = this._hashKey(key);
+            fpsrc = fmix32(a ^ this._seed2);
+        }
+        const store = this._store;
+        const mask = this._mask;
+        // Nonzero fingerprint: 0 is the empty-slot sentinel, so map 0 -> 1 (decisions/0014).
+        let fp = fpsrc & this._fpMask;
+        if (fp === 0) fp = 1;
+        const hf = fmix32(Math.imul(fp, 0x5bd1e995));   // hash(fp) for the alt-bucket XOR
+        const i1 = a & mask;
+        const i2 = (i1 ^ hf) & mask;
+
+        // Direct insert: scan i1 then i2 for an empty (0) slot. b=4 unrolled, no loop var.
+        let base = i1 << 2;
+        if (store[base] === 0) { store[base] = fp; this._count++; if (this._stats !== null) this._stats.adds++; return; }
+        if (store[base + 1] === 0) { store[base + 1] = fp; this._count++; if (this._stats !== null) this._stats.adds++; return; }
+        if (store[base + 2] === 0) { store[base + 2] = fp; this._count++; if (this._stats !== null) this._stats.adds++; return; }
+        if (store[base + 3] === 0) { store[base + 3] = fp; this._count++; if (this._stats !== null) this._stats.adds++; return; }
+        base = i2 << 2;
+        if (store[base] === 0) { store[base] = fp; this._count++; if (this._stats !== null) this._stats.adds++; return; }
+        if (store[base + 1] === 0) { store[base + 1] = fp; this._count++; if (this._stats !== null) this._stats.adds++; return; }
+        if (store[base + 2] === 0) { store[base + 2] = fp; this._count++; if (this._stats !== null) this._stats.adds++; return; }
+        if (store[base + 3] === 0) { store[base + 3] = fp; this._count++; if (this._stats !== null) this._stats.adds++; return; }
+
+        // Both buckets full: KICK. A single scalar `victim` register carries the displaced
+        // fingerprint; xorshift32 picks the eviction bucket and slot. Each kick is a SWAP of
+        // store[idx] with `victim`; the touched slot indices are trailed in _kickPath so the
+        // chain can be unwound if the insert fails. No scratch ALLOCATION (kickPath is
+        // preallocated); the direct-insert path above never records.
+        const kickPath = this._kickPath;
+        let r = this._rng;
+        let i = (r & 1) ? i2 : i1;
+        let victim = fp;
+        for (let n = 0; n < CUCKOO_KICKS; n++) {
+            r ^= r << 13; r >>>= 0;
+            r ^= r >> 17;
+            r ^= r << 5; r >>>= 0;
+            const idx = (i << 2) + (r & 3);   // absolute slot to evict from bucket i
+            kickPath[n] = idx;                // trail it for a possible unwind
+            const e = store[idx];             // evict a random occupant
+            store[idx] = victim;              // place the carried fingerprint (bucket i is its candidate)
+            victim = e;                       // now carry the evicted one
+            // The evicted fingerprint was in bucket i, so its alternate is (i XOR hash(fp)).
+            const vf = fmix32(Math.imul(victim, 0x5bd1e995));
+            i = (i ^ vf) & mask;
+            const b2 = i << 2;
+            if (store[b2] === 0) { store[b2] = victim; this._rng = r; this._count++; if (this._stats !== null) this._stats.adds++; return; }
+            if (store[b2 + 1] === 0) { store[b2 + 1] = victim; this._rng = r; this._count++; if (this._stats !== null) this._stats.adds++; return; }
+            if (store[b2 + 2] === 0) { store[b2 + 2] = victim; this._rng = r; this._count++; if (this._stats !== null) this._stats.adds++; return; }
+            if (store[b2 + 3] === 0) { store[b2 + 3] = victim; this._rng = r; this._count++; if (this._stats !== null) this._stats.adds++; return; }
+        }
+        // 500 kicks exhausted: the table is at capacity. UNWIND the eviction chain to the
+        // EXACT pre-add state, then fail closed (decisions/0014). Each kick was a swap of
+        // store[idx] with the carried victim; replaying the swaps in REVERSE order restores
+        // every touched slot (correct even when a slot was touched more than once) and
+        // leaves `victim` == the new fp -- unplaced and dropped. A thrown add therefore
+        // mutates NOTHING: no existing fingerprint is lost, so no previously-added key can
+        // read false. This is the aborting cold path (extra work here is free of the hot
+        // path). count is untouched (only successful placement increments it).
+        for (let n = CUCKOO_KICKS - 1; n >= 0; n--) {
+            const idx = kickPath[n];
+            const tmp = store[idx];
+            store[idx] = victim;
+            victim = tmp;
+        }
+        this._rng = r;
+        throw new Error(CUCKOO_FULL_MSG);
+    }
+
+    /**
+     * The query (decisions/0014). Returns true iff the key's fingerprint is present in
+     * either candidate bucket. One-sided: NO false negatives for a key that is currently
+     * present (decisions/0015 states the delete-misuse exception), only false POSITIVES
+     * bounded by ~2b/2^f. Zero allocation on the int + string paths; b=4 slots unrolled.
+     */
+    mightContain(key) {
+        let a, fpsrc;
+        if (this._int) {
+            if (!Number.isInteger(key) || key < INT_MIN || key > INT_MAX) {
+                throw new TypeError(INT_KEY_MSG + String(key));
+            }
+            a = fmix32((key ^ this._seed) | 0);
+            fpsrc = fmix32((Math.imul(key | 0, 0x9e3779b1) ^ this._seed2) | 0);
+        } else {
+            a = this._hashKey(key);
+            fpsrc = fmix32(a ^ this._seed2);
+        }
+        const store = this._store;
+        const mask = this._mask;
+        let fp = fpsrc & this._fpMask;
+        if (fp === 0) fp = 1;
+        const hf = fmix32(Math.imul(fp, 0x5bd1e995));
+        const i1 = a & mask;
+        const i2 = (i1 ^ hf) & mask;
+        const b1 = i1 << 2;
+        const b2 = i2 << 2;
+        const hit =
+            store[b1] === fp || store[b1 + 1] === fp || store[b1 + 2] === fp || store[b1 + 3] === fp ||
+            store[b2] === fp || store[b2 + 1] === fp || store[b2 + 2] === fp || store[b2 + 3] === fp;
+        if (this._stats !== null) {
+            this._stats.queries++;
+            if (hit) this._stats.hits++; else this._stats.misses++;
+        }
+        return hit;
+    }
+
+    /** The SOLE alias of `mightContain` (decisions/0003), same one-sided semantics. */
+    has(key) { return this.mightContain(key); }
+
+    /**
+     * Delete a key (decisions/0014, 0015). Scans both candidate buckets for the key's
+     * fingerprint and clears the FIRST matching slot (0 = empty), returning true; returns
+     * false and mutates NOTHING if no slot matches. Zero allocation; b=4 slots unrolled.
+     *
+     * CAVEAT (decisions/0015): deleting a NEVER-INSERTED key whose fingerprint COLLIDES
+     * with a real key (same fingerprint, sharing a candidate bucket) will clear the REAL
+     * key's slot -> a later FALSE NEGATIVE for that other key. Only remove keys you
+     * actually inserted. This is sharper than a Bloom-family remove: a Cuckoo delete does
+     * not just decrement a shared counter, it removes a concrete fingerprint instance.
+     */
+    remove(key) {
+        let a, fpsrc;
+        if (this._int) {
+            if (!Number.isInteger(key) || key < INT_MIN || key > INT_MAX) {
+                throw new TypeError(INT_KEY_MSG + String(key));
+            }
+            a = fmix32((key ^ this._seed) | 0);
+            fpsrc = fmix32((Math.imul(key | 0, 0x9e3779b1) ^ this._seed2) | 0);
+        } else {
+            a = this._hashKey(key);
+            fpsrc = fmix32(a ^ this._seed2);
+        }
+        const store = this._store;
+        const mask = this._mask;
+        let fp = fpsrc & this._fpMask;
+        if (fp === 0) fp = 1;
+        const hf = fmix32(Math.imul(fp, 0x5bd1e995));
+        const i1 = a & mask;
+        const i2 = (i1 ^ hf) & mask;
+        let base = i1 << 2;
+        if (store[base] === fp) { store[base] = 0; this._count--; return true; }
+        if (store[base + 1] === fp) { store[base + 1] = 0; this._count--; return true; }
+        if (store[base + 2] === fp) { store[base + 2] = 0; this._count--; return true; }
+        if (store[base + 3] === fp) { store[base + 3] = 0; this._count--; return true; }
+        base = i2 << 2;
+        if (store[base] === fp) { store[base] = 0; this._count--; return true; }
+        if (store[base + 1] === fp) { store[base + 1] = 0; this._count--; return true; }
+        if (store[base + 2] === fp) { store[base + 2] = 0; this._count--; return true; }
+        if (store[base + 3] === fp) { store[base + 3] = 0; this._count--; return true; }
+        return false;
+    }
+
+    /**
+     * Hash an arbitrary key to a 32-bit base (decisions/0001). A string hashes over its
+     * code units (alloc-free); any other type is `String()`-encoded first (the honest
+     * amortized caveat). Never called on the keys:'int' path.
+     */
+    _hashKey(key) {
+        if (typeof key === "string") return hashStr(key, this._seed);
+        return hashStr(String(key), this._seed);
+    }
+
+    // --- cold inspection ------------------------------------------------------
+
+    /**
+     * The false-positive probability (decisions/0004, 0014). Configured target while
+     * EMPTY; once keys are added it is the width-quantized closed form `2b/2^f` using the
+     * ACTUAL stored fingerprint width `f`. Because `f` is byte-aligned UP at construction,
+     * this is typically FAR BELOW the configured target -- the family's measure-vs-configured
+     * honesty hook, surfaced not hidden. It is a formula, NOT a measurement -- MEASURE with
+     * the bench (`npm run bench`). Cold, O(1). Unlike Bloom's it does not vary with fill:
+     * a Cuckoo's FPR is bounded by the fingerprint width, not the load factor.
+     */
+    fpp() {
+        if (this._count === 0) return this._fpp;
+        return (2 * this._b) / Math.pow(2, this._f);
+    }
+
+    /** Reset to empty. Allocates NOTHING: zeroes the existing fingerprint store in place,
+     *  so the ArrayBuffer identity is preserved. */
+    clear() {
+        this._store.fill(0);
+        this._count = 0;
+    }
+
+    // --- opt-in stats (decisions/0004) ----------------------------------------
+
+    /** The live per-instance counter holder BY REFERENCE. Requires `{ stats: true }`;
+     *  throws fail-closed otherwise (null is not zero). */
+    stats() {
+        if (this._stats === null) throw new Error(STATS_OFF_MSG);
+        return this._stats;
+    }
+
+    /** Zero the four counters IN PLACE. Requires `{ stats: true }`; else fail closed. */
+    resetStats() {
+        if (this._stats === null) throw new Error(STATS_OFF_MSG);
+        this._stats.adds = 0;
+        this._stats.queries = 0;
+        this._stats.hits = 0;
+        this._stats.misses = 0;
+    }
+
+    // --- snapshot / restore (decisions/0005, 0014) ----------------------------
+
+    /**
+     * Serialize to a plain, structurally-cloneable snapshot (decisions/0014). COLD -- never
+     * a hot path -- and MAY allocate. The fingerprint store IS the serial form, emitted as
+     * a plain Array (`fp`) so it round-trips through structuredClone AND JSON. `fw` records
+     * the fingerprint width in bits, `b` the bucket size (4), `nb` the bucket count. The
+     * fail-closed tag lets `restore()` reject any mismatch or corruption (REJECT, never
+     * truncate). NOTE: `f` is the shared FORMAT tag; the fingerprint WIDTH is `fw` (a
+     * separate field) to avoid colliding with it.
+     */
+    dump() {
+        return {
+            f: SNAP_TAG,
+            mem: "Cuckoo",
+            fw: this._f,
+            b: this._b,
+            nb: this._nb,
+            cap: this._cap,
+            fpp: this._fpp,
+            seed: this._seed,
+            keys: this._int ? "int" : null,
+            count: this._count,
+            fp: Array.from(this._store),
+        };
+    }
+
+    /**
+     * Reconstruct a FRESH Cuckoo from a snapshot (decisions/0014). Fail closed on ANY tag /
+     * member / fingerprint-width / bucket-size / bucket-count / capacity / fpp / seed / keys
+     * mismatch AND on a corrupt or wrong-length store OR an out-of-range / impossible
+     * fingerprint (REJECT, never truncate -- null is not zero). EVERY slot must be an
+     * integer in `0..fpMask` (0 = empty; a nonzero value must fit the width) BEFORE any
+     * instance is mutated: a coercion would silently turn a garbled value into a wrong
+     * fingerprint and cause a false negative. `opts` re-derives runtime-only options (stats);
+     * everything structural comes FROM the snapshot.
+     */
+    static restore(snap, opts) {
+        if (snap === null || typeof snap !== "object") {
+            throw new TypeError("[lite-filter] restore(snap): snapshot must be an object");
+        }
+        if (snap.f !== SNAP_TAG) {
+            throw new Error(
+                "[lite-filter] restore(): bad format tag " + String(snap.f) +
+                " (expected " + SNAP_TAG + ")");
+        }
+        if (snap.mem !== "Cuckoo") {
+            throw new Error(
+                "[lite-filter] restore(): member mismatch " + String(snap.mem) +
+                " (this is Cuckoo.restore)");
+        }
+        if (snap.b !== CUCKOO_B) {
+            throw new Error(
+                "[lite-filter] restore(): bucket-size mismatch " + String(snap.b) +
+                " (expected " + CUCKOO_B + ")");
+        }
+        if (!Number.isInteger(snap.seed) || snap.seed < 0 || snap.seed > 0xffffffff) {
+            throw new Error(
+                "[lite-filter] restore(): corrupt seed " + String(snap.seed) +
+                " (must be a 32-bit unsigned integer)");
+        }
+        if (snap.keys !== "int" && snap.keys !== null) {
+            throw new Error(
+                "[lite-filter] restore(): corrupt keys mode " + String(snap.keys) +
+                " (must be 'int' or null)");
+        }
+        const keys = snap.keys === "int" ? "int" : undefined;
+        const inst = new Cuckoo(snap.cap, {
+            fpp: snap.fpp,
+            seed: snap.seed,
+            keys: keys,
+            stats: opts && opts.stats,
+        });
+        if (snap.fw !== inst._f) {
+            throw new Error(
+                "[lite-filter] restore(): fingerprint-width mismatch (snapshot fw=" + String(snap.fw) +
+                ", derived f=" + inst._f + ")");
+        }
+        if (snap.nb !== inst._nb) {
+            throw new Error(
+                "[lite-filter] restore(): bucket-count mismatch (snapshot nb=" + String(snap.nb) +
+                ", derived nb=" + inst._nb + ")");
+        }
+        const fp = snap.fp;
+        if (!Array.isArray(fp) || fp.length !== inst._store.length) {
+            throw new Error(
+                "[lite-filter] restore(): corrupt fingerprint store (expected " + inst._store.length +
+                " slots, got " + (Array.isArray(fp) ? fp.length : String(fp)) + ")");
+        }
+        if (!Number.isInteger(snap.count) || snap.count < 0) {
+            throw new Error(
+                "[lite-filter] restore(): corrupt count " + String(snap.count));
+        }
+        // Validate EVERY slot BEFORE mutating (REJECT never truncate; null is not zero).
+        // A slot is 0 (empty) or a nonzero fingerprint in 1..fpMask; anything else is a
+        // corrupt or foreign store and is rejected rather than coerced to garbage.
+        const fpMask = inst._fpMask;
+        for (let i = 0; i < fp.length; i++) {
+            const v = fp[i];
+            if (!Number.isInteger(v) || v < 0 || v > fpMask) {
+                throw new Error(
+                    "[lite-filter] restore(): corrupt fingerprint at slot " + i + " (" + String(v) +
+                    "); each slot must be an integer in 0.." + fpMask);
+            }
+        }
+        for (let i = 0; i < fp.length; i++) inst._store[i] = fp[i];
         inst._count = snap.count;
         return inst;
     }

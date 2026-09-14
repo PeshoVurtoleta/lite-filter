@@ -202,3 +202,62 @@ export function validateBlockedLocality(filter) {
     }
     return block;
 }
+
+/**
+ * Assert the CONSERVATION invariant for a Cuckoo filter (test/debug only, O(slots)).
+ *
+ *   store.length === nb * b                     (nb buckets of b slots each)
+ *   nb is a power of two && nb >= 1             (the bucket index is a mask)
+ *   b === 4 && 1 <= f <= 16                     (pinned bucket size, valid width)
+ *   every slot is in 0..fpMask                  (0 = empty; a fingerprint fits the width)
+ *   count of NONZERO slots === count            (each add stores one fingerprint, each
+ *                                                remove clears one -- exact, not an estimate)
+ *
+ * The nonzero-slot / count equality is the teeth: a lost or duplicated fingerprint (a kick
+ * bug, a bad remove) breaks it immediately. "Every present key resolves in i1 or i2" is
+ * guaranteed by construction (kicks preserve candidacy) and proven at scale by the torture
+ * differential (0 false negatives), so it is not re-derived here. Throws an Error naming
+ * the first violation, or returns void.
+ */
+export function validateCuckoo(filter) {
+    const f = filter._f;
+    const b = filter._b;
+    const nb = filter._nb;
+    const store = filter._store;
+    const count = filter._count;
+    const fpMask = filter._fpMask;
+
+    if (b !== 4) {
+        throw new Error("[validate] Cuckoo bucket size b=" + b + " != 4 (pinned)");
+    }
+    if (!(f >= 1) || !(f <= 16)) {
+        throw new Error("[validate] Cuckoo fingerprint width f=" + f + " out of 1..16");
+    }
+    if (!(nb >= 1) || (nb & (nb - 1)) !== 0) {
+        throw new Error("[validate] Cuckoo bucket count nb=" + nb + " is not a power of two >= 1");
+    }
+    const expectedSlots = nb * b;
+    if (store.length !== expectedSlots) {
+        throw new Error(
+            "[validate] Cuckoo store length " + store.length + " != nb*b=" + expectedSlots);
+    }
+    if (fpMask !== (1 << f) - 1) {
+        throw new Error("[validate] Cuckoo fpMask " + fpMask + " != (1<<f)-1=" + ((1 << f) - 1));
+    }
+
+    let nonzero = 0;
+    for (let i = 0; i < store.length; i++) {
+        const v = store[i];
+        if (v < 0 || v > fpMask) {
+            throw new Error("[validate] Cuckoo slot " + i + " value " + v + " out of 0.." + fpMask);
+        }
+        if (v !== 0) nonzero++;
+    }
+    if (count < 0) {
+        throw new Error("[validate] negative count " + count);
+    }
+    if (nonzero !== count) {
+        throw new Error(
+            "[validate] Cuckoo nonzero-slot count " + nonzero + " != size " + count);
+    }
+}

@@ -52,8 +52,8 @@ async function main() {
         createOwnerCascadeOrphanKernel,
     } = await import("@zakkster/lite-leak");
     const { createRoot, effect, dispose } = await import("@zakkster/lite-signal");
-    const { Bloom, CountingBloom, BlockedBloom } = await import("../Filter.js");
-    const { validate, validateCounting, validateBlocked } = await import("./validate.mjs");
+    const { Bloom, CountingBloom, BlockedBloom, Cuckoo } = await import("../Filter.js");
+    const { validate, validateCounting, validateBlocked, validateCuckoo } = await import("./validate.mjs");
     const { differentialInt, differentialChurnInt } = await import("./torture/oracle.mjs");
 
     const SEED = (process.env.TORTURE_SEED >>> 0) || 0x1f2e3d4c;
@@ -97,6 +97,13 @@ async function main() {
                 h.add(i | 0);
                 h.mightContain(i | 0);
                 tracker.track(h, () => {}, "blocked-bloom", { audit: true });
+                // Cuckoo holds only a Uint8Array|Uint16Array -- same retention shape.
+                // Churn it through the SAME owner scope so a leak here surfaces too.
+                const c = new Cuckoo(1024, { keys: "int" });
+                c.add(i | 0);
+                c.mightContain(i | 0);
+                c.remove(i | 0);
+                tracker.track(c, () => {}, "cuckoo", { audit: true });
             });
             dispose(e); // disposing the owner untracks the filters -> collectable
         }
@@ -120,6 +127,11 @@ async function main() {
     // strictly zero-alloc (one block, odd-stride within-block walk, no scratch).
     const binst = new BlockedBloom(HOT_CAP, { keys: "int" });
     const bbufBefore = binst._words.buffer;
+    // Cuckoo steady-state instance: add / mightContain / remove all on the hot path, all
+    // strictly zero-alloc (two-bucket b=4 scan, single scalar victim register on kicks, no
+    // scratch array). add-then-remove each op keeps the table near-empty so no kick throws.
+    const kinst = new Cuckoo(HOT_CAP, { keys: "int" });
+    const kbufBefore = kinst._store.buffer;
 
     // The BREAK control: a retained sink the hot loop feeds one fresh object per op,
     // so heapUsed climbs and the major-GC / pause gate rejects the window.
@@ -139,6 +151,11 @@ async function main() {
         // BlockedBloom: add then query on the hot path, both zero-alloc on keys:'int'.
         binst.add(i & MASK);
         acc = (acc + (binst.mightContain((i * 2 + 1) & MASK) ? 1 : 0)) | 0;
+        // Cuckoo: add then query then remove the same key so the table stays near-empty
+        // (no kick throw) and all three hot paths run, each zero-alloc on keys:'int'.
+        kinst.add(i & MASK);
+        acc = (acc + (kinst.mightContain(i & MASK) ? 1 : 0)) | 0;
+        kinst.remove(i & MASK);
         if (BREAK) sink.push({ i: i, acc: acc }); // retained: MUST trip the gate
         if ((i & 8191) === 0) {
             gc.sampleHeap(performance.now(), process.memoryUsage().heapUsed);
@@ -157,12 +174,15 @@ async function main() {
     inst.clear();
     cinst.clear();
     binst.clear();
+    kinst.clear();
     const sameBuffer = inst._words.buffer === bufBefore &&
         cinst._cnts.buffer === cbufBefore &&
-        binst._words.buffer === bbufBefore;
+        binst._words.buffer === bbufBefore &&
+        kinst._store.buffer === kbufBefore;
     validate(inst);
     validateCounting(cinst);
     validateBlocked(binst);
+    validateCuckoo(kinst);
 
     const allocPerOp = Math.max(0, Math.round((heapAfter - heapBefore) / HOT));
 
@@ -190,6 +210,66 @@ async function main() {
     const BB_FPR_LIMIT = 0.0175;   // honest ceiling: blocked runs OVER plain (decisions/0013)
     const BB_THEORY_FLOOR = 0.0115; // ABOVE plain Bloom's MEASURED rate -- must be EXCEEDED
 
+    // Law 6 (Cuckoo): 1e6 adds -> exactly 0 false negatives (one-sided; no fingerprint
+    // dropped below the load target). Sized for n, load ~0.61, so no kick throws.
+    const cfLaw1 = differentialInt(Cuckoo, { n: 1000000, fpp: 0.01, probes: 1, seed: SEED });
+    // Law 7 (Cuckoo): n=1e5, fpp=0.01, 1e6 disjoint probes -> measured FPR within a
+    // ceiling BELOW the configured 0.01 target. Cuckoo's FPR is width-quantized to
+    // ~2b/2^f (f=10 -> 8/1024 = 0.0078); the byte-aligned width lands the MEASURED rate
+    // (~0.0061 here) UNDER the configured target -- the measure-vs-configured honesty hook.
+    const cfLaw2 = differentialInt(Cuckoo, { n: 100000, fpp: 0.01, probes: 1000000, seed: SEED ^ 0x55 });
+    const CF_FPR_LIMIT = 0.0090;   // above measured ~0.0061, below configured 0.01
+    // Law 8 (Cuckoo delete): bounded-keyspace add/remove churn mirrored against a Set -> 0
+    // false negatives for present keys, and net size tracks the present-set (decisions/0014).
+    // The keyspace bound keeps the churn under the load target so no add() throws.
+    const cfChurn = differentialChurnInt(Cuckoo,
+        { n: 50000, fpp: 0.01, ops: 100000, seed: SEED ^ 0xa5, keyspace: 20000 });
+    // Law 9 (Cuckoo overload): a small filter filled past capacity MUST throw a
+    // [lite-filter] Error after 500 kicks (fail closed, decisions/0014) -- never a silent
+    // drop -- AND the throw MUST NOT drop a previously-added key (the cardinal law: no
+    // false negative on a successfully-added key) AND a thrown add MUST be a byte-identical
+    // no-op (unwound to the exact pre-add state). Proven in-process.
+    let cfOverload = false;      // the overflow raised a [lite-filter] Error
+    let cfOverloadFn = 0;        // false negatives among keys added BEFORE the throw
+    let cfOverloadNoop = false;  // a thrown add left dump() byte-identical (true no-op)
+    {
+        const full = new Cuckoo(64, { fpp: 0.01, keys: "int" });
+        const added = [];
+        try {
+            for (let i = 0; i < 200000; i++) { full.add(i); added.push(i); }
+        } catch (e) {
+            cfOverload = e instanceof Error && /\[lite-filter\]/.test(e.message);
+        }
+        // The bug this catches: an overflow that drops an already-added key. Requery EVERY
+        // key added before the throw -- 0 false negatives is the hard law.
+        for (let j = 0; j < added.length; j++) if (!full.mightContain(added[j])) cfOverloadFn++;
+        // A thrown add is a no-op: snapshot immediately before each attempt; on the attempt
+        // that throws, the post-catch snapshot MUST equal the pre-add one (byte-identical).
+        for (let t = 0; t < 200000; t++) {
+            const before = JSON.stringify(full.dump());
+            try { full.add(1000000 + t); }
+            catch (e) { cfOverloadNoop = before === JSON.stringify(full.dump()); break; }
+        }
+    }
+
+    // Law 10 (Cuckoo achievable load): a correct random-slot victim pick (r & 3 -- all four
+    // b=4 slots evictable) must reach a HIGH load factor before the fail-closed door. Fill
+    // to 90% of the slot capacity and assert NO throw and 0 false negatives. A degraded pick
+    // (e.g. r & 1, only two slots evictable) cannot reach 90% and trips this -- covering the
+    // kick-slot blind spot QA flagged (decisions/0014). Achievable load with r & 3 is ~0.96.
+    let cfLoadOk = false;
+    let cfLoadFn = 0;
+    let cfLoadFrac = 0;
+    {
+        const lf = new Cuckoo(100000, { fpp: 0.01, keys: "int", seed: SEED });
+        const target = Math.floor(0.90 * lf._store.length);
+        let threw = false;
+        try { for (let i = 0; i < target; i++) lf.add(i); } catch (e) { threw = true; }
+        if (!threw) for (let i = 0; i < target; i++) if (!lf.mightContain(i)) cfLoadFn++;
+        cfLoadFrac = lf.size / lf._store.length;
+        cfLoadOk = !threw && cfLoadFn === 0;
+    }
+
     // ---- verdict --------------------------------------------------------------
     const oracleOk =
         law1.falseNegatives === 0 &&
@@ -200,7 +280,16 @@ async function main() {
         bbLaw1.falseNegatives === 0 &&
         bbLaw2.falseNegatives === 0 &&
         bbLaw2.fpr <= BB_FPR_LIMIT &&
-        bbLaw2.fpr > BB_THEORY_FLOOR;
+        bbLaw2.fpr > BB_THEORY_FLOOR &&
+        cfLaw1.falseNegatives === 0 &&
+        cfLaw2.falseNegatives === 0 &&
+        cfLaw2.fpr <= CF_FPR_LIMIT &&
+        cfChurn.falseNegatives === 0 &&
+        cfChurn.present === cfChurn.filterSize &&
+        cfOverload === true &&
+        cfOverloadFn === 0 &&
+        cfOverloadNoop === true &&
+        cfLoadOk === true;
     const ok =
         report.ok &&
         live === 0 &&
@@ -224,6 +313,13 @@ async function main() {
         " fpr=" + bbLaw2.fpr.toFixed(5) + " ceiling=" + BB_FPR_LIMIT.toFixed(5) +
         " floor=" + BB_THEORY_FLOOR.toFixed(5) +
         " overTheory=" + (bbLaw2.fpr > BB_THEORY_FLOOR) +
+        " | cf fn=" + (cfLaw1.falseNegatives + cfLaw2.falseNegatives) +
+        " fpr=" + cfLaw2.fpr.toFixed(5) + " ceiling=" + CF_FPR_LIMIT.toFixed(5) +
+        " churnFn=" + cfChurn.falseNegatives +
+        " present=" + cfChurn.present + " size=" + cfChurn.filterSize +
+        " overload=" + cfOverload + " overloadFn=" + cfOverloadFn +
+        " overloadNoop=" + cfOverloadNoop +
+        " load=" + cfLoadFrac.toFixed(3) + " loadOk=" + cfLoadOk +
         " clearReuse=" + sameBuffer +
         " | " + (ok ? "ok" : "FAIL") + "\n");
 
@@ -236,10 +332,25 @@ async function main() {
         for (const l of leaks) process.stderr.write("  leak " + l + "\n");
         if (!sameBuffer) process.stderr.write("  clear() reallocated the bit store\n");
         if (law1.falseNegatives + law2.falseNegatives + churn.falseNegatives +
-            bbLaw1.falseNegatives + bbLaw2.falseNegatives > 0)
+            bbLaw1.falseNegatives + bbLaw2.falseNegatives +
+            cfLaw1.falseNegatives + cfLaw2.falseNegatives + cfChurn.falseNegatives > 0)
             process.stderr.write("  FALSE NEGATIVE -- the one-sided guarantee is void\n");
         if (churn.present !== churn.filterSize)
             process.stderr.write("  CBF size " + churn.filterSize + " != present " + churn.present + "\n");
+        if (cfChurn.present !== cfChurn.filterSize)
+            process.stderr.write("  Cuckoo size " + cfChurn.filterSize + " != present " + cfChurn.present + "\n");
+        if (cfLaw2.fpr > CF_FPR_LIMIT)
+            process.stderr.write("  Cuckoo FPR " + cfLaw2.fpr.toFixed(5) + " over limit " + CF_FPR_LIMIT + "\n");
+        if (!cfOverload)
+            process.stderr.write("  Cuckoo overload did NOT throw -- fail-closed door broken (decisions/0014)\n");
+        if (cfOverloadFn > 0)
+            process.stderr.write("  Cuckoo overload DROPPED " + cfOverloadFn +
+                " already-added key(s) -- FALSE NEGATIVE on overflow (decisions/0014)\n");
+        if (!cfOverloadNoop)
+            process.stderr.write("  Cuckoo thrown add was NOT a byte-identical no-op -- the eviction chain did not unwind\n");
+        if (!cfLoadOk)
+            process.stderr.write("  Cuckoo could not reach 90% load (fn=" + cfLoadFn + ", load=" +
+                cfLoadFrac.toFixed(3) + ") -- degraded kick-slot pick (decisions/0014)\n");
         if (law2.fpr > FPR_LIMIT)
             process.stderr.write("  FPR " + law2.fpr.toFixed(5) + " over limit " + FPR_LIMIT + "\n");
         if (bbLaw2.fpr > BB_FPR_LIMIT)

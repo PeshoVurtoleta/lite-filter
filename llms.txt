@@ -3,15 +3,16 @@
 Zero-dependency, zero-GC approximate-membership filter FAMILY for JavaScript under
 one uniform LiteFilter<K> surface. v0.1.0 ships the substrate + the reference
 member: Bloom (Bloom, CACM 1970) -- the differential oracle and the honest floor the
-rest of the family (Cuckoo, Quotient, XOR, Binary Fuse) will improve
+rest of the family (Quotient, XOR, Binary Fuse) will improve
 on, one member per release. v0.2.0 adds CountingBloom (deletable); v0.3.0 adds
-BlockedBloom (one 512-bit cache-line block per key). Every member exposes the SAME
+BlockedBloom (one 512-bit cache-line block per key); v0.4.0 adds Cuckoo (deletable,
+fingerprint-based, fail-closed at capacity). Every member exposes the SAME
 add/mightContain/has/size/count/capacity/fpp/clear API, so the filter is a one-line
 constructor swap. Single-file ESM, zero runtime dependencies, node:test only. Ships
 a runnable + importable bench (Bench.mjs) that measures ACTUAL vs THEORETICAL
 false-positive rate on your own keys, checked against a real Set oracle.
 
-## Status: 0.3.0 - Bloom (reference) + CountingBloom (deletable) + BlockedBloom (cache-local).
+## Status: 0.4.0 - Bloom (reference) + CountingBloom (deletable) + BlockedBloom (cache-local) + Cuckoo (fingerprint).
 
 The problem it solves: "have I seen this key?" -- dedup, set membership, cache
 admission -- at a handful of BITS per entry instead of the tens of bytes a Set costs
@@ -34,8 +35,8 @@ behavior on your keys, instead of copying a number from a paper.
 - has(key): the SOLE alias of mightContain (same one-sided semantics). No third name.
 - remove(key): member-specific. Bloom and BlockedBloom are ADD-ONLY -- they throw a
   [lite-filter] Error (fail closed; clearing bits would cause false negatives for other
-  keys). CountingBloom implements a REAL remove(key) -> boolean (returns false and
-  mutates nothing if the key is absent). Further deletable members (Cuckoo / Quotient) later.
+  keys). CountingBloom and Cuckoo implement a REAL remove(key) -> boolean (return false
+  and mutate nothing if the key is absent). Further deletable members (Quotient) later.
 - size / count -> number: the number of adds recorded (a plain counter, not an
   estimate, not a distinct-key count -- Bloom cannot detect a duplicate add).
 - capacity -> number: the item count the filter was sized for at construction.
@@ -55,7 +56,9 @@ Cross-cutting, mirrored from lite-lru:
   form, emitted as a plain array that round-trips through structuredClone and JSON;
   restore rejects any tag/member/width/capacity/fpp/seed/store-length mismatch or
   corruption (REJECT, never truncate). Bloom emits { bits }; CountingBloom emits
-  { w:4, cnts } and validates every byte 0..255 (so every nibble 0..15) before build.
+  { w:4, cnts } and validates every byte 0..255 (so every nibble 0..15) before build;
+  BlockedBloom emits { bb:512, nb, bits }; Cuckoo emits { fw, b:4, nb, fp } (fw is the
+  fingerprint width -- f is the format tag) and validates every slot 0..fpMask before build.
 
 ## Members
 
@@ -86,20 +89,43 @@ Cross-cutting, mirrored from lite-lru:
   up). No "same fpp for free" claim. Good for: maximum query throughput where a higher
   measured FPR is acceptable (or bought back with a lower configured fpp). Not for: the
   tightest FPR at a given bits/item (plain Bloom is lower), or deletes (CountingBloom).
+- Cuckoo (decisions/0014..0015): stores a small NONZERO fingerprint per key in one of TWO
+  candidate buckets of b=4 slots (partial-key cuckoo hashing). i1 = hash(key) & (nb-1);
+  fp = nonzero fingerprint(key); i2 = (i1 XOR hash(fp)) & (nb-1) -- an INVOLUTION, so an
+  evicted fingerprint recovers its alt bucket from the fingerprint alone. add scans i1
+  then i2 for an empty slot; on a full pair it KICKS a random victim to its alt bucket up
+  to 500 times using a SINGLE scalar victim register (no scratch array). It DELETES via a
+  real remove(key) -> boolean. Fingerprint width f = ceil(log2(8/fpp)) byte-aligned UP to
+  an 8-bit (f<=8) or 16-bit (9..16) store; f>16 (fpp < 8/65536 ~ 0.000122) throws at
+  construction. The FPR is width-quantized to ~2b/2^f (independent of fill), typically
+  BELOW the configured target because f rounds up (at fpp 0.01, f=10 -> 16-bit -> ~0.0078);
+  fpp() reports that quantized rate once non-empty. Two honest fail-closed edges: (1) add
+  on a full table (500 kicks exhausted) THROWS a [lite-filter] Error -- never a silent drop
+  (decisions/0014); headroom is observable via size vs capacity; (2) removing a
+  NEVER-INSERTED key whose fingerprint collides with a real key removes that other key's
+  fingerprint -> a false negative for it (decisions/0015) -- only remove keys you inserted.
+  Space ~2x Bloom at fpp 0.01 (byte-aligned slots). Good for: membership + deletes with an
+  FPR bounded by the fingerprint width, not the load. Not for: removing untrusted /
+  never-inserted keys, or duplicate-heavy streams (a key added > 2b times overflows its
+  bucket pair), or the smallest static space (XOR / Binary Fuse, planned).
 
 ## Construction
 
 new Bloom(capacity, { fpp = 0.01, seed?, keys?: 'int', stats?: true })
 new CountingBloom(capacity, { fpp = 0.01, seed?, keys?: 'int', stats?: true })
 new BlockedBloom(capacity, { fpp = 0.01, seed?, keys?: 'int', stats?: true })
+new Cuckoo(capacity, { fpp = 0.01, seed?, keys?: 'int', stats?: true })
 
 Sizing (decisions/0002): m = ceil(-n * ln(fpp) / ln(2)^2), k = round((m/n) * ln(2)),
-k clamped to >= 1. All members share the sizing; CountingBloom stores ceil(m/2) bytes
-(two 4-bit counters per byte) where Bloom stores ceil(m/32) 32-bit words; BlockedBloom
-stores ceil(m/512)*16 words (nb 512-bit blocks) and clamps k to <= 512. Fail-closed
-doors: fpp not in (0,1), capacity < 1, or an overflowing store all throw a
-[lite-filter] Error at construction. null is not zero: an unsized filter is never a
-zero-capacity one.
+k clamped to >= 1. All Bloom-family members share the sizing; CountingBloom stores
+ceil(m/2) bytes (two 4-bit counters per byte) where Bloom stores ceil(m/32) 32-bit words;
+BlockedBloom stores ceil(m/512)*16 words (nb 512-bit blocks) and clamps k to <= 512.
+Cuckoo sizes differently (decisions/0014): fingerprint width f = ceil(log2(8/fpp))
+byte-aligned to 8 or 16 bits, bucket count nb = pow2 >= ceil(capacity/(4*0.95)), store
+nb*4 slots (Uint8Array or Uint16Array); real slot capacity is nb*4, headroom via size vs
+capacity. Fail-closed doors: fpp not in (0,1), capacity < 1, an overflowing store, or (for
+Cuckoo) a fingerprint width > 16 bits all throw a [lite-filter] Error at construction.
+null is not zero: an unsized filter is never a zero-capacity one.
 
 ## The honesty hook (the bench's whole point)
 
@@ -124,6 +150,13 @@ is a hypothesis, not your filter's behavior on your keys -- MEASURE.
   (perf-gate); every set bit of a key lies in ONE 512-bit block (validate); measured
   FPR within its honest ceiling (<= 0.0175) and PROVEN over plain-Bloom theory
   (> 0.00949) -- the locality penalty is visible, not hidden (torture, decisions/0013).
+- Cuckoo deletes + fail-closed: add/mightContain/remove on keys:'int' are 0 scavenges at
+  N and 8N (perf-gate; two-bucket b=4 scan, single scalar victim register on kicks, no
+  scratch array); 1e6 adds -> 0 false negatives; bounded-keyspace add/remove churn -> 0
+  false negatives for present keys and net size == present; measured FPR <= 0.0090
+  (~0.0061, UNDER the configured 0.01 -- width quantization) with 0 false negatives; and a
+  small over-filled filter PROVABLY THROWS after 500 kicks (fail-closed, torture,
+  decisions/0014). nonzero-slot count == size (validate).
 - Fail closed on every unverified state; [lite-filter]-tagged errors throughout.
 
 ## Testing

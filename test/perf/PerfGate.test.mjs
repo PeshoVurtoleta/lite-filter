@@ -24,7 +24,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { zgcSuite } from "@zakkster/lite-perf-gate";
-import { Bloom, CountingBloom, BlockedBloom } from "../../Filter.js";
+import { Bloom, CountingBloom, BlockedBloom, Cuckoo } from "../../Filter.js";
 
 const CAP = 4096;
 const MASK = CAP - 1;
@@ -35,6 +35,9 @@ function bitsBytes(c) { return c._words.buffer.byteLength; }
 
 /** The CountingBloom equivalent: the packed nibble store's byte length. */
 function cntsBytes(c) { return c._cnts.buffer.byteLength; }
+
+/** The Cuckoo equivalent: the fingerprint store's byte length, fixed at construction. */
+function storeBytes(c) { return c._store.buffer.byteLength; }
 
 /** add-churn: fresh int keys; every op sets k bits in the fixed store. */
 const addChurn = {
@@ -155,6 +158,67 @@ const bbQueryHit = {
     statsOf(s) { return { grows: bitsBytes(s.c) }; },
 };
 
+/** Cuckoo add-churn: fresh distinct int keys, each a two-bucket b=4 scan (+ occasional
+ *  kick, single scalar victim register, no scratch). clear() at the half-load mark keeps
+ *  the table under the kick ceiling so no add throws -- both clear() and add() zero-alloc. */
+const cfAddChurn = {
+    name: "Cuckoo add-churn (int)",
+    setup() {
+        const c = new Cuckoo(CAP, { fpp: 0.01, keys: "int" });
+        return { c, k: 0, limit: c._store.length >> 1 };
+    },
+    hot(s, n) {
+        const c = s.c;
+        let k = s.k | 0;
+        const lim = s.limit;
+        for (let i = 0; i < n; i++) {
+            if (c.size >= lim) c.clear();
+            c.add(k & 0x3fffffff);
+            k = (k + 1) | 0;
+        }
+        s.k = k | 0;
+    },
+    statsOf(s) { return { grows: storeBytes(s.c) }; },
+};
+
+/** Cuckoo query-hit: a half-loaded filter; every op is a present-fingerprint positive
+ *  (two-bucket b=4 scan, no alloc). */
+const cfQueryHit = {
+    name: "Cuckoo query-hit (int)",
+    setup() {
+        const c = new Cuckoo(CAP, { fpp: 0.01, keys: "int" });
+        const f = c._store.length >> 1;
+        for (let i = 0; i < f; i++) c.add(i);
+        return { c, acc: 0, mask: f - 1 };
+    },
+    hot(s, n) {
+        const c = s.c;
+        let acc = s.acc | 0;
+        const m = s.mask;
+        for (let i = 0; i < n; i++) acc = (acc + (c.mightContain(i & m) ? 1 : 0)) | 0;
+        s.acc = acc | 0;
+    },
+    statsOf(s) { return { grows: storeBytes(s.c) }; },
+};
+
+/** Cuckoo remove-churn: add then remove the same key each op -- the two-bucket delete on
+ *  the hot path, strictly zero-alloc (slot clear, no scratch); the table stays near-empty
+ *  so add never kicks or throws. */
+const cfRemoveChurn = {
+    name: "Cuckoo remove-churn (int)",
+    setup() {
+        const c = new Cuckoo(CAP, { fpp: 0.01, keys: "int" });
+        return { c, k: 0 };
+    },
+    hot(s, n) {
+        const c = s.c;
+        let k = s.k | 0;
+        for (let i = 0; i < n; i++) { c.add(k & MASK); c.remove(k & MASK); k = (k + 1) | 0; }
+        s.k = k | 0;
+    },
+    statsOf(s) { return { grows: storeBytes(s.c) }; },
+};
+
 /**
  * The teeth: an object-key churn on the default backing that String()-encodes one
  * fresh object key per op -- it MUST trip the gate (scavenges scale with n).
@@ -174,7 +238,8 @@ zgcSuite({
     maxOldGen: 0,
     maxArrayBuffersKB: 0,
     counters: { grows: 0 },
-    scenarios: [addChurn, queryHit, cbfAddChurn, cbfQueryHit, cbfRemoveChurn, bbAddChurn, bbQueryHit],
+    scenarios: [addChurn, queryHit, cbfAddChurn, cbfQueryHit, cbfRemoveChurn, bbAddChurn, bbQueryHit,
+        cfAddChurn, cfQueryHit, cfRemoveChurn],
     mustFail: [mustFailAlloc],
 });
 
@@ -205,5 +270,15 @@ test("perf-gate cross-check: BlockedBloom clear() reuses the bit store buffer", 
     for (let i = 0; i < CAP; i++) c.add(i);
     c.clear();
     assert.equal(c._words.buffer, buf, "clear() must reuse the same ArrayBuffer");
+    assert.equal(c.size, 0);
+});
+
+test("perf-gate cross-check: Cuckoo clear() reuses the fingerprint store buffer", () => {
+    const c = new Cuckoo(CAP, { fpp: 0.01, keys: "int" });
+    const buf = c._store.buffer;
+    const half = c._store.length >> 1;
+    for (let i = 0; i < half; i++) c.add(i);
+    c.clear();
+    assert.equal(c._store.buffer, buf, "clear() must reuse the same ArrayBuffer");
     assert.equal(c.size, 0);
 });

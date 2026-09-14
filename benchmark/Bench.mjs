@@ -27,7 +27,7 @@
  * @license MIT
  */
 
-import { Bloom, CountingBloom, BlockedBloom, VERSION } from "../Filter.js";
+import { Bloom, CountingBloom, BlockedBloom, Cuckoo, VERSION } from "../Filter.js";
 
 /** Seeded xorshift32 -- byte-reproducible from its seed. */
 export function makePrng(seed) {
@@ -236,6 +236,62 @@ export function measureBlocked(name, gen, cap, fpp, seed) {
 }
 
 /**
+ * Measure one workload against a fresh Cuckoo sized (cap, fpp). Same row shape as
+ * `measure` so it prints into the same side-by-side table. Cuckoo's FPR is width-quantized
+ * to `2b/2^f` (independent of fill), so `theoretical` is that closed form -- NOT Bloom's
+ * fill-derived one -- and bits/item is the ACTUAL store (nb*b slots, byte-aligned to 8 or
+ * 16 bits per slot), which is why it can run WIDER than Bloom's `~1.44*log2(1/fpp)`. add()
+ * is FAIL-CLOSED at capacity (decisions/0014): if a workload oversizes past the load
+ * target the excess adds THROW, so we stop at the first overflow and measure over the keys
+ * that actually landed (the honest capacity limit, surfaced not hidden).
+ */
+export function measureCuckoo(name, gen, cap, fpp, seed) {
+    const { keys, probes } = gen(cap, Math.max(cap * 10, 100000), seed);
+    const filter = new Cuckoo(cap, { fpp, keys: "int" });
+    const truth = new Set();
+
+    const t0 = performance.now();
+    let added = 0;
+    let overflowed = false;
+    for (let i = 0; i < keys.length; i++) {
+        try { filter.add(keys[i]); } catch (e) { overflowed = true; break; }
+        added++;
+    }
+    const addNs = added === 0 ? 0 : ((performance.now() - t0) * 1e6) / added;
+    for (let i = 0; i < added; i++) truth.add(keys[i]);
+
+    let falseNeg = 0;
+    for (const key of truth) if (!filter.mightContain(key)) falseNeg++;
+
+    const t1 = performance.now();
+    let acc = 0;
+    for (let i = 0; i < probes.length; i++) acc += filter.mightContain(probes[i]) ? 1 : 0;
+    const queryNs = ((performance.now() - t1) * 1e6) / probes.length;
+    if (acc === -1) process.stdout.write(""); // keep acc observable
+    let falsePos = 0, probed = 0;
+    for (let i = 0; i < probes.length; i++) {
+        if (truth.has(probes[i])) continue;
+        probed++;
+        if (filter.mightContain(probes[i])) falsePos++;
+    }
+
+    const distinct = truth.size;
+    // The fingerprint width f is the row's "k" column (Cuckoo has no k probes).
+    const k = filter._f;
+    const measuredFpr = probed === 0 ? 0 : falsePos / probed;
+    // Cuckoo FPR is width-quantized: 2b/2^f, independent of load.
+    const theoretical = (2 * filter._b) / Math.pow(2, filter._f);
+    const overPct = theoretical === 0 ? 0 : ((measuredFpr - theoretical) / theoretical) * 100;
+    // ACTUAL store: nb*b slots byte-aligned to 8 or 16 bits per slot.
+    const bitsPerItem = distinct === 0 ? 0 : (filter._store.byteLength * 8) / distinct;
+
+    return {
+        name, added, distinct, bitsPerItem, k,
+        measuredFpr, theoretical, overPct, addNs, queryNs, falseNeg, overflowed,
+    };
+}
+
+/**
  * The remove/churn workload (CountingBloom only): add N distinct keys, remove HALF,
  * then requery -- the still-present half MUST show 0 false negatives, and the removed
  * half should mostly read absent. Reports remove ns/op and the two counts. This is the
@@ -308,6 +364,20 @@ export function runBenchCounting(opts) {
     rows.push(measureCounting("zipfian", zipfian, cap, fpp, seed ^ 0x11));
     rows.push(measureCounting("sequential", sequential, cap, fpp, seed ^ 0x22));
     rows.push(measureCounting("adversarial", (n, p, s) => adversarial(Math.floor(cap * 1.5), p, s),
+        cap, fpp, seed ^ 0x33));
+    return rows;
+}
+
+/** Run the Cuckoo workload matrix (FPR-vs-theory across the 4 workloads). */
+export function runBenchCuckoo(opts) {
+    const cap = (opts && opts.cap) || 100000;
+    const fpp = (opts && opts.fpp) || 0.01;
+    const seed = (opts && opts.seed) || 0xC0FFEE;
+    const rows = [];
+    rows.push(measureCuckoo("uniform", uniform, cap, fpp, seed));
+    rows.push(measureCuckoo("zipfian", zipfian, cap, fpp, seed ^ 0x11));
+    rows.push(measureCuckoo("sequential", sequential, cap, fpp, seed ^ 0x22));
+    rows.push(measureCuckoo("adversarial", (n, p, s) => adversarial(Math.floor(cap * 1.5), p, s),
         cap, fpp, seed ^ 0x33));
     return rows;
 }
@@ -402,6 +472,45 @@ function printBlockedTable(bloomRows, blockedRows, cap, fpp) {
         "the WIN. fpp() reports the plain-Bloom FLOOR -- MEASURE your own keys.\n\n");
 }
 
+/**
+ * Bloom vs Cuckoo SIDE BY SIDE across the four workloads: bits/item (Cuckoo is byte-aligned
+ * so it can run WIDER), measured FPR and its THEORETICAL closed form (Bloom's fill-derived
+ * `(1-e^(-kn/m))^k` vs Cuckoo's width-quantized `2b/2^f`). Cuckoo's measured FPR typically
+ * lands BELOW its configured target because the fingerprint width is byte-aligned UP -- the
+ * measure-vs-configured honesty hook. The `k` column is Bloom's hash count / Cuckoo's
+ * fingerprint width f.
+ */
+function printCuckooTable(bloomRows, cuckooRows, cap, fpp) {
+    process.stdout.write(
+        "@zakkster/lite-filter v" + VERSION + " -- Bloom vs Cuckoo (cap=" + cap +
+        ", target fpp=" + fpp + ")\n" +
+        "Cuckoo stores a nonzero fingerprint (b=4 slots/bucket); its FPR is width-quantized\n" +
+        "to 2b/2^f (independent of fill), typically UNDER the configured target. add() is\n" +
+        "fail-closed at capacity (decisions/0014) -- an oversized workload overflows.\n\n");
+    process.stdout.write(
+        pad("workload", 12) + pad("Bl b/item", 11) + pad("Ck b/item", 11) +
+        pad("Bloom FPR", 12) + pad("Ckoo FPR", 12) + pad("Ck theoFPR", 12) +
+        pad("Bl add", 9) + pad("Ck add", 9) + pad("added", 9) + "\n");
+    for (let i = 0; i < bloomRows.length; i++) {
+        const bl = bloomRows[i];
+        const ck = cuckooRows[i];
+        process.stdout.write(
+            pad(bl.name, 12) +
+            pad(bl.bitsPerItem.toFixed(2), 11) +
+            pad(ck.bitsPerItem.toFixed(2), 11) +
+            pad(bl.measuredFpr.toFixed(5), 12) +
+            pad(ck.measuredFpr.toFixed(5), 12) +
+            pad(ck.theoretical.toFixed(5), 12) +
+            pad(bl.addNs.toFixed(1), 9) +
+            pad(ck.addNs.toFixed(1), 9) +
+            pad(ck.added + (ck.overflowed ? "*" : ""), 9) + "\n");
+    }
+    process.stdout.write(
+        "\n* = add() hit the fail-closed capacity door (decisions/0014); metrics are over\n" +
+        "the keys that landed. Cuckoo deletes (remove -> boolean) and its FPR is quantized\n" +
+        "by the byte-aligned fingerprint width -- MEASURE your own keys.\n\n");
+}
+
 // Runnable entry: `node benchmark/Bench.mjs`.
 if (import.meta.url === "file://" + process.argv[1] ||
     import.meta.url === new URL("file://" + process.argv[1]).href) {
@@ -411,4 +520,5 @@ if (import.meta.url === "file://" + process.argv[1] ||
     printTable(bloomRows, cap, fpp);
     printCountingTable(runBenchCounting({ cap, fpp }), measureRemove(cap, fpp, 0xC0FFEE ^ 0x44), cap, fpp);
     printBlockedTable(bloomRows, runBenchBlocked({ cap, fpp }), cap, fpp);
+    printCuckooTable(bloomRows, runBenchCuckoo({ cap, fpp }), cap, fpp);
 }

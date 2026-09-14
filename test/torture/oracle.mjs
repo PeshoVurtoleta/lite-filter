@@ -94,14 +94,21 @@ export function differentialInt(Ctor, opts) {
  * key never reads false (decisions/0008, 0009). At the end, EVERY key still present in
  * the oracle must read true -- 0 false negatives is the hard law.
  *
- * @param {Function} Ctor  the member constructor (e.g. CountingBloom)
- * @param {{ n:number, fpp:number, ops:number, seed:number }} opts
+ * `opts.keyspace` (optional) bounds the key domain to `[0, keyspace)`, so removes RECUR
+ * and the present set equilibrates near keyspace/2 instead of growing unbounded. A
+ * CAPACITY-bounded member (Cuckoo, whose add() throws when full, decisions/0014) needs
+ * this so the churn stays under the load target; CountingBloom (no capacity cap) omits it
+ * and draws from the full [0, 2^31) half, unchanged.
+ *
+ * @param {Function} Ctor  the member constructor (e.g. CountingBloom, Cuckoo)
+ * @param {{ n:number, fpp:number, ops:number, seed:number, keyspace?:number }} opts
  * @returns {{ falseNegatives:number, present:number, filterSize:number }}
  */
 export function differentialChurnInt(Ctor, opts) {
     const n = opts.n;
     const fpp = opts.fpp;
     const ops = opts.ops;
+    const keyspace = (opts.keyspace >>> 0) || 0;
     const rng = makePrng(opts.seed >>> 0);
 
     const filter = new Ctor(n, { fpp: fpp, keys: "int" });
@@ -109,7 +116,8 @@ export function differentialChurnInt(Ctor, opts) {
     let falseNegatives = 0;
 
     for (let i = 0; i < ops; i++) {
-        const key = rng() >>> 1; // [0, 2^31) -- the low half
+        // Bounded keyspace (Cuckoo) recurs keys so removes fire; else the low int32 half.
+        const key = keyspace ? (rng() % keyspace) : (rng() >>> 1);
         if (present.has(key)) {
             // The oracle says present, so remove() MUST agree (return true) and MUST
             // not have read the key as absent -- a false negative on a live key.

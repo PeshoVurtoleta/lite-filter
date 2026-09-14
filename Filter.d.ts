@@ -70,8 +70,14 @@ export interface FilterSnapshot {
   cnts?: number[];
   /** BlockedBloom: the block size in bits (512). */
   bb?: number;
-  /** BlockedBloom: the block count (ceil(m / 512)). */
+  /** BlockedBloom / Cuckoo: the block / bucket count. */
   nb?: number;
+  /** Cuckoo: the fingerprint width in bits (8 or 16). Named `fw` -- `f` is the tag. */
+  fw?: number;
+  /** Cuckoo: the bucket size (4). */
+  b?: number;
+  /** Cuckoo: the fingerprint store as a plain array of slots (0 = empty). */
+  fp?: number[];
 }
 
 /** Construction options shared by every filter member. */
@@ -205,6 +211,41 @@ export class BlockedBloom<K = unknown> implements LiteFilter<K> {
   dump(): FilterSnapshot;
   /** Reconstruct a fresh BlockedBloom from a snapshot. Fail closed on any mismatch. */
   static restore(snap: FilterSnapshot, opts?: FilterRestoreOptions): BlockedBloom;
+}
+
+/**
+ * Cuckoo filter (Fan, Andersen, Kaminsky & Mitzenmacher, CoNEXT 2014) -- the space-lean
+ * deletable member (decisions/0014, 0015). Stores a small NONZERO fingerprint per key in
+ * one of TWO candidate buckets of b=4 slots (partial-key cuckoo hashing); `add` scans
+ * both and, on a full pair, kicks a victim to its alternate bucket up to 500 times. It
+ * DELETES via a real `remove(key): boolean`. Two honest fail-closed rulings:
+ *   - `add(key)` on a full table (500 kicks exhausted) THROWS a `[lite-filter]`-tagged
+ *     Error -- fail closed, never a silent drop (decisions/0014). Headroom via size/capacity.
+ *   - `remove(key)` on a key that was NEVER inserted whose fingerprint COLLIDES with a
+ *     real key removes that other key's fingerprint -> a later false negative for it
+ *     (decisions/0015). Only remove keys you inserted.
+ * `fpp()` is the width-quantized `2b/2^f` once non-empty (typically BELOW the configured
+ * target -- `f` is byte-aligned up), NOT a fill-varying estimate. MEASURE with the bench.
+ */
+export class Cuckoo<K = unknown> implements LiteFilter<K> {
+  constructor(capacity: number, options?: FilterOptions);
+  add(key: K): void;
+  mightContain(key: K): boolean;
+  has(key: K): boolean;
+  /** Delete a key. Returns true on a real delete, false if the key is absent (no
+   *  mutation). See the class caveat on never-inserted, fingerprint-colliding keys. */
+  remove(key: K): boolean;
+  readonly size: number;
+  readonly count: number;
+  readonly capacity: number;
+  /** The configured target while empty, else the width-quantized `2b/2^f`. MEASURE. */
+  fpp(): number;
+  clear(): void;
+  stats(): FilterStats;
+  resetStats(): void;
+  dump(): FilterSnapshot;
+  /** Reconstruct a fresh Cuckoo from a snapshot. Fail closed on any mismatch. */
+  static restore(snap: FilterSnapshot, opts?: FilterRestoreOptions): Cuckoo;
 }
 
 export const VERSION: string;

@@ -7,6 +7,63 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The `VERSION` constant, `package.json` `version`, and `llms.txt` are bumped
 together (three-place version sync) at release.
 
+## [0.4.0] - 2026-09-14
+
+The 4th member -- `Cuckoo`, the fingerprint one (deletable, fail-closed at capacity).
+
+### Added
+
+- **`Cuckoo` -- the fingerprint member** (Fan, Andersen, Kaminsky & Mitzenmacher, CoNEXT
+  2014; decisions/0014, 0015). A new class IN `Filter.js` implementing the same uniform
+  `LiteFilter<K>` surface as `Bloom`, so it is a one-line constructor swap. It DELETES via
+  a real `remove(key) -> boolean` (returns false, mutates nothing, when the key is absent).
+  - Stores a small NONZERO fingerprint per key in one of TWO candidate buckets of `b = 4`
+    slots (partial-key cuckoo hashing): `i1 = hash(key) & (nb-1)`,
+    `i2 = (i1 XOR hash(fp)) & (nb-1)` -- an INVOLUTION, so an evicted fingerprint recovers
+    its alternate bucket from the fingerprint alone. `add` scans both buckets and, on a
+    full pair, KICKS a random victim to its alternate bucket up to 500 times using a SINGLE
+    scalar victim register (no scratch array). Fingerprint 0 is the empty-slot sentinel;
+    the fingerprint hash never emits 0 (0 -> 1). `b = 4` and 500 kicks are PINNED.
+  - **Fingerprint width `f = ceil(log2(8/fpp))` byte-aligned UP** (decisions/0014):
+    `f <= 8` -> a `Uint8Array` store, `9..16` -> a `Uint16Array`; `f > 16`
+    (`fpp < 8/65536 ~ 0.000122`) throws a `[lite-filter]` RangeError at construction. Bucket
+    count is a power of two `>= ceil(capacity/(4*0.95))`; store is `nb*4` slots, sized once.
+    `fpp()` reports the width-quantized `2b/2^f` once non-empty (independent of fill) --
+    at `fpp = 0.01`, `f = 10 -> 16-bit`, delivered FPR `8/1024 ~ 0.0078`, BELOW the
+    configured target and at ~2x a plain Bloom's bytes/item (~21 vs ~9.6 at ~76% load).
+    This measure-vs-configured quantization is surfaced by `fpp()` and the bench, not hidden.
+  - **Fail-closed at capacity** (decisions/0014): `add` on a table where 500 kicks are
+    exhausted THROWS a `[lite-filter]` Error -- it does NOT return a boolean and does NOT
+    silently drop the fingerprint (which would be a false negative). The uniform
+    `add(key) -> void` surface is preserved; headroom is observable via `size` vs `capacity`.
+  - **Delete caveat** (decisions/0015): removing a NEVER-INSERTED key whose fingerprint
+    collides with a real key clears that other key's slot -> a later false negative for it.
+    Only remove keys you inserted (documented in the docstring, `Filter.d.ts`, README, llms.txt).
+  - Hot path `add` / `mightContain` / `has` / `remove` are strictly zero-alloc on
+    `keys:'int'` (two-bucket b=4 scan, a single scalar victim register on kicks, no scratch):
+    0 scavenges at N=200000 and 8N on add-churn / query-hit / remove-churn under the pinned
+    4MB semi-space (perf-gate). `clear()` zeroes the store in place (same ArrayBuffer identity).
+  - `dump()` / static `Cuckoo.restore(snap, opts?)` with a
+    `{ f, mem:"Cuckoo", fw, b:4, nb, cap, fpp, seed, keys, count, fp }` tag (`fw` = the
+    fingerprint width; `f` remains the shared format tag) that validates the store length
+    (`nb*4`) and every slot (`0..fpMask`) BEFORE building any instance, and REJECTS any tag /
+    member / width / bucket-size / bucket-count / length / range corruption -- never truncates.
+- **`Filter.d.ts`** -- `Cuckoo<K> implements LiteFilter<K>` with a real `remove(key): boolean`;
+  `FilterSnapshot` extended with optional `fw` / `b` / `fp` fields (`nb` already present).
+- **Gates extended** -- the conservation invariant `validateCuckoo` (every slot `0..fpMask`,
+  nonzero-slot count == size, power-of-two `nb`, store length `nb*4`); a bounded-keyspace
+  extension to the `differentialChurnInt` Set oracle (so a capacity-bounded member churns
+  under its load target); torture Cuckoo leak/GC + differential (0 false negatives) +
+  delete-churn + a PROVEN fail-closed overload-throw phase; three new perf-gate scenarios
+  (add-churn / query-hit / remove-churn on `keys:'int'`) at 0 scavenges N and 8N.
+- **The bench** (`benchmark/Bench.mjs`) -- `measureCuckoo` / `runBenchCuckoo` and a
+  `printCuckooTable` that prints Bloom vs Cuckoo SIDE BY SIDE across the four workloads:
+  bits/item (Cuckoo ~2x, byte-aligned), measured FPR vs the width-quantized theoretical
+  `2b/2^f`, and the fail-closed capacity overflow (marked `*`) on oversized / duplicate-heavy
+  workloads.
+
+[0.4.0]: https://github.com/PeshoVurtoleta/lite-filter/releases/tag/v0.4.0
+
 ## [0.3.0] - 2026-09-14
 
 The 3rd member -- `BlockedBloom`, the cache-local one.

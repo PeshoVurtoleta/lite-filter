@@ -9,8 +9,8 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { Bloom, CountingBloom, BlockedBloom } from "../Filter.js";
-import { validate, validateCounting, validateBlocked } from "./validate.mjs";
+import { Bloom, CountingBloom, BlockedBloom, Cuckoo } from "../Filter.js";
+import { validate, validateCounting, validateBlocked, validateCuckoo } from "./validate.mjs";
 
 function filled(opts) {
     const f = new Bloom(1000, opts);
@@ -27,6 +27,13 @@ function filledCounting(opts) {
 function filledBlocked(opts) {
     const f = new BlockedBloom(1000, opts);
     for (let i = 0; i < 800; i++) f.add(opts && opts.keys === "int" ? i : "k-" + i);
+    return f;
+}
+
+function filledCuckoo(opts) {
+    const f = new Cuckoo(1000, opts);
+    const n = f._store.length >> 2; // stay well under the load target -- no kick throws
+    for (let i = 0; i < n; i++) f.add(opts && opts.keys === "int" ? i : "k-" + i);
     return f;
 }
 
@@ -341,6 +348,184 @@ test("BlockedBloom restore door: bad format tag / seed / keys / count fail close
 test("BlockedBloom restore opts: stats can be re-derived on restore", () => {
     const snap = filledBlocked({ keys: "int" }).dump();
     const g = BlockedBloom.restore(snap, { stats: true });
+    g.mightContain(1);
+    assert.equal(g.stats().queries, 1);
+});
+
+/* ------------------------------------------------------------------------- *
+ * Cuckoo snapshot (decisions/0014): the fingerprint store envelope, fw + b + nb.
+ * ------------------------------------------------------------------------- */
+
+test("Cuckoo dump/restore: exact round-trip preserves membership + count + fingerprint store", () => {
+    const f = filledCuckoo({ fpp: 0.01, keys: "int" });
+    const snap = f.dump();
+    const g = Cuckoo.restore(snap);
+    assert.equal(g.size, f.size);
+    assert.equal(g.capacity, f.capacity);
+    assert.deepEqual(Array.from(g._store), Array.from(f._store), "restored fingerprint store must be exact, not re-derived");
+    assert.equal(g._f, f._f);
+    assert.equal(g._b, f._b);
+    assert.equal(g._nb, f._nb);
+    assert.equal(g._seed, f._seed);
+    const n = f._store.length >> 2;
+    for (let i = 0; i < n; i++) assert.equal(g.mightContain(i), true);
+    validateCuckoo(g);
+});
+
+test("Cuckoo dump: round-trips through JSON and structuredClone", () => {
+    const f = filledCuckoo({ fpp: 0.01, keys: "int" });
+    const snap = f.dump();
+    const viaJson = Cuckoo.restore(JSON.parse(JSON.stringify(snap)));
+    const viaClone = Cuckoo.restore(structuredClone(snap));
+    const n = f._store.length >> 2;
+    for (let i = 0; i < n; i++) {
+        assert.equal(viaJson.mightContain(i), true);
+        assert.equal(viaClone.mightContain(i), true);
+    }
+    validateCuckoo(viaJson);
+    validateCuckoo(viaClone);
+});
+
+test("Cuckoo dump: the tag shape is stable and self-describing (mem + fw + b:4 + nb + fp)", () => {
+    const snap = filledCuckoo({ fpp: 0.01, keys: "int" }).dump();
+    assert.equal(snap.f, "litefilter/1");
+    assert.equal(snap.mem, "Cuckoo");
+    assert.equal(snap.b, 4);
+    assert.equal(typeof snap.fw, "number");
+    assert.ok(snap.fw >= 1 && snap.fw <= 16);
+    assert.equal(typeof snap.nb, "number");
+    assert.equal(snap.keys, "int");
+    assert.equal(Array.isArray(snap.fp), true);
+    assert.equal(snap.fp.length, snap.nb * 4);
+});
+
+test("Cuckoo restore door: member mismatch fails closed (both directions vs Bloom, and vs CountingBloom/BlockedBloom)", () => {
+    const bloomSnap = filled({ keys: "int" }).dump();
+    assert.throws(() => Cuckoo.restore(bloomSnap), /\[lite-filter\].*member/);
+    const cuckooSnap = filledCuckoo({ keys: "int" }).dump();
+    assert.throws(() => Bloom.restore(cuckooSnap), /\[lite-filter\].*member/);
+
+    const cbfSnap = filledCounting({ keys: "int" }).dump();
+    assert.throws(() => Cuckoo.restore(cbfSnap), /\[lite-filter\].*member/,
+        "a CountingBloom snapshot must be rejected by Cuckoo.restore");
+    const bbSnap = filledBlocked({ keys: "int" }).dump();
+    assert.throws(() => Cuckoo.restore(bbSnap), /\[lite-filter\].*member/,
+        "a BlockedBloom snapshot must be rejected by Cuckoo.restore");
+    assert.throws(() => CountingBloom.restore(cuckooSnap), /\[lite-filter\].*member/,
+        "a Cuckoo snapshot must be rejected by CountingBloom.restore");
+    assert.throws(() => BlockedBloom.restore(cuckooSnap), /\[lite-filter\].*member/,
+        "a Cuckoo snapshot must be rejected by BlockedBloom.restore");
+});
+
+test("Cuckoo restore door: bucket-size (b) mismatch fails closed", () => {
+    const snap = filledCuckoo({ keys: "int" }).dump();
+    snap.b = 8;
+    assert.throws(() => Cuckoo.restore(snap), /\[lite-filter\].*bucket-size/);
+});
+
+test("Cuckoo restore door: fingerprint-width (fw) mismatch fails closed", () => {
+    const snap = filledCuckoo({ fpp: 0.01, keys: "int" }).dump();
+    snap.fw = snap.fw === 16 ? 8 : 16;
+    assert.throws(() => Cuckoo.restore(snap), /\[lite-filter\].*fingerprint-width/);
+});
+
+test("Cuckoo restore door: bucket-count (nb) mismatch fails closed", () => {
+    const snap = filledCuckoo({ keys: "int" }).dump();
+    snap.nb = snap.nb * 2;
+    assert.throws(() => Cuckoo.restore(snap), /\[lite-filter\].*bucket-count/);
+});
+
+test("Cuckoo restore door: a short / oversized fingerprint store is REJECTED, never truncated", () => {
+    const shortSnap = filledCuckoo({ keys: "int" }).dump();
+    shortSnap.fp = shortSnap.fp.slice(0, shortSnap.fp.length - 1);
+    assert.throws(() => Cuckoo.restore(shortSnap), /\[lite-filter\].*fingerprint store/);
+    const longSnap = filledCuckoo({ keys: "int" }).dump();
+    longSnap.fp = longSnap.fp.concat([0, 0, 0]);
+    assert.throws(() => Cuckoo.restore(longSnap), /\[lite-filter\].*fingerprint store/);
+});
+
+test("Cuckoo restore door: an out-of-range / impossible fingerprint is REJECTED, never coerced", () => {
+    for (const bad of [-1, NaN, "not-a-number", {}, null, 4294967296.7]) {
+        const snap = filledCuckoo({ keys: "int" }).dump();
+        snap.fp[0] = bad;
+        assert.throws(() => Cuckoo.restore(snap), /\[lite-filter\]/,
+            "restore() must reject a corrupt fingerprint " + String(bad));
+    }
+    // A fingerprint value that EXCEEDS the derived fpMask (impossible for this width,
+    // even though it might be a small nonnegative integer) must also be rejected.
+    const snap = filledCuckoo({ fpp: 0.01, keys: "int" }).dump();
+    const overWidth = Math.pow(2, snap.fw) + 1; // one past the width's max representable value
+    snap.fp[0] = overWidth;
+    assert.throws(() => Cuckoo.restore(snap), /\[lite-filter\].*fingerprint/,
+        "a fingerprint exceeding the derived width's fpMask must be rejected as impossible");
+});
+
+test("Cuckoo restore door: bad format tag / seed / keys / count fail closed", () => {
+    const s1 = filledCuckoo({ keys: "int" }).dump(); s1.f = "litefilter/2";
+    assert.throws(() => Cuckoo.restore(s1), /\[lite-filter\].*format tag/);
+    const s2 = filledCuckoo({ keys: "int" }).dump(); s2.seed = 1.5;
+    assert.throws(() => Cuckoo.restore(s2), /\[lite-filter\].*seed/);
+    const s3 = filledCuckoo({ keys: "int" }).dump(); delete s3.keys;
+    assert.throws(() => Cuckoo.restore(s3), /\[lite-filter\].*keys mode/);
+    const s4 = filledCuckoo({ keys: "int" }).dump(); s4.count = -1;
+    assert.throws(() => Cuckoo.restore(s4), /\[lite-filter\].*count/);
+    assert.throws(() => Cuckoo.restore(null), /\[lite-filter\]/);
+    assert.throws(() => Cuckoo.restore(42), /\[lite-filter\]/);
+});
+
+test("Cuckoo restore door: a capacity/fpp mismatch is caught transitively via fw/nb re-derivation", () => {
+    const snap = filledCuckoo({ fpp: 0.01, keys: "int" }).dump();
+    snap.cap = snap.cap * 5;
+    assert.throws(() => Cuckoo.restore(snap), /\[lite-filter\]/, "a corrupted cap must fail closed, not silently build a wrong-shaped filter");
+    const snap2 = filledCuckoo({ fpp: 0.01, keys: "int" }).dump();
+    snap2.fpp = 0.3;
+    assert.throws(() => Cuckoo.restore(snap2), /\[lite-filter\]/);
+});
+
+test("Cuckoo restore door: validates EVERY slot (and the full-length store) BEFORE writing ANY slot into the instance store", () => {
+    // Same fail-open regression class QaAuditBlocked.test.js proves for BlockedBloom:
+    // corrupt only the LAST slot, and use a Proxy to prove the write loop never ran
+    // (each index read at most once, from the validation pre-scan) before the throw.
+    const snap = filledCuckoo({ keys: "int" }).dump();
+    const badIdx = snap.fp.length - 1;
+    snap.fp[badIdx] = -1;
+    const accessCounts = new Map();
+    const proxied = new Proxy(snap.fp, {
+        get(target, prop, receiver) {
+            if (typeof prop === "string" && /^\d+$/.test(prop)) {
+                const idx = Number(prop);
+                accessCounts.set(idx, (accessCounts.get(idx) || 0) + 1);
+            }
+            return Reflect.get(target, prop, receiver);
+        },
+    });
+    snap.fp = proxied;
+
+    assert.throws(() => Cuckoo.restore(snap), /\[lite-filter\]/);
+
+    assert.ok(accessCounts.has(badIdx), "test setup: the corrupt last index must actually have been scanned");
+    for (const [idx, count] of accessCounts) {
+        assert.ok(count <= 1,
+            "index " + idx + " was read " + count + " times -- the write loop ran despite a corrupt slot (fail-open on restore)");
+    }
+});
+
+test("Cuckoo restore door: a repeated failed restore() leaves no residue that corrupts a later clean restore()", () => {
+    const goodSnap = filledCuckoo({ keys: "int" }).dump();
+    for (let trial = 0; trial < 5; trial++) {
+        const bad = filledCuckoo({ keys: "int" }).dump();
+        bad.fp[0] = -1;
+        assert.throws(() => Cuckoo.restore(bad));
+    }
+    const g = Cuckoo.restore(goodSnap);
+    const n = g._store.length >> 2;
+    for (let i = 0; i < n; i++) assert.equal(g.mightContain(i), true);
+    validateCuckoo(g);
+});
+
+test("Cuckoo restore opts: stats can be re-derived on restore", () => {
+    const snap = filledCuckoo({ keys: "int" }).dump();
+    const g = Cuckoo.restore(snap, { stats: true });
     g.mightContain(1);
     assert.equal(g.stats().queries, 1);
 });

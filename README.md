@@ -1,6 +1,6 @@
 # @zakkster/lite-filter
 
-> A zero-GC approximate-membership filter FAMILY under one `LiteFilter<K>` surface: `Bloom` (the add-only reference), `CountingBloom` (deletable, ~4x space), and `BlockedBloom` (one cache miss per query, at a higher measured FPR) ship today, with the space-optimal and mergeable members (Cuckoo, Quotient, XOR, Binary Fuse) to come -- one-line swappable, tree-shakeable to a single filter, with a shipped bench that measures ACTUAL vs THEORETICAL false-positive rate on your own keys instead of trusting a formula.
+> A zero-GC approximate-membership filter FAMILY under one `LiteFilter<K>` surface: `Bloom` (the add-only reference), `CountingBloom` (deletable, ~4x space), `BlockedBloom` (one cache miss per query, at a higher measured FPR), and `Cuckoo` (deletable, fingerprint-based, fail-closed at capacity) ship today, with the space-optimal and mergeable static members (Quotient, XOR, Binary Fuse) to come -- one-line swappable, tree-shakeable to a single filter, with a shipped bench that measures ACTUAL vs THEORETICAL false-positive rate on your own keys instead of trusting a formula.
 
 [![npm version](https://img.shields.io/npm/v/@zakkster/lite-filter.svg?style=for-the-badge&color=latest)](https://www.npmjs.com/package/@zakkster/lite-filter)
 [![sponsor](https://img.shields.io/badge/sponsor-PeshoVurtoleta-ea4aaa.svg?logo=github)](https://github.com/sponsors/PeshoVurtoleta)
@@ -38,7 +38,7 @@ seen.size;                      // 2     -- adds recorded
 seen.fpp();                     // the fill-derived FPR estimate (a formula, not a measurement)
 ```
 
-One `LiteFilter<K>` surface, `add`/`mightContain`/`has`/`size`/`capacity`/`fpp`/`clear`, zero allocation on every hot path after construction. Integer keys opt into a strict-zero-alloc backing. `Bloom`, `CountingBloom`, and `BlockedBloom` are shipped named exports today; the remaining members (Cuckoo, Quotient, XOR, Binary Fuse) ship as further named exports (`sideEffects: false` drops whichever you do not import).
+One `LiteFilter<K>` surface, `add`/`mightContain`/`has`/`size`/`capacity`/`fpp`/`clear`, zero allocation on every hot path after construction. Integer keys opt into a strict-zero-alloc backing. `Bloom`, `CountingBloom`, `BlockedBloom`, and `Cuckoo` are shipped named exports today; the remaining static members (Quotient, XOR, Binary Fuse) ship as further named exports (`sideEffects: false` drops whichever you do not import).
 
 Then measure, do not guess:
 
@@ -56,6 +56,7 @@ npm run bench     # measured vs theoretical FPR (% over), bits/item, add/query n
 - [The members](#the-members)
   - [CountingBloom -- the deletable member](#the-members)
   - [BlockedBloom -- the cache-local member](#the-members)
+  - [Cuckoo -- the fingerprint member](#the-members)
 - [API reference](#api-reference)
   - [Construction](#construction)
   - [The surface](#the-surface)
@@ -141,8 +142,9 @@ so `remove()` throws (use `CountingBloom` when you need deletes).
 | `Bloom` | no (`remove` throws) | 1x (`~1.44 log2(1/fpp)` bits/item) | SHIPPED (v0.1.0) | `import { Bloom } from '@zakkster/lite-filter'` |
 | `CountingBloom` | **yes** (`remove -> boolean`) | ~4x Bloom (4-bit counters) | SHIPPED (v0.2.0) | `import { CountingBloom } from '@zakkster/lite-filter'` |
 | `BlockedBloom` | no (`remove` throws) | 1x Bloom (one 512-bit cache line per key) | SHIPPED (v0.3.0) | `import { BlockedBloom } from '@zakkster/lite-filter'` |
+| `Cuckoo` | **yes** (`remove -> boolean`) | ~2x Bloom at fpp 0.01 (byte-aligned fingerprints) | SHIPPED (v0.4.0) | `import { Cuckoo } from '@zakkster/lite-filter'` |
 
-All three implement the same `LiteFilter<K>` surface, so a member is a one-line
+All four implement the same `LiteFilter<K>` surface, so a member is a one-line
 constructor swap; the only surface difference is `remove` (member-specific).
 
 <details>
@@ -208,6 +210,47 @@ delivered rate.
 
 </details>
 
+<details>
+<summary>Cuckoo -- the fingerprint member (deletable, fail-closed at capacity)</summary>
+
+`Cuckoo` (Fan, Andersen, Kaminsky & Mitzenmacher, CoNEXT 2014) stores a small NONZERO
+fingerprint per key in one of TWO candidate buckets of `b = 4` slots (decisions/0014).
+The second bucket is `i2 = (i1 XOR hash(fp)) & (nb-1)` -- an INVOLUTION, so an evicted
+fingerprint recovers its alternate bucket from the fingerprint alone. `add` scans both
+buckets and, on a full pair, KICKS a random victim to its alternate bucket up to 500 times
+(a single scalar victim register, zero allocation). It DELETES via a real
+`remove(key): boolean`.
+
+```js
+import { Cuckoo } from '@zakkster/lite-filter';
+
+const f = new Cuckoo(100000, { fpp: 0.01, keys: 'int' });
+f.add(42);
+f.remove(42);            // true  -- a real delete; false if the key is absent
+f.mightContain(42);      // false -- gone
+```
+
+Two honest edges, both surfaced, never hidden:
+
+- **Fail-closed at capacity** (decisions/0014). When 500 kicks are exhausted the table is
+  full and `add` THROWS a `[lite-filter]` Error -- it never silently drops a fingerprint
+  (which would be a false negative). Headroom is observable via `size` vs `capacity`. Size
+  up when it throws.
+- **Only remove keys you inserted** (decisions/0015). Deleting a NEVER-INSERTED key whose
+  fingerprint collides with a real key clears that other key's slot -> a later **false
+  negative** for it. This is sharper than a Counting Bloom delete (which decrements a
+  shared counter); a Cuckoo delete removes a concrete fingerprint instance.
+
+**The measure-vs-configured hook.** The fingerprint width is `f = ceil(log2(8/fpp))`
+byte-aligned UP to an 8- or 16-bit slot. At `fpp = 0.01`, `f` rounds up to a 16-bit slot,
+so the delivered FPR is the width-quantized `2b/2^f = 8/1024 ~ 0.0078` -- BELOW the
+configured 0.01, at ~2x a plain Bloom's bytes/item (~21 vs ~9.6 at ~76% load). `fpp()`
+reports that width-quantized rate once non-empty (not a fill-varying estimate); `npm run
+bench` prints Bloom vs Cuckoo side by side so the byte-align quantization is visible. Below
+`fpp = 8/65536 (~0.000122)` the width would exceed 16 bits and construction throws.
+
+</details>
+
 ## API reference
 
 ### Construction
@@ -233,7 +276,7 @@ a bit count that would overflow a safe typed-array length; an unknown `keys` or
 | `add(key)` | `void` | Record a key. Zero-alloc on int + string keys. |
 | `mightContain(key)` | `boolean` | The query. NO false negatives; false positives bounded by `fpp`. |
 | `has(key)` | `boolean` | The sole alias of `mightContain`, same semantics. |
-| `remove(key)` | `never` / `boolean` | **Bloom** + **BlockedBloom**: add-only, **throw** `[lite-filter]`. **CountingBloom**: a real delete, returns `boolean` (member-specific). |
+| `remove(key)` | `never` / `boolean` | **Bloom** + **BlockedBloom**: add-only, **throw** `[lite-filter]`. **CountingBloom** + **Cuckoo**: a real delete, returns `boolean` (member-specific). |
 | `size` / `count` | `number` | Adds recorded (a plain counter, not a distinct-key count). |
 | `capacity` | `number` | The item count the filter was sized for. |
 | `fpp()` | `number` | Configured target while empty, else the fill-derived estimate. |
@@ -292,10 +335,11 @@ const rows = runBench({ cap: 100000, fpp: 0.01 });
 
 | Export | Meaning |
 | --- | --- |
-| `VERSION` | the package version string (`"0.3.0"`) |
+| `VERSION` | the package version string (`"0.4.0"`) |
 | `Bloom` | the reference member (also the default export) |
 | `CountingBloom` | the deletable member (4-bit saturating counters; a real `remove`) |
 | `BlockedBloom` | the cache-local member (one 512-bit block per key; one cache miss per query, at a higher measured FPR) |
+| `Cuckoo` | the fingerprint member (b=4 buckets; deletable, fail-closed at capacity; FPR width-quantized to `2b/2^f`) |
 
 ## Composability
 
@@ -358,7 +402,11 @@ array), and 1e5 mixed add/remove ops = **0 false negatives** for present keys.
 BlockedBloom `add` / `mightContain` on `keys:'int'` are **0 scavenges** at N and 8N too
 (one block, odd-stride within-block walk, no scratch), with a measured FPR within its
 honest ceiling (**<= 0.0175**) that is PROVEN to run OVER the plain-Bloom theory
-(decisions/0013). ns/op figures are machine-local -- run `npm run bench`.
+(decisions/0013). Cuckoo `add` / `mightContain` / `remove` on `keys:'int'` are also
+**0 scavenges** at N and 8N (two-bucket b=4 scan, a single scalar victim register on kicks,
+no scratch array), with a width-quantized measured FPR **<= 0.0090** (~0.0061, under the
+configured 0.01 -- decisions/0014) and a PROVEN fail-closed overload throw. ns/op figures
+are machine-local -- run `npm run bench`.
 
 </details>
 
@@ -395,6 +443,14 @@ honest ceiling (**<= 0.0175**) that is PROVEN to run OVER the plain-Bloom theory
   NOT upsized to hide it. `fpp()` reports the plain-Bloom form as a FLOOR the measured
   rate runs OVER, and the bench prints Bloom vs BlockedBloom side by side. No "same fpp
   for free" claim.
+- **Cuckoo pins b=4 / 500 kicks and byte-aligns the fingerprint** (decisions/0014):
+  `f = ceil(log2(8/fpp))` rounded up to an 8- or 16-bit slot, power-of-two buckets, an
+  involution alt-bucket XOR, and a fail-closed `add` THROW at capacity (never a silent
+  drop). `fpp()` reports the width-quantized `2b/2^f` -- typically UNDER the configured
+  target -- surfaced, not hidden.
+- **Cuckoo delete has a sharp caveat** (decisions/0015): removing a NEVER-INSERTED key
+  whose fingerprint collides with a real key clears that other key's slot -> a false
+  negative for it. Only remove keys you inserted.
 
 ## Testing
 
@@ -402,18 +458,20 @@ honest ceiling (**<= 0.0175**) that is PROVEN to run OVER the plain-Bloom theory
 
 - `npm test` -- the boundary suite: every method, every one-sided law, every
   fail-closed door, plus an ASCII-source guard.
-- `npm run test:types` -- `tsc --noEmit` proves `Bloom`, `CountingBloom`, and
-  `BlockedBloom` satisfy `LiteFilter<K>`, that `CountingBloom.remove` is a real
-  `boolean`, and that `Bloom`/`BlockedBloom` `remove` is `never`.
+- `npm run test:types` -- `tsc --noEmit` proves `Bloom`, `CountingBloom`,
+  `BlockedBloom`, and `Cuckoo` satisfy `LiteFilter<K>`, that `CountingBloom.remove` and
+  `Cuckoo.remove` are a real `boolean`, and that `Bloom`/`BlockedBloom` `remove` is `never`.
 - `npm run torture` -- `node --expose-gc`: the leak tracker (retention returns to 0)
   + the GC profiler (maxMajor 0) + the Set-differential oracle (no false negatives,
   bounded FPR) + a CountingBloom add/remove churn oracle + a BlockedBloom oracle (0
   false negatives; measured FPR within its honest ceiling AND proven OVER plain-Bloom
-  theory) + the `clear()` ArrayBuffer-identity check for all three members.
+  theory) + a Cuckoo oracle (0 false negatives, delete-churn, and a PROVEN fail-closed
+  overload throw) + the `clear()` ArrayBuffer-identity check for all four members.
 - `npm run torture:controls` -- the must-fail proof: a broken build MUST fail.
 - `npm run test:perf` -- the `@zakkster/lite-perf-gate` zero-alloc scenarios on
   `keys:'int'` (Bloom add-churn + query-hit; CountingBloom add-churn + query-hit +
-  remove-churn; BlockedBloom add-churn + query-hit), with an allocating mustFail for teeth.
+  remove-churn; BlockedBloom add-churn + query-hit; Cuckoo add-churn + query-hit +
+  remove-churn), with an allocating mustFail for teeth.
 - `npm run bench` -- the measurement tool.
 
 ## What this is not
