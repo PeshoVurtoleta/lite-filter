@@ -428,7 +428,24 @@ export class Bloom {
                 "[lite-filter] restore(): member mismatch " + String(snap.mem) +
                 " (this is Bloom.restore)");
         }
-        const keys = snap.keys === "int" ? "int" : (snap.keys === null ? undefined : snap.keys);
+        // The seed is the snapshot's source of truth (the bits were computed with
+        // it), so it cannot be re-derived -- but it MUST be a valid uint32 integer or
+        // the snapshot is corrupt. Validate BEFORE constructing (null is not zero).
+        if (!Number.isInteger(snap.seed) || snap.seed < 0 || snap.seed > 0xffffffff) {
+            throw new Error(
+                "[lite-filter] restore(): corrupt seed " + String(snap.seed) +
+                " (must be a 32-bit unsigned integer)");
+        }
+        // The keys mode selects the HASH PATH, so a stripped/garbled `keys` field
+        // must fail closed: silently mapping it to the arbitrary (string) backing
+        // would restore an int-backed filter onto the wrong hasher and produce
+        // FALSE NEGATIVES. Only the two exact values are accepted (null is not zero).
+        if (snap.keys !== "int" && snap.keys !== null) {
+            throw new Error(
+                "[lite-filter] restore(): corrupt keys mode " + String(snap.keys) +
+                " (must be 'int' or null)");
+        }
+        const keys = snap.keys === "int" ? "int" : undefined;
         // Rebuild from the recorded (cap, fpp, seed, keys). The sizing is
         // deterministic, so a re-derived m/k that disagrees with the snapshot means a
         // corrupt or foreign snapshot -- fail closed rather than load a wrong shape.
@@ -448,11 +465,6 @@ export class Bloom {
                 "[lite-filter] restore(): hash-count mismatch (snapshot k=" + String(snap.k) +
                 ", derived k=" + inst._k + ")");
         }
-        if ((snap.seed >>> 0) !== inst._seed) {
-            throw new Error(
-                "[lite-filter] restore(): seed mismatch (snapshot seed=" + String(snap.seed) +
-                ", derived seed=" + inst._seed + ")");
-        }
         const bits = snap.bits;
         if (!Array.isArray(bits) || bits.length !== inst._words.length) {
             throw new Error(
@@ -463,7 +475,20 @@ export class Bloom {
             throw new Error(
                 "[lite-filter] restore(): corrupt count " + String(snap.count));
         }
-        for (let i = 0; i < bits.length; i++) inst._words[i] = bits[i] >>> 0;
+        // Validate EVERY word BEFORE mutating (REJECT never truncate; null is not
+        // zero). A `>>> 0` coercion would silently turn NaN/null/"str"/{} into 0 or
+        // an out-of-range float into garbage -- dropping set bits and causing a
+        // FALSE NEGATIVE on a previously-added key. Each word must be an exact
+        // 32-bit unsigned integer, or the snapshot is corrupt (decisions/0005).
+        for (let i = 0; i < bits.length; i++) {
+            const w = bits[i];
+            if (!Number.isInteger(w) || w < 0 || w > 0xffffffff) {
+                throw new Error(
+                    "[lite-filter] restore(): corrupt bit-store word at index " + i +
+                    " (" + String(w) + "); each word must be a 32-bit unsigned integer");
+            }
+        }
+        for (let i = 0; i < bits.length; i++) inst._words[i] = bits[i];
         inst._count = snap.count;
         return inst;
     }

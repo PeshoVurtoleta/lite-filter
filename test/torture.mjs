@@ -46,11 +46,9 @@ async function main() {
     const { GcProfiler, checkNoGc } = await import("@zakkster/lite-gc-profiler");
     const {
         createLeakTracker,
-        createTimerOrphanKernel,
-        createListenerOrphanKernel,
-        createObserverOrphanKernel,
-        createAsyncRetentionKernel,
+        createOwnerCascadeOrphanKernel,
     } = await import("@zakkster/lite-leak");
+    const { createRoot, effect, dispose } = await import("@zakkster/lite-signal");
     const { Bloom } = await import("../Filter.js");
     const { validate } = await import("./validate.mjs");
     const { differentialInt } = await import("./torture/oracle.mjs");
@@ -65,23 +63,29 @@ async function main() {
         onLeak: (r) => leaks.push(r.kind + ":" + String(r.tag)),
         onWarning: (w) => warns.push(w.kind + ":" + w.reason),
     });
-    tracker.registerKernel(createTimerOrphanKernel());
-    tracker.registerKernel(createListenerOrphanKernel());
-    tracker.registerKernel(createObserverOrphanKernel());
-    tracker.registerKernel(createAsyncRetentionKernel());
+    // Bloom patches NO timer / listener / observer / async surface, so per the
+    // torture-harness skill we register ONLY the owner-cascade retention kernel --
+    // the one that answers "did a filter outlive its owner?". Adding the surface
+    // kernels here would only emit no-owner-set advisories for surfaces we never use.
+    tracker.registerKernel(createOwnerCascadeOrphanKernel());
 
     // ---- phase 1: retention torture ------------------------------------------
     // Bloom holds only a typed array -- no timers, listeners, or global registry.
-    // After each cycle drops its reference and gc runs, the tracker MUST empty.
+    // Each cycle tracks a fresh filter INSIDE a reactive owner scope; disposing the
+    // scope must untrack it and let it be collected, so the tracker returns to 0.
+    // The cleanup + tag are detached primitives: they must NOT close over `f`.
     const CYCLES = 4096;
-    for (let i = 0; i < CYCLES; i++) {
-        let f = new Bloom(1024, { keys: "int" });
-        f.add(i | 0);
-        f.mightContain(i | 0);
-        // cleanup + tag are detached primitives: they must NOT close over `f`.
-        tracker.track(f, () => {}, "bloom", { audit: true });
-        f = null;
-    }
+    createRoot(() => {
+        for (let i = 0; i < CYCLES; i++) {
+            const e = effect(() => {
+                const f = new Bloom(1024, { keys: "int" });
+                f.add(i | 0);
+                f.mightContain(i | 0);
+                tracker.track(f, () => {}, "bloom", { audit: true });
+            });
+            dispose(e); // disposing the owner untracks the filter -> collectable
+        }
+    });
     globalThis.gc();
     await new Promise((r) => setTimeout(r, 50));
     const live = tracker.size();

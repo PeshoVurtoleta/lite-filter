@@ -1,0 +1,326 @@
+# @zakkster/lite-filter
+
+> A zero-GC approximate-membership filter FAMILY under one `LiteFilter<K>` surface: a Bloom reference member today, the modern space-optimal members (Cuckoo, XOR, Binary Fuse) to come -- one-line swappable, tree-shakeable to a single filter, with a shipped bench that measures ACTUAL vs THEORETICAL false-positive rate on your own keys instead of trusting a formula.
+
+[![npm version](https://img.shields.io/npm/v/@zakkster/lite-filter.svg?style=for-the-badge&color=latest)](https://www.npmjs.com/package/@zakkster/lite-filter)
+[![sponsor](https://img.shields.io/badge/sponsor-PeshoVurtoleta-ea4aaa.svg?logo=github)](https://github.com/sponsors/PeshoVurtoleta)
+![Zero-GC](https://img.shields.io/badge/Zero--GC-Engine-00C853?style=for-the-badge&logo=leaf&logoColor=white)
+[![npm bundle size](https://img.shields.io/bundlephobia/minzip/@zakkster/lite-filter?style=for-the-badge)](https://bundlephobia.com/result?p=@zakkster/lite-filter)
+[![npm downloads](https://img.shields.io/npm/dm/@zakkster/lite-filter?style=for-the-badge&color=blue)](https://www.npmjs.com/package/@zakkster/lite-filter)
+[![npm total downloads](https://img.shields.io/npm/dt/@zakkster/lite-filter?style=for-the-badge&color=blue)](https://www.npmjs.com/package/@zakkster/lite-filter)
+![Tree-Shakeable](https://img.shields.io/badge/tree--shakeable-yes-brightgreen)
+![TypeScript](https://img.shields.io/badge/TypeScript-Types-informational)
+![Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)
+[![license](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](./LICENSE)
+
+## The membership filter the ecosystem was missing
+
+You want to answer "have I seen this key?" -- dedup, set membership, cache admission, "is this id probably in the set?" -- and a JS `Set` is the obvious tool. But a `Set` stores every key by value or reference, allocates per entry, resizes by copying, and costs tens of bytes per key plus GC pressure. A probabilistic filter answers the SAME membership question in a handful of **bits** per entry, at fixed preallocated memory with **no per-op allocation**, a small bounded tunable false-positive rate, and **zero false negatives**.
+
+And choosing the right probabilistic structure is a real, hard-to-navigate decision with no universal winner -- Bloom is the baseline but cannot delete and is not the smallest; Cuckoo and Counting Bloom delete but cost more; XOR and Binary Fuse are near the space lower bound but are static. `lite-filter` puts that whole family behind ONE identical interface (a one-line constructor swap) plus **the bench that tells you which one to pick**: measured FPR vs theoretical, bits/item, add/query ns, on YOUR keys.
+
+```bash
+npm install @zakkster/lite-filter
+```
+
+```js
+import { Bloom } from '@zakkster/lite-filter';
+
+const seen = new Bloom(100000, { fpp: 0.01 });   // sized for 100k items at a 1% target
+
+seen.add('user:42');
+seen.add('user:99');
+
+seen.mightContain('user:42');   // true  -- always (added keys never read false)
+seen.mightContain('user:7');    // false -- (or, ~1% of the time, a false positive)
+seen.has('user:99');            // true  -- has() is the alias of mightContain
+seen.size;                      // 2     -- adds recorded
+seen.fpp();                     // the fill-derived FPR estimate (a formula, not a measurement)
+```
+
+One `LiteFilter<K>` surface, `add`/`mightContain`/`has`/`size`/`capacity`/`fpp`/`clear`, zero allocation on every hot path after construction. Integer keys opt into a strict-zero-alloc backing. `import { Bloom }` is the whole library today; future members ship as further named exports (`sideEffects: false` drops whichever you do not import).
+
+Then measure, do not guess:
+
+```bash
+npm run bench     # measured vs theoretical FPR (% over), bits/item, add/query ns, per workload
+```
+
+---
+
+## Table of contents
+
+- [Why this exists](#why-this-exists)
+- [What you get](#what-you-get)
+- [The Bloom filter, in brief](#the-bloom-filter-in-brief)
+- [API reference](#api-reference)
+  - [Construction](#construction)
+  - [The surface](#the-surface)
+  - [Integer keys -- strict zero-alloc](#integer-keys----strict-zero-alloc)
+  - [Stats -- opt-in runtime counters](#stats----opt-in-runtime-counters)
+  - [Snapshot -- dump / restore](#snapshot----dump--restore)
+  - [The bench tool](#the-bench-tool)
+  - [Constants](#constants)
+- [Composability](#composability)
+- [Zero-GC design notes](#zero-gc-design-notes)
+- [Design decisions worth knowing](#design-decisions-worth-knowing)
+- [Testing](#testing)
+- [What this is not](#what-this-is-not)
+- [Ecosystem](#ecosystem)
+- [License](#license)
+
+---
+
+## Why this exists
+
+Every membership question in JS defaults to `Set`, and `Set` is exact -- which is
+exactly the problem when you do not need exactness. A dedup over a stream of a
+billion ids, a "have I crawled this URL", a cache admission gate keeping one-hit
+wonders out -- none of these need to store the keys, only to answer "probably yes /
+definitely no". Storing the keys is the cost you are trying to avoid.
+
+A Bloom filter answers that in `~1.44 * log2(1/fpp)` bits per item -- about 9.6 bits
+(1.2 bytes) per item at a 1% false-positive rate, versus tens of bytes per key for a
+`Set`, and with no per-op allocation and no GC churn. The tradeoff is a bounded,
+tunable rate of false POSITIVES; there are never false negatives.
+
+The reason this is a FAMILY and not one filter: the right structure depends on your
+axes (target fpp, space, delete support, static-vs-incremental, query speed,
+mergeability), and there is no universal winner. `lite-filter` grows one member per
+release under one surface, and ships the bench so you measure the tradeoff on your
+own keys rather than copying a number from a paper.
+
+## What you get
+
+- **One uniform surface.** `add` / `mightContain` / `has` / `size` / `count` /
+  `capacity` / `fpp` / `clear`, identical across every present and future member.
+- **Zero-GC hot path.** One preallocated `Uint32Array`, sized once, reused forever.
+  `add` and `mightContain` allocate nothing on the `keys:'int'` and string paths.
+- **Fail-closed everywhere.** Impossible sizing, a bad int key, a `remove` on an
+  add-only member, or a corrupt snapshot all throw a `[lite-filter]`-tagged Error.
+- **The honesty bench.** Measured vs theoretical FPR as `% over theoretical`,
+  checked against a real `Set` oracle, over four seeded workloads.
+- **Snapshot round-trip.** `dump()` / `restore()` -- the typed array IS the serial
+  form; structurally-cloneable and JSON-safe; fail-closed on any mismatch.
+- **Types + tree-shaking.** `Filter.d.ts` types `LiteFilter<K>`; `sideEffects: false`.
+
+## The Bloom filter, in brief
+
+<details>
+<summary>How the reference member works (and its one-sided guarantee)</summary>
+
+A Bloom filter is one bit array of `m` bits plus `k` hash functions. To `add` a key,
+compute `k` positions and set those `k` bits. To query, compute the same `k`
+positions and return `true` only if ALL `k` bits are set.
+
+- If a key was added, its `k` bits are set, so `mightContain` returns `true` --
+  **always**. There are **no false negatives**.
+- If a key was never added, its `k` bits might still all happen to be set by OTHER
+  keys -- a **false positive**, whose probability is bounded by the configured
+  `fpp` and rises as the filter fills.
+
+`lite-filter` derives `m` and `k` from your `(capacity, fpp)`:
+
+    m = ceil(-n * ln(fpp) / ln(2)^2)      bits
+    k = round((m / n) * ln(2))            hash positions (clamped >= 1)
+
+All `k` positions come from just TWO base hashes via enhanced double hashing
+(`pos_i = (h1 + i*h2) mod m`), so a probe needs zero scratch storage. Bloom cannot
+delete -- clearing a key's bits would corrupt every other key sharing one of them --
+so `remove()` throws (use a deletable member when the roster ships one).
+
+</details>
+
+## API reference
+
+### Construction
+
+```ts
+new Bloom(capacity: number, options?: {
+  fpp?: number;      // target false-positive probability in (0, 1). Default 0.01.
+  seed?: number;     // hash seed (32-bit-coercible). Default is a fixed constant.
+  keys?: 'int';      // opt into the strict-zero-alloc 32-bit-integer backing.
+  stats?: boolean;   // mint the per-instance stats holder. OFF by default.
+})
+```
+
+Fail-closed doors (all throw a `[lite-filter]`-tagged Error): `capacity` non-integer
+or `< 1`; `fpp` not in the open interval `(0, 1)` (so `<= 0` and `>= 1` both throw);
+a bit count that would overflow a safe typed-array length; an unknown `keys` or
+`stats` value (with a did-you-mean hint).
+
+### The surface
+
+| Method | Returns | Notes |
+| --- | --- | --- |
+| `add(key)` | `void` | Record a key. Zero-alloc on int + string keys. |
+| `mightContain(key)` | `boolean` | The query. NO false negatives; false positives bounded by `fpp`. |
+| `has(key)` | `boolean` | The sole alias of `mightContain`, same semantics. |
+| `remove(key)` | `never` | Bloom is add-only: **throws** `[lite-filter]` (fail closed). |
+| `size` / `count` | `number` | Adds recorded (a plain counter, not a distinct-key count). |
+| `capacity` | `number` | The item count the filter was sized for. |
+| `fpp()` | `number` | Configured target while empty, else the fill-derived estimate. |
+| `clear()` | `void` | Reset to empty. Allocates nothing (zeroes the store in place). |
+| `stats()` / `resetStats()` | -- | Require `{ stats: true }`; fail closed otherwise. |
+| `dump()` | snapshot | Serialize. Cold; may allocate. |
+| `Bloom.restore(snap, opts?)` | `Bloom` | Static. Rebuild; fail closed on any mismatch. |
+
+### Integer keys -- strict zero-alloc
+
+```js
+const f = new Bloom(1_000_000, { fpp: 0.001, keys: 'int' });
+f.add(42);                 // mixed directly -- no string encoding, no allocation
+f.mightContain(42);        // true
+f.add(2 ** 31);            // throws [lite-filter]: keys:'int' requires a 32-bit signed integer
+```
+
+`keys: 'int'` restricts keys to 32-bit signed integers (`-2147483648 .. 2147483647`)
+and takes an integer-mix hash path that never encodes a string -- the mode the perf
+gate proves is 0 B/op. String keys on the default backing are also alloc-free (they
+hash over their code units); only a non-string, non-int key pays a `String()` encode.
+
+### Stats -- opt-in runtime counters
+
+```js
+const f = new Bloom(1000, { stats: true });
+f.add('a'); f.mightContain('a'); f.mightContain('z');
+f.stats();       // { adds: 1, queries: 2, hits: 1, misses: 1 }  (BY REFERENCE)
+f.resetStats();  // zeroes the same holder in place
+```
+
+OFF by default: with no `{ stats: true }`, `_stats === null` and the hot path writes
+nothing. `stats()` / `resetStats()` on a non-stats instance throw (null is not zero).
+
+### Snapshot -- dump / restore
+
+```js
+const snap = f.dump();                 // plain, structuredClone- and JSON-safe
+const json = JSON.stringify(snap);     // persist to disk / IPC / a worker
+const g = Bloom.restore(JSON.parse(json));   // bit-identical membership
+```
+
+The `Uint32Array` store IS the serial form. `restore()` re-derives `(m, k)` from the
+recorded `(cap, fpp)` and REJECTS -- never truncates -- on any tag, member, capacity,
+fpp, seed, bit-count, or count mismatch.
+
+### The bench tool
+
+```js
+import { runBench } from '@zakkster/lite-filter/benchmark/Bench.mjs';
+const rows = runBench({ cap: 100000, fpp: 0.01 });
+// each row: { name, bitsPerItem, k, measuredFpr, theoretical, overPct, addNs, queryNs, falseNeg }
+```
+
+### Constants
+
+| Export | Meaning |
+| --- | --- |
+| `VERSION` | the package version string (`"0.1.0"`) |
+| `Bloom` | the reference member (also the default export) |
+
+## Composability
+
+Approximate membership is machinery that lives INSIDE bigger systems. A cache
+admission gate that keeps one-hit-wonders out of an LRU is a canonical pairing:
+
+```js
+import { Bloom } from '@zakkster/lite-filter';
+import { LiteLru } from '@zakkster/lite-lru';
+
+const cache = new LiteLru(10000);
+const seen = new Bloom(1_000_000, { fpp: 0.01 });
+
+function admit(key, load) {
+  // Only cache a key we have seen at least once before -- one-hit wonders never
+  // pollute the cache, and the filter costs ~1.2 bytes/key instead of a second Set.
+  if (seen.mightContain(key)) {
+    let v = cache.get(key);
+    if (v === undefined) { v = load(key); cache.put(key, v); }
+    return v;
+  }
+  seen.add(key);           // first sighting: record it, but skip the cache this time
+  return load(key);
+}
+```
+
+Pairs equally with `@zakkster/lite-binary-reader` -- build a filter over record ids
+parsed straight out of a foreign binary buffer, with no intermediate `Set`.
+
+## Zero-GC design notes
+
+<details>
+<summary>Allocation table + the two-hash trick</summary>
+
+| Operation | Allocation (keys:'int') | Allocation (string) | Allocation (arbitrary) |
+| --- | --- | --- | --- |
+| `add` | 0 B | 0 B | 1 `String()` (amortized) |
+| `mightContain` / `has` | 0 B | 0 B | 1 `String()` (amortized) |
+| `clear` | 0 B (same ArrayBuffer) | 0 B | 0 B |
+| `fpp` / `size` / `stats` | 0 B | 0 B | 0 B |
+| `dump` | O(words) -- cold, allowed | -- | -- |
+
+- **One preallocated `Uint32Array`** of `ceil(m/32)` words, sized once from
+  `(n, fpp)`, never grown, never reallocated. `clear()` zeroes it in place -- the
+  ArrayBuffer identity is preserved (proven by the torture gate).
+- **Enhanced double hashing** (Kirsch & Mitzenmacher, 2006): all `k` probe positions
+  come from two base hashes, `pos_i = (h1 + i*h2) mod m`, so a probe needs no
+  `k`-length array -- zero scratch storage, two real hashes per op.
+- **`Math.imul` throughout** the murmur3 `fmix32` mixer -- exact 32-bit multiplies,
+  never a boxed heap double.
+- **Opt-in stats guard** (`_stats === null`) is the ONLY extra hot-path branch, and
+  it is free when stats are off.
+
+Gated numbers (this repo, `npm run test:perf` + `npm run torture`): add + mightContain
+on `keys:'int'` = **0 B/op**, **maxMajor 0**; 1e6 adds then requery = **0 false
+negatives**; n=1e5, fpp=0.01, 1e6 disjoint probes = measured FPR **<= 0.0125**
+(<= 25% over the formula). ns/op figures are machine-local -- run `npm run bench`.
+
+</details>
+
+## Design decisions worth knowing
+
+- **The hash is load-bearing, and validated by the bench, not reputation**
+  (decisions/0001). murmur3 `fmix32` + a direct integer mix + an alloc-free string
+  hash; hash quality is what keeps measured FPR near theory, so it is a gated number.
+- **`(n, fpp)` is the sizing surface** (decisions/0002); explicit `(bits, k)` is not
+  offered in v0.1.0. Every impossible request fails closed at the door.
+- **Bloom is add-only, loudly** (decisions/0003). `remove()` throws rather than
+  silently corrupting other keys. `count` is an add-call counter, not distinct keys.
+- **`fpp()` is an estimate, labeled as one** (decisions/0004). Measure your own keys.
+- **The snapshot rejects, never truncates** (decisions/0005). A corrupt or foreign
+  snapshot is an error, not a silently-wrong filter.
+- **The static-build API is deferred** (decisions/0006) to the first static member.
+
+## Testing
+
+`node:test` only, zero runtime deps. The gates (`npm run verify` runs all of them):
+
+- `npm test` -- the boundary suite: every method, every one-sided law, every
+  fail-closed door, plus an ASCII-source guard.
+- `npm run test:types` -- `tsc --noEmit` proves `Bloom` satisfies `LiteFilter<K>`.
+- `npm run torture` -- `node --expose-gc`: the leak tracker (retention returns to 0)
+  + the GC profiler (maxMajor 0) + the Set-differential oracle (no false negatives,
+  bounded FPR) + the `clear()` ArrayBuffer-identity check.
+- `npm run torture:controls` -- the must-fail proof: a broken build MUST fail.
+- `npm run test:perf` -- the `@zakkster/lite-perf-gate` zero-alloc scenarios
+  (add-churn + query-hit on `keys:'int'`), with an allocating mustFail for teeth.
+- `npm run bench` -- the measurement tool.
+
+## What this is not
+
+- **Not cryptographic.** Fingerprints are not MACs; do not use it for security.
+- **Not an exact set.** It answers "probably yes / definitely no". Use `Set` when you
+  need certainty on the positive side.
+- **Not a key-value store.** It stores membership, never values.
+
+## Ecosystem
+
+Part of the `@zakkster/*` suite of zero-GC, single-file micro-libraries. Pairs with
+[`@zakkster/lite-lru`](https://www.npmjs.com/package/@zakkster/lite-lru) (a filter is
+a natural cache-admission gate) and
+[`@zakkster/lite-binary-reader`](https://www.npmjs.com/package/@zakkster/lite-binary-reader)
+(build a filter over ids parsed from a binary buffer). Same laws, same voice.
+
+## License
+
+MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>

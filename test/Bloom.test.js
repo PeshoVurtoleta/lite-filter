@@ -159,3 +159,44 @@ test("door: int key out of 32-bit range throws [lite-filter] TypeError", () => {
 test("door: unknown keys option fails closed with a did-you-mean hint", () => {
     assert.throws(() => new Bloom(10, { keys: "ints" }), /did you mean 'int'\?/);
 });
+
+test("door: capacity/fpp requesting an overflowing bit count throws [lite-filter] RangeError", () => {
+    // (n, fpp) that derive m > 0x7fffffe0 must fail BEFORE the Uint32Array allocation
+    // throws an opaque error (decisions/0002; ROADMAP section 6).
+    assert.throws(() => new Bloom(1e15, { fpp: 1e-15 }), /\[lite-filter\].*too large/);
+});
+
+test("door: constructor with no capacity argument (undefined) throws [lite-filter]", () => {
+    assert.throws(() => new Bloom(), /\[lite-filter\].*capacity/);
+    assert.throws(() => new Bloom(undefined), /\[lite-filter\].*capacity/);
+});
+
+test("door: NaN fails closed for capacity, fpp, and seed", () => {
+    assert.throws(() => new Bloom(NaN), /\[lite-filter\].*capacity/);
+    assert.throws(() => new Bloom(100, { fpp: NaN }), /\[lite-filter\].*fpp/);
+    assert.throws(() => new Bloom(100, { seed: NaN }), /\[lite-filter\].*seed/);
+});
+
+test("boundary: capacity N=1 constructs and behaves correctly", () => {
+    const f = new Bloom(1, { keys: "int" });
+    f.add(42);
+    assert.equal(f.mightContain(42), true);
+    validate(f);
+});
+
+test("boundary: keys:'int' accepts the exact INT_MIN/INT_MAX edges and -0/0", () => {
+    const f = new Bloom(10, { keys: "int" });
+    for (const k of [-2147483648, 2147483647, -0, 0]) {
+        f.add(k);
+        assert.equal(f.mightContain(k), true, "boundary key " + k + " must read true");
+    }
+    validate(f);
+});
+
+test("door: NaN/null/undefined int keys fail closed on add() and mightContain()", () => {
+    const f = new Bloom(10, { keys: "int" });
+    for (const bad of [NaN, null, undefined, "5", {}, []]) {
+        assert.throws(() => f.add(bad), /\[lite-filter\].*keys:'int'/, "add(" + String(bad) + ")");
+        assert.throws(() => f.mightContain(bad), /\[lite-filter\].*keys:'int'/, "mightContain(" + String(bad) + ")");
+    }
+});

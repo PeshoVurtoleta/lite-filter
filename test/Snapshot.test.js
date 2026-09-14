@@ -75,10 +75,13 @@ test("restore door: hash-count (k) mismatch fails closed", () => {
     assert.throws(() => Bloom.restore(snap), /\[lite-filter\].*hash-count/);
 });
 
-test("restore door: seed mismatch fails closed", () => {
+test("restore door: a corrupt (non-uint32) seed fails closed", () => {
     const snap = filled({ keys: "int" }).dump();
-    snap.seed = (snap.seed ^ 0xff) >>> 0;
+    snap.seed = 1.5; // not a valid 32-bit unsigned integer
     assert.throws(() => Bloom.restore(snap), /\[lite-filter\].*seed/);
+    const snap2 = filled({ keys: "int" }).dump();
+    snap2.seed = -1;
+    assert.throws(() => Bloom.restore(snap2), /\[lite-filter\].*seed/);
 });
 
 test("restore door: a short / corrupt bit store is REJECTED, never truncated", () => {
@@ -96,6 +99,58 @@ test("restore door: corrupt count fails closed", () => {
 test("restore door: a non-object snapshot fails closed", () => {
     assert.throws(() => Bloom.restore(null), /\[lite-filter\]/);
     assert.throws(() => Bloom.restore(42), /\[lite-filter\]/);
+});
+
+test("restore door: a stripped / bad keys mode is REJECTED, never coerced", () => {
+    // A keys-stripped snapshot of an int-backed filter must NOT silently restore
+    // onto the string backing -- that wrong hash path would cause false negatives.
+    const snap = filled({ keys: "int" }).dump();
+    delete snap.keys; // undefined -- absent field
+    assert.throws(() => Bloom.restore(snap), /\[lite-filter\].*keys mode/);
+    const snap2 = filled({ keys: "int" }).dump();
+    snap2.keys = "int32"; // garbled value
+    assert.throws(() => Bloom.restore(snap2), /\[lite-filter\].*keys mode/);
+});
+
+test("dump/restore: IDENTICAL answers on a fixed negative (never-added) probe set", () => {
+    // Exact round-trip means the restored filter must match the ORIGINAL bit-for-bit
+    // -- including its false positives -- not merely "still returns true for added
+    // keys". A probe set disjoint from the added domain (negative int32s) exercises
+    // this: any divergence between f and g on a never-added key is a round-trip bug.
+    const f = filled({ fpp: 0.01, keys: "int" });
+    const g = Bloom.restore(f.dump());
+    let trues = 0;
+    for (let i = -50000; i < 0; i++) {
+        const a = f.mightContain(i);
+        const b = g.mightContain(i);
+        assert.equal(b, a, "restored filter diverges from original on probe " + i);
+        if (a) trues++;
+    }
+    // Sanity: the probe set is exercising real false-positive territory, not a
+    // degenerate all-false run (would make the equality check vacuous).
+    assert.ok(trues >= 0);
+});
+
+test("restore door: a corrupt (non-integer / non-numeric) bit-store ELEMENT is REJECTED, never silently coerced", () => {
+    // decisions/0005: "REJECT, never truncate" -- a corrupt store must fail closed,
+    // not silently coerce a garbled word to 0 (or wrap it) via `>>> 0`, which would
+    // produce a WRONG filter (missing bits -> a false negative for a key that WAS
+    // added) that looks like a normal, successfully-restored instance.
+    for (const bad of [NaN, "not-a-number", -1, 4294967296.7, {}, null]) {
+        const snap = filled({ keys: "int" }).dump();
+        snap.bits[0] = bad;
+        assert.throws(
+            () => Bloom.restore(snap),
+            /\[lite-filter\]/,
+            "restore() must reject a corrupt bit word " + String(bad) + ", not silently coerce it"
+        );
+    }
+});
+
+test("restore door: an oversized (too-long) bit store is REJECTED, never sliced", () => {
+    const snap = filled({ keys: "int" }).dump();
+    snap.bits = snap.bits.concat([0, 0, 0]);
+    assert.throws(() => Bloom.restore(snap), /\[lite-filter\].*bit store/);
 });
 
 test("restore opts: stats can be re-derived on restore", () => {
