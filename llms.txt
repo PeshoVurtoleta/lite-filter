@@ -1,0 +1,106 @@
+# @zakkster/lite-filter
+
+Zero-dependency, zero-GC approximate-membership filter FAMILY for JavaScript under
+one uniform LiteFilter<K> surface. v0.1.0 ships the substrate + the reference
+member: Bloom (Bloom, CACM 1970) -- the differential oracle and the honest floor the
+rest of the family (Counting Bloom, Blocked Bloom, Cuckoo, Quotient, XOR, Binary
+Fuse) will improve on, one member per release. Every member exposes the SAME
+add/mightContain/has/size/count/capacity/fpp/clear API, so the filter is a one-line
+constructor swap. Single-file ESM, zero runtime dependencies, node:test only. Ships
+a runnable + importable bench (Bench.mjs) that measures ACTUAL vs THEORETICAL
+false-positive rate on your own keys, checked against a real Set oracle.
+
+## Status: 0.1.0 - substrate + Bloom reference member.
+
+The problem it solves: "have I seen this key?" -- dedup, set membership, cache
+admission -- at a handful of BITS per entry instead of the tens of bytes a Set costs
+per key, with a small, bounded, tunable false-positive rate and ZERO false
+negatives, at fixed preallocated memory with no per-op allocation.
+
+The family is the identity from v0.1.0, exactly as @zakkster/lite-lru puts its
+eviction policies under one LiteCache<K,V> surface: Bloom is the reference member +
+differential oracle + honest floor, and the shipped bench is the differentiator --
+it measures the divergence between the textbook FPR formula and your filter's
+behavior on your keys, instead of copying a number from a paper.
+
+## The surface (LiteFilter<K>)
+
+- add(key) -> void: record a key. Zero allocation on keys:'int' and string paths;
+  arbitrary keys are amortized where they must String()-encode.
+- mightContain(key) -> boolean: the query. NO false negatives -- an added key ALWAYS
+  reads true. A true on a never-added key is a false POSITIVE, bounded by the
+  configured fpp. One-sided: false positives only.
+- has(key): the SOLE alias of mightContain (same one-sided semantics). No third name.
+- remove(key): Bloom is ADD-ONLY -- it throws a [lite-filter] Error (fail closed;
+  clearing bits would cause false negatives for other keys). Deletable members
+  (Counting Bloom / Cuckoo / Quotient) will implement it later.
+- size / count -> number: the number of adds recorded (a plain counter, not an
+  estimate, not a distinct-key count -- Bloom cannot detect a duplicate add).
+- capacity -> number: the item count the filter was sized for at construction.
+- fpp() -> number: the CONFIGURED target while empty, else the fill-derived
+  closed-form ESTIMATE (1 - e^(-k*n/m))^k. A formula, NOT a measurement -- measure
+  your own keys with the bench.
+- clear() -> void: reset to empty; allocates nothing (zeroes the store in place,
+  same ArrayBuffer identity).
+
+Cross-cutting, mirrored from lite-lru:
+- keys:'int' strict-zero-alloc mode: 32-bit signed integer keys, mixed directly with
+  no string encoding. Out-of-range / non-integer keys throw a [lite-filter] TypeError.
+- Opt-in stats { stats: true }: a per-instance holder { adds, queries, hits, misses };
+  OFF by default so the hot path writes nothing (_stats === null). stats()/resetStats()
+  fail closed on a non-stats instance.
+- dump() / static Bloom.restore(snap, opts?): the Uint32Array store IS the serial
+  form, emitted as a plain array that round-trips through structuredClone and JSON;
+  restore rejects any tag/member/capacity/fpp/seed/bit-count mismatch or corruption
+  (REJECT, never truncate).
+
+## Members (decisions/0001)
+
+- Bloom: one bit array of m bits, k hash positions per key. add sets k bits;
+  mightContain returns true only if all k bits are set. Add-only, one-sided, the
+  textbook baseline and the differential oracle. Good for: a simple, well-understood
+  membership filter at a fixed target fpp. Not for: deletes (add-only), or the
+  smallest possible space at very low fpp (the static members will win there).
+
+## Construction
+
+new Bloom(capacity, { fpp = 0.01, seed?, keys?: 'int', stats?: true })
+
+Sizing (decisions/0002): m = ceil(-n * ln(fpp) / ln(2)^2), k = round((m/n) * ln(2)),
+k clamped to >= 1. Fail-closed doors: fpp not in (0,1), capacity < 1, or an
+overflowing bit count all throw a [lite-filter] Error at construction. null is not
+zero: an unsized filter is never a zero-capacity one.
+
+## The honesty hook (the bench's whole point)
+
+The textbook fpp = (1 - e^(-kn/m))^k assumes independent, uniform hash positions.
+Under real key distributions, at high load factor / near-full fill, the MEASURED FPR
+runs OVER the formula. Bench.mjs prints "% over theoretical" for four seeded
+workloads (uniform, zipfian, sequential, adversarial near-full) checked against a
+real Set oracle, so the divergence is the first thing you see. A number from a paper
+is a hypothesis, not your filter's behavior on your keys -- MEASURE.
+
+## Guarantees
+
+- Zero allocation on add + mightContain (strict on keys:'int'; string keys too).
+  Proven by node --expose-gc test/torture.mjs and the lite-perf-gate scenarios.
+- No false negatives: 1e6 adds then requery = exactly 0 false negatives (torture).
+- Bounded FPR: n=1e5, fpp=0.01, 1e6 disjoint probes -> measured FPR <= 0.0125
+  (<= 25% over the formula), checked against a Set oracle (torture).
+- Fail closed on every unverified state; [lite-filter]-tagged errors throughout.
+
+## Testing
+
+node:test only. npm test (boundary suite), npm run test:types (tsc surface gate),
+npm run torture (leak + GC gate + differential oracle), npm run torture:controls
+(the must-fail proof), npm run test:perf (lite-perf-gate zero-alloc scenarios),
+npm run bench (the measurement tool), npm run verify (all of the gates).
+
+## What this is not
+
+Not a cryptographic structure (fingerprints are not MACs). Not an exact set (that is
+what Set is for). Not a key-value store (it stores membership, never values).
+
+## License
+
+MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>

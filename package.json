@@ -1,0 +1,82 @@
+{
+  "name": "@zakkster/lite-filter",
+  "author": "Zahary Shinikchiev <shinikchiev@yahoo.com>",
+  "version": "0.1.0",
+  "description": "Zero-dependency, zero-GC approximate-membership filter family under one LiteFilter<K> surface: a Bloom reference member and the modern space-optimal static members (XOR / Binary Fuse), tree-shakeable to one filter, with a shipped bench that measures actual vs theoretical false-positive rate.",
+  "type": "module",
+  "main": "./Filter.js",
+  "module": "./Filter.js",
+  "types": "./Filter.d.ts",
+  "exports": {
+    ".": {
+      "types": "./Filter.d.ts",
+      "node": "./Filter.js",
+      "import": "./Filter.js",
+      "default": "./Filter.js"
+    },
+    "./benchmark/Bench.mjs": "./benchmark/Bench.mjs"
+  },
+  "files": [
+    "Filter.js",
+    "Filter.d.ts",
+    "benchmark/Bench.mjs",
+    "llms.txt",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "test:types": "tsc -p test/types/tsconfig.json",
+    "torture": "node --expose-gc test/torture.mjs",
+    "torture:controls": "node test/controls.mjs",
+    "test:perf": "node --expose-gc --max-semi-space-size=4 --test test/perf/PerfGate.test.mjs",
+    "bench": "node benchmark/Bench.mjs",
+    "verify": "npm test && npm run test:types && npm run torture && npm run torture:controls && npm run test:perf"
+  },
+  "keywords": [
+    "bloom",
+    "bloom-filter",
+    "cuckoo-filter",
+    "xor-filter",
+    "binary-fuse",
+    "approximate-membership",
+    "probabilistic",
+    "set-membership",
+    "dedup",
+    "zero-gc",
+    "gc",
+    "garbage-collection",
+    "memory",
+    "performance",
+    "lightweight",
+    "zero-dependency"
+  ],
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "homepage": "https://github.com/PeshoVurtoleta/lite-filter#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/PeshoVurtoleta/lite-filter.git"
+  },
+  "bugs": {
+    "url": "https://github.com/PeshoVurtoleta/lite-filter/issues",
+    "email": "shinikchiev@yahoo.com"
+  },
+  "funding": {
+    "type": "github",
+    "url": "https://github.com/sponsors/PeshoVurtoleta"
+  },
+  "devDependencies": {
+    "@zakkster/lite-gc-profiler": "^1.16.0",
+    "@zakkster/lite-leak": "^1.10.0",
+    "@zakkster/lite-perf-gate": "^1.4.2",
+    "typescript": "^7.0.2"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "sideEffects": false
+}
