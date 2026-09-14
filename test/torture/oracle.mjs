@@ -78,3 +78,54 @@ export function differentialInt(Ctor, opts) {
         probed: probed,
     };
 }
+
+/**
+ * Run the DELETE differential oracle for a deletable integer-keyed member (e.g.
+ * CountingBloom). A `Set` mirrors add AND remove so a false negative on a key that is
+ * CURRENTLY present is unambiguous.
+ *
+ * Each op picks a key from the low int32 half; if the oracle says it is present the op
+ * REMOVES it (and asserts the filter agreed it was present), otherwise it ADDS it.
+ * Every key is at multiplicity 1 while present, so no counter saturates and a present
+ * key never reads false (decisions/0008, 0009). At the end, EVERY key still present in
+ * the oracle must read true -- 0 false negatives is the hard law.
+ *
+ * @param {Function} Ctor  the member constructor (e.g. CountingBloom)
+ * @param {{ n:number, fpp:number, ops:number, seed:number }} opts
+ * @returns {{ falseNegatives:number, present:number, filterSize:number }}
+ */
+export function differentialChurnInt(Ctor, opts) {
+    const n = opts.n;
+    const fpp = opts.fpp;
+    const ops = opts.ops;
+    const rng = makePrng(opts.seed >>> 0);
+
+    const filter = new Ctor(n, { fpp: fpp, keys: "int" });
+    const present = new Set();
+    let falseNegatives = 0;
+
+    for (let i = 0; i < ops; i++) {
+        const key = rng() >>> 1; // [0, 2^31) -- the low half
+        if (present.has(key)) {
+            // The oracle says present, so remove() MUST agree (return true) and MUST
+            // not have read the key as absent -- a false negative on a live key.
+            const removed = filter.remove(key);
+            if (!removed) falseNegatives++;
+            present.delete(key);
+        } else {
+            filter.add(key);
+            present.add(key);
+        }
+    }
+
+    // Law: every key CURRENTLY present must read true -- 0 false negatives.
+    for (const key of present) {
+        if (!filter.mightContain(key)) falseNegatives++;
+    }
+
+    return {
+        falseNegatives: falseNegatives,
+        present: present.size,
+        filterSize: filter.size,
+    };
+}

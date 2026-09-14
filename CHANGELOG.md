@@ -7,6 +7,49 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The `VERSION` constant, `package.json` `version`, and `llms.txt` are bumped
 together (three-place version sync) at release.
 
+## [0.2.0] - 2026-09-14
+
+The 2nd member -- `CountingBloom`, the deletable one.
+
+### Added
+
+- **`CountingBloom` -- the deletable member** (Fan, Cao, Almeida & Broder, 2000;
+  decisions/0007..0011). A new class IN `Filter.js` implementing the same uniform
+  `LiteFilter<K>` surface as `Bloom`, so it is a one-line constructor swap.
+  - Each Bloom bit becomes a 4-bit SATURATING counter, two packed per byte, in ONE
+    preallocated `Uint8Array` of `ceil(m/2)` bytes -- ~4x a plain Bloom's space
+    (decisions/0007). Same `(n, fpp)` sizing as Bloom (m, k shared).
+  - Hot path `add` (saturating increment; a counter at 15 stays 15, never wraps),
+    `mightContain` / `has` (true iff every probed counter is nonzero), and a REAL
+    `remove(key) -> boolean`. All strictly zero-alloc on `keys:'int'` (nibble
+    read/modify/write, no scratch array): 0 scavenges at N=200000 and 8N on
+    add-churn / query-hit / remove-churn under the pinned 4MB semi-space (perf-gate).
+  - `remove` is two-pass and fail-closed (decisions/0009): pass 1 verifies every
+    probed counter is nonzero (else returns `false`, mutates nothing); pass 2
+    decrements each counter in 1..14 (a saturated 15 is never decremented,
+    decisions/0008). Two honest caveats: removing a never-added key can corrupt other
+    keys (a later false negative), and a saturated counter sticks its keys present.
+  - `clear()` zeroes the counter store in place (same ArrayBuffer identity);
+    opt-in zero-GC stats; `dump()` / static `CountingBloom.restore(snap, opts?)` with a
+    `{ f, mem:"CountingBloom", w:4, m, k, cap, fpp, seed, keys, count, cnts }` tag that
+    validates every byte 0..255 (so every nibble 0..15) BEFORE building any instance,
+    and REJECTS any mismatch or corruption -- never truncates (decisions/0011).
+  - Approximate-multiplicity readout DEFERRED (decisions/0010): saturation + collisions
+    make it an over-estimate, so it does not ship un-characterized.
+- **`Filter.d.ts`** -- `CountingBloom<K> implements LiteFilter<K>` with a real
+  `remove(key): boolean`; `FilterSnapshot` extended with optional `w` / `cnts` fields.
+- **Gates extended** -- boundary suite (`test/CountingBloom.test.js` + CountingBloom
+  round-trip / corruption cases in `test/Snapshot.test.js`); the conservation invariant
+  `validateCounting` (every nibble 0..15, `sum(nibbles) <= k*size`); a
+  `differentialChurnInt` Set-oracle mirroring add AND remove (0 false negatives for
+  present keys); torture CountingBloom leak/GC + churn phases; three new perf-gate
+  scenarios (add-churn / query-hit / remove-churn on `keys:'int'`).
+- **The bench** (`benchmark/Bench.mjs`) -- a `CountingBloom` FPR-vs-theory table across
+  the four workloads (bits/item is 4x Bloom's), plus a `remove-churn` workload (add N,
+  remove half, requery): measured 0 false negatives for still-present keys.
+
+[0.2.0]: https://github.com/PeshoVurtoleta/lite-filter/releases/tag/v0.2.0
+
 ## [0.1.0] - 2026-09-14
 
 The SUBSTRATE + the reference member -- everything the family stands on.

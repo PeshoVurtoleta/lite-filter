@@ -9,11 +9,17 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { Bloom } from "../Filter.js";
-import { validate } from "./validate.mjs";
+import { Bloom, CountingBloom } from "../Filter.js";
+import { validate, validateCounting } from "./validate.mjs";
 
 function filled(opts) {
     const f = new Bloom(1000, opts);
+    for (let i = 0; i < 800; i++) f.add(opts && opts.keys === "int" ? i : "k-" + i);
+    return f;
+}
+
+function filledCounting(opts) {
+    const f = new CountingBloom(1000, opts);
     for (let i = 0; i < 800; i++) f.add(opts && opts.keys === "int" ? i : "k-" + i);
     return f;
 }
@@ -158,4 +164,86 @@ test("restore opts: stats can be re-derived on restore", () => {
     const g = Bloom.restore(snap, { stats: true });
     g.mightContain(1);
     assert.equal(g.stats().queries, 1);
+});
+
+/* ------------------------------------------------------------------------- *
+ * CountingBloom snapshot (decisions/0011): same envelope, byte store + w:4.
+ * ------------------------------------------------------------------------- */
+
+test("CountingBloom dump/restore: exact round-trip preserves membership + count", () => {
+    const f = filledCounting({ fpp: 0.01, keys: "int" });
+    for (let i = 0; i < 200; i++) f.remove(i); // exercise the counter store, not just fills
+    const g = CountingBloom.restore(f.dump());
+    assert.equal(g.size, f.size);
+    assert.equal(g.capacity, f.capacity);
+    for (let i = 200; i < 800; i++) assert.equal(g.mightContain(i), true);
+    validateCounting(g);
+});
+
+test("CountingBloom dump: round-trips through JSON and structuredClone", () => {
+    const f = filledCounting({ fpp: 0.01, keys: "int" });
+    const snap = f.dump();
+    const viaJson = CountingBloom.restore(JSON.parse(JSON.stringify(snap)));
+    const viaClone = CountingBloom.restore(structuredClone(snap));
+    for (let i = 0; i < 800; i++) {
+        assert.equal(viaJson.mightContain(i), true);
+        assert.equal(viaClone.mightContain(i), true);
+    }
+});
+
+test("CountingBloom dump: the tag shape is stable and self-describing (mem + w:4 + cnts)", () => {
+    const snap = filledCounting({ fpp: 0.01, keys: "int" }).dump();
+    assert.equal(snap.f, "litefilter/1");
+    assert.equal(snap.mem, "CountingBloom");
+    assert.equal(snap.w, 4);
+    assert.equal(snap.keys, "int");
+    assert.equal(Array.isArray(snap.cnts), true);
+    assert.equal(typeof snap.m, "number");
+    assert.equal(typeof snap.k, "number");
+});
+
+test("CountingBloom restore door: member mismatch (a Bloom snapshot) fails closed", () => {
+    const bloomSnap = filled({ keys: "int" }).dump();
+    assert.throws(() => CountingBloom.restore(bloomSnap), /\[lite-filter\].*member/);
+    const cbfSnap = filledCounting({ keys: "int" }).dump();
+    assert.throws(() => Bloom.restore(cbfSnap), /\[lite-filter\].*member/);
+});
+
+test("CountingBloom restore door: counter-width (w) mismatch fails closed", () => {
+    const snap = filledCounting({ keys: "int" }).dump();
+    snap.w = 8;
+    assert.throws(() => CountingBloom.restore(snap), /\[lite-filter\].*counter-width/);
+});
+
+test("CountingBloom restore door: a byte > 255 is REJECTED, never coerced (implies nibble > 15)", () => {
+    for (const bad of [256, 300, NaN, "x", -1, 12.5, {}, null]) {
+        const snap = filledCounting({ keys: "int" }).dump();
+        snap.cnts[0] = bad;
+        assert.throws(
+            () => CountingBloom.restore(snap),
+            /\[lite-filter\]/,
+            "restore() must reject a corrupt counter byte " + String(bad)
+        );
+    }
+});
+
+test("CountingBloom restore door: a short / oversized counter store is REJECTED", () => {
+    const shortSnap = filledCounting({ keys: "int" }).dump();
+    shortSnap.cnts = shortSnap.cnts.slice(0, shortSnap.cnts.length - 1);
+    assert.throws(() => CountingBloom.restore(shortSnap), /\[lite-filter\].*counter store/);
+    const longSnap = filledCounting({ keys: "int" }).dump();
+    longSnap.cnts = longSnap.cnts.concat([0, 0, 0]);
+    assert.throws(() => CountingBloom.restore(longSnap), /\[lite-filter\].*counter store/);
+});
+
+test("CountingBloom restore door: bad format tag / seed / keys / count fail closed", () => {
+    const s1 = filledCounting({ keys: "int" }).dump(); s1.f = "litefilter/2";
+    assert.throws(() => CountingBloom.restore(s1), /\[lite-filter\].*format tag/);
+    const s2 = filledCounting({ keys: "int" }).dump(); s2.seed = 1.5;
+    assert.throws(() => CountingBloom.restore(s2), /\[lite-filter\].*seed/);
+    const s3 = filledCounting({ keys: "int" }).dump(); delete s3.keys;
+    assert.throws(() => CountingBloom.restore(s3), /\[lite-filter\].*keys mode/);
+    const s4 = filledCounting({ keys: "int" }).dump(); s4.count = -1;
+    assert.throws(() => CountingBloom.restore(s4), /\[lite-filter\].*count/);
+    assert.throws(() => CountingBloom.restore(null), /\[lite-filter\]/);
 });

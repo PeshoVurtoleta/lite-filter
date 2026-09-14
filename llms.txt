@@ -3,14 +3,14 @@
 Zero-dependency, zero-GC approximate-membership filter FAMILY for JavaScript under
 one uniform LiteFilter<K> surface. v0.1.0 ships the substrate + the reference
 member: Bloom (Bloom, CACM 1970) -- the differential oracle and the honest floor the
-rest of the family (Counting Bloom, Blocked Bloom, Cuckoo, Quotient, XOR, Binary
-Fuse) will improve on, one member per release. Every member exposes the SAME
+rest of the family (Blocked Bloom, Cuckoo, Quotient, XOR, Binary Fuse) will improve
+on, one member per release. v0.2.0 adds CountingBloom, the deletable member. Every member exposes the SAME
 add/mightContain/has/size/count/capacity/fpp/clear API, so the filter is a one-line
 constructor swap. Single-file ESM, zero runtime dependencies, node:test only. Ships
 a runnable + importable bench (Bench.mjs) that measures ACTUAL vs THEORETICAL
 false-positive rate on your own keys, checked against a real Set oracle.
 
-## Status: 0.1.0 - substrate + Bloom reference member.
+## Status: 0.2.0 - substrate + Bloom reference member + CountingBloom (deletable).
 
 The problem it solves: "have I seen this key?" -- dedup, set membership, cache
 admission -- at a handful of BITS per entry instead of the tens of bytes a Set costs
@@ -31,9 +31,10 @@ behavior on your keys, instead of copying a number from a paper.
   reads true. A true on a never-added key is a false POSITIVE, bounded by the
   configured fpp. One-sided: false positives only.
 - has(key): the SOLE alias of mightContain (same one-sided semantics). No third name.
-- remove(key): Bloom is ADD-ONLY -- it throws a [lite-filter] Error (fail closed;
-  clearing bits would cause false negatives for other keys). Deletable members
-  (Counting Bloom / Cuckoo / Quotient) will implement it later.
+- remove(key): member-specific. Bloom is ADD-ONLY -- it throws a [lite-filter] Error
+  (fail closed; clearing bits would cause false negatives for other keys).
+  CountingBloom implements a REAL remove(key) -> boolean (returns false and mutates
+  nothing if the key is absent). Further deletable members (Cuckoo / Quotient) later.
 - size / count -> number: the number of adds recorded (a plain counter, not an
   estimate, not a distinct-key count -- Bloom cannot detect a duplicate add).
 - capacity -> number: the item count the filter was sized for at construction.
@@ -49,27 +50,41 @@ Cross-cutting, mirrored from lite-lru:
 - Opt-in stats { stats: true }: a per-instance holder { adds, queries, hits, misses };
   OFF by default so the hot path writes nothing (_stats === null). stats()/resetStats()
   fail closed on a non-stats instance.
-- dump() / static Bloom.restore(snap, opts?): the Uint32Array store IS the serial
+- dump() / static Member.restore(snap, opts?): the typed-array store IS the serial
   form, emitted as a plain array that round-trips through structuredClone and JSON;
-  restore rejects any tag/member/capacity/fpp/seed/bit-count mismatch or corruption
-  (REJECT, never truncate).
+  restore rejects any tag/member/width/capacity/fpp/seed/store-length mismatch or
+  corruption (REJECT, never truncate). Bloom emits { bits }; CountingBloom emits
+  { w:4, cnts } and validates every byte 0..255 (so every nibble 0..15) before build.
 
-## Members (decisions/0001)
+## Members
 
-- Bloom: one bit array of m bits, k hash positions per key. add sets k bits;
-  mightContain returns true only if all k bits are set. Add-only, one-sided, the
-  textbook baseline and the differential oracle. Good for: a simple, well-understood
+- Bloom (decisions/0001): one bit array of m bits, k hash positions per key. add sets
+  k bits; mightContain returns true only if all k bits are set. Add-only, one-sided,
+  the textbook baseline and the differential oracle. Good for: a simple, well-understood
   membership filter at a fixed target fpp. Not for: deletes (add-only), or the
   smallest possible space at very low fpp (the static members will win there).
+- CountingBloom (decisions/0007..0011): each bit becomes a 4-bit SATURATING counter,
+  two packed per byte (one Uint8Array). add increments, remove decrements,
+  mightContain is true iff every probed counter is nonzero. Costs ~4x Bloom's space
+  and buys a REAL remove(key) -> boolean. Same FPR formula as Bloom. Two honest
+  caveats: (1) removing a NEVER-ADDED key can corrupt other keys and cause a later
+  false negative -- only remove keys you added; (2) a counter that SATURATES at 15 is
+  clamped forever (never wraps on add, never decrements on remove), so its keys stick
+  present. Good for: membership + deletes with Bloom semantics. Not for: the lowest
+  space per deletable item (Cuckoo, planned), or a multiplicity readout (deferred,
+  decisions/0010 -- saturation makes it an over-estimate).
 
 ## Construction
 
 new Bloom(capacity, { fpp = 0.01, seed?, keys?: 'int', stats?: true })
+new CountingBloom(capacity, { fpp = 0.01, seed?, keys?: 'int', stats?: true })
 
 Sizing (decisions/0002): m = ceil(-n * ln(fpp) / ln(2)^2), k = round((m/n) * ln(2)),
-k clamped to >= 1. Fail-closed doors: fpp not in (0,1), capacity < 1, or an
-overflowing bit count all throw a [lite-filter] Error at construction. null is not
-zero: an unsized filter is never a zero-capacity one.
+k clamped to >= 1. Both members share the sizing; CountingBloom stores ceil(m/2) bytes
+(two 4-bit counters per byte) where Bloom stores ceil(m/32) 32-bit words. Fail-closed
+doors: fpp not in (0,1), capacity < 1, or an overflowing store all throw a
+[lite-filter] Error at construction. null is not zero: an unsized filter is never a
+zero-capacity one.
 
 ## The honesty hook (the bench's whole point)
 
@@ -87,6 +102,9 @@ is a hypothesis, not your filter's behavior on your keys -- MEASURE.
 - No false negatives: 1e6 adds then requery = exactly 0 false negatives (torture).
 - Bounded FPR: n=1e5, fpp=0.01, 1e6 disjoint probes -> measured FPR <= 0.0125
   (<= 25% over the formula), checked against a Set oracle (torture).
+- CountingBloom deletes: add/mightContain/remove on keys:'int' are 0 scavenges at N
+  and 8N (perf-gate); 1e5 mixed add/remove ops -> 0 false negatives for present keys
+  and sum(nibbles) <= k*size (torture).
 - Fail closed on every unverified state; [lite-filter]-tagged errors throughout.
 
 ## Testing

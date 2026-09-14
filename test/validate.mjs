@@ -68,3 +68,56 @@ export function validate(filter) {
         throw new Error("[validate] non-empty filter (count=" + count + ") has 0 bits set");
     }
 }
+
+/**
+ * Assert the CONSERVATION invariant for a CountingBloom (test/debug only, O(bytes)).
+ *
+ *   cnts.length === ceil(m / 2)                (the store matches the sizing)
+ *   m >= 1 && k >= 1                           (a validly sized filter)
+ *   every packed nibble is in 0..15            (no negative, no overflow past 4 bits)
+ *   sum(nibbles) <= k * count                  (each add raises the sum by <= k;
+ *                                               saturation only lowers it further,
+ *                                               and remove only lowers it -- decisions/0008)
+ *
+ * A byte is 0..255 by Uint8Array construction, so both its nibbles are 0..15 already;
+ * the nibble check is asserted anyway as a backstop against a packing bug. Throws an
+ * Error naming the first violation, or returns void.
+ */
+export function validateCounting(filter) {
+    const m = filter._m;
+    const k = filter._k;
+    const cnts = filter._cnts;
+    const count = filter._count;
+
+    const expectedBytes = (m + 1) >>> 1;
+    if (cnts.length !== expectedBytes) {
+        throw new Error(
+            "[validate] counter store length " + cnts.length +
+            " != ceil(m/2)=" + expectedBytes);
+    }
+    if (!(m >= 1) || !(k >= 1)) {
+        throw new Error("[validate] invalid sizing m=" + m + " k=" + k);
+    }
+
+    let sum = 0;
+    for (let i = 0; i < cnts.length; i++) {
+        const byte = cnts[i];
+        const lo = byte & 0x0f;
+        const hi = (byte >>> 4) & 0x0f;
+        if (lo < 0 || lo > 15 || hi < 0 || hi > 15) {
+            throw new Error("[validate] nibble out of 0..15 at byte " + i + " (byte=" + byte + ")");
+        }
+        sum += lo + hi;
+    }
+    if (count < 0) {
+        throw new Error("[validate] negative count " + count);
+    }
+    if (sum > k * count) {
+        throw new Error(
+            "[validate] nibble sum " + sum + " exceeds k*count bound " + (k * count) +
+            " (k=" + k + ", count=" + count + ")");
+    }
+    if (count > 0 && sum < 1) {
+        throw new Error("[validate] non-empty CountingBloom (count=" + count + ") has all-zero counters");
+    }
+}

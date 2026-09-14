@@ -42,11 +42,15 @@ export interface FilterStats {
  *   - `fpp`   -- the configured target false-positive probability.
  *   - `seed`  -- the hash seed. A mismatch fails closed.
  *   - `keys`  -- the backing: `"int"` or `null`.
- *   - `count` -- the number of adds recorded.
- *   - `bits`  -- the bit store as a plain array of 32-bit words.
+ *   - `count` -- the number of adds recorded (net of removes on a deletable member).
+ *   - `bits`  -- (Bloom) the bit store as a plain array of 32-bit words.
+ *   - `w`     -- (CountingBloom) the counter width in bits (4).
+ *   - `cnts`  -- (CountingBloom) the packed counter store as a plain array of bytes.
  *
  * Treat it as opaque: do not hand-edit it. `restore()` validates every field and
- * throws a `[lite-filter]`-tagged Error on any corruption (null is not zero).
+ * throws a `[lite-filter]`-tagged Error on any corruption (null is not zero). The
+ * `bits` / `w` + `cnts` fields are member-specific -- each member's `restore()` only
+ * accepts its own shape and rejects a foreign one via the `mem` tag.
  */
 export interface FilterSnapshot {
   f: "litefilter/1";
@@ -58,7 +62,12 @@ export interface FilterSnapshot {
   seed: number;
   keys: "int" | null;
   count: number;
-  bits: number[];
+  /** Bloom: the bit store as 32-bit words. */
+  bits?: number[];
+  /** CountingBloom: the counter width in bits (4). */
+  w?: number;
+  /** CountingBloom: the packed counter store as bytes (0..255). */
+  cnts?: number[];
 }
 
 /** Construction options shared by every filter member. */
@@ -132,6 +141,36 @@ export class Bloom<K = unknown> implements LiteFilter<K> {
   dump(): FilterSnapshot;
   /** Reconstruct a fresh Bloom from a snapshot. Fail closed on any mismatch. */
   static restore(snap: FilterSnapshot, opts?: FilterRestoreOptions): Bloom;
+}
+
+/**
+ * Counting Bloom filter -- the deletable member. A Bloom whose bit array is replaced
+ * by 4-bit SATURATING counters (two per byte): `add` increments, `remove` decrements,
+ * `mightContain` is true iff every probed counter is nonzero. Costs ~4x a plain
+ * Bloom's space and carries two honest caveats (decisions/0009):
+ *   - `remove(key)` on a key that was NEVER added can corrupt OTHER keys' state and
+ *     cause a later false negative -- only remove keys you actually added.
+ *   - a counter that SATURATES at 15 is clamped forever (never decrements again), so
+ *     its keys can stick present after removal.
+ */
+export class CountingBloom<K = unknown> implements LiteFilter<K> {
+  constructor(capacity: number, options?: FilterOptions);
+  add(key: K): void;
+  mightContain(key: K): boolean;
+  has(key: K): boolean;
+  /** Delete a key. Returns true on a real delete, false if the key is absent (no
+   *  mutation). See the class caveats on never-added keys and saturation. */
+  remove(key: K): boolean;
+  readonly size: number;
+  readonly count: number;
+  readonly capacity: number;
+  fpp(): number;
+  clear(): void;
+  stats(): FilterStats;
+  resetStats(): void;
+  dump(): FilterSnapshot;
+  /** Reconstruct a fresh CountingBloom from a snapshot. Fail closed on any mismatch. */
+  static restore(snap: FilterSnapshot, opts?: FilterRestoreOptions): CountingBloom;
 }
 
 export const VERSION: string;

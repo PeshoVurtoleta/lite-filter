@@ -27,7 +27,7 @@
  * @license MIT
  */
 
-import { Bloom, VERSION } from "../Filter.js";
+import { Bloom, CountingBloom, VERSION } from "../Filter.js";
 
 /** Seeded xorshift32 -- byte-reproducible from its seed. */
 export function makePrng(seed) {
@@ -147,6 +147,83 @@ export function measure(name, gen, cap, fpp, seed) {
     };
 }
 
+/**
+ * Measure one workload against a fresh CountingBloom sized (cap, fpp). Same row shape
+ * as `measure`, so the two members print into the same table for a direct comparison.
+ */
+export function measureCounting(name, gen, cap, fpp, seed) {
+    const { keys, probes } = gen(cap, Math.max(cap * 10, 100000), seed);
+    const filter = new CountingBloom(cap, { fpp, keys: "int" });
+    const truth = new Set();
+
+    const t0 = performance.now();
+    for (let i = 0; i < keys.length; i++) filter.add(keys[i]);
+    const addNs = ((performance.now() - t0) * 1e6) / keys.length;
+    for (let i = 0; i < keys.length; i++) truth.add(keys[i]);
+
+    let falseNeg = 0;
+    for (const key of truth) if (!filter.mightContain(key)) falseNeg++;
+
+    const t1 = performance.now();
+    let acc = 0;
+    for (let i = 0; i < probes.length; i++) acc += filter.mightContain(probes[i]) ? 1 : 0;
+    const queryNs = ((performance.now() - t1) * 1e6) / probes.length;
+    let falsePos = 0, probed = 0;
+    for (let i = 0; i < probes.length; i++) {
+        if (truth.has(probes[i])) continue;
+        probed++;
+        if (filter.mightContain(probes[i])) falsePos++;
+    }
+
+    const distinct = truth.size;
+    const m = filter._m;
+    const k = filter._k;
+    const measuredFpr = probed === 0 ? 0 : falsePos / probed;
+    const theoretical = Math.pow(1 - Math.exp(-(k * distinct) / m), k);
+    const overPct = theoretical === 0 ? 0 : ((measuredFpr - theoretical) / theoretical) * 100;
+    // CountingBloom's nibble store is 4 bits/counter -> 4x a plain Bloom's bits/item.
+    const bitsPerItem = (m * 4) / distinct;
+
+    return {
+        name, added: keys.length, distinct, bitsPerItem, k,
+        measuredFpr, theoretical, overPct, addNs, queryNs, falseNeg,
+    };
+}
+
+/**
+ * The remove/churn workload (CountingBloom only): add N distinct keys, remove HALF,
+ * then requery -- the still-present half MUST show 0 false negatives, and the removed
+ * half should mostly read absent. Reports remove ns/op and the two counts. This is the
+ * property Bloom cannot offer at all (its remove() throws).
+ */
+export function measureRemove(cap, fpp, seed) {
+    const { keys } = uniform(cap, 1, seed);
+    // De-duplicate so "remove half" is well-defined on distinct keys.
+    const distinct = Array.from(new Set(keys));
+    const filter = new CountingBloom(cap, { fpp, keys: "int" });
+    for (let i = 0; i < distinct.length; i++) filter.add(distinct[i]);
+
+    const half = distinct.length >> 1;
+    const t0 = performance.now();
+    for (let i = 0; i < half; i++) filter.remove(distinct[i]);
+    const removeNs = half === 0 ? 0 : ((performance.now() - t0) * 1e6) / half;
+
+    // The still-present half: 0 false negatives is the law.
+    let falseNegPresent = 0;
+    for (let i = half; i < distinct.length; i++) {
+        if (!filter.mightContain(distinct[i])) falseNegPresent++;
+    }
+    // The removed half: how many still read present (residue from shared counters).
+    let residual = 0;
+    for (let i = 0; i < half; i++) if (filter.mightContain(distinct[i])) residual++;
+
+    return {
+        name: "remove-churn", added: distinct.length, removed: half,
+        stillPresent: distinct.length - half, falseNegPresent, residual,
+        residualRate: half === 0 ? 0 : residual / half, removeNs, size: filter.size,
+    };
+}
+
 /** Run the full workload matrix. Returns an array of rows. */
 export function runBench(opts) {
     const cap = (opts && opts.cap) || 100000;
@@ -162,18 +239,27 @@ export function runBench(opts) {
     return rows;
 }
 
+/** Run the CountingBloom workload matrix (FPR-vs-theory across the 4 workloads). */
+export function runBenchCounting(opts) {
+    const cap = (opts && opts.cap) || 100000;
+    const fpp = (opts && opts.fpp) || 0.01;
+    const seed = (opts && opts.seed) || 0xC0FFEE;
+    const rows = [];
+    rows.push(measureCounting("uniform", uniform, cap, fpp, seed));
+    rows.push(measureCounting("zipfian", zipfian, cap, fpp, seed ^ 0x11));
+    rows.push(measureCounting("sequential", sequential, cap, fpp, seed ^ 0x22));
+    rows.push(measureCounting("adversarial", (n, p, s) => adversarial(Math.floor(cap * 1.5), p, s),
+        cap, fpp, seed ^ 0x33));
+    return rows;
+}
+
 /* -------------------------------------------------------------------------- *
  * CLI table.
  * -------------------------------------------------------------------------- */
 
 function pad(s, w) { s = String(s); return s.length >= w ? s : " ".repeat(w - s.length) + s; }
 
-function printTable(rows, cap, fpp) {
-    process.stdout.write(
-        "\n@zakkster/lite-filter v" + VERSION + " -- Bloom bench (cap=" + cap +
-        ", target fpp=" + fpp + ")\n" +
-        "Measured FPR vs theoretical closed-form, checked against a real Set oracle.\n" +
-        "ns/op is machine-local wall-clock -- an EXAMPLE, not a headline.\n\n");
+function printRows(rows) {
     process.stdout.write(
         pad("workload", 12) + pad("bits/item", 11) + pad("k", 3) +
         pad("measFPR", 11) + pad("theoFPR", 11) + pad("% over", 9) +
@@ -190,8 +276,35 @@ function printTable(rows, cap, fpp) {
             pad(r.queryNs.toFixed(1), 10) +
             pad(r.falseNeg, 10) + "\n");
     }
+}
+
+function printTable(rows, cap, fpp) {
+    process.stdout.write(
+        "\n@zakkster/lite-filter v" + VERSION + " -- Bloom bench (cap=" + cap +
+        ", target fpp=" + fpp + ")\n" +
+        "Measured FPR vs theoretical closed-form, checked against a real Set oracle.\n" +
+        "ns/op is machine-local wall-clock -- an EXAMPLE, not a headline.\n\n");
+    printRows(rows);
     process.stdout.write(
         "\nThe GOLDEN RULE (GUIDE.md): a formula is a hypothesis. MEASURE your own keys.\n\n");
+}
+
+function printCountingTable(rows, remove, cap, fpp) {
+    process.stdout.write(
+        "@zakkster/lite-filter v" + VERSION + " -- CountingBloom bench (cap=" + cap +
+        ", target fpp=" + fpp + ")\n" +
+        "Same FPR-vs-theory columns; bits/item is 4x Bloom (4-bit counters).\n\n");
+    printRows(rows);
+    process.stdout.write(
+        "\nremove-churn: add " + remove.added + " distinct, remove " + remove.removed +
+        " -> stillPresent=" + remove.stillPresent +
+        " falseNegPresent=" + remove.falseNegPresent +
+        " (MUST be 0) residual=" + remove.residual +
+        " residualRate=" + remove.residualRate.toFixed(5) +
+        " remove ns/op=" + remove.removeNs.toFixed(1) +
+        " size=" + remove.size + "\n" +
+        "residual = removed keys that still read present (shared-counter residue), a\n" +
+        "false-POSITIVE effect; the never-false-negative law is falseNegPresent=0.\n\n");
 }
 
 // Runnable entry: `node benchmark/Bench.mjs`.
@@ -200,4 +313,5 @@ if (import.meta.url === "file://" + process.argv[1] ||
     const cap = 100000;
     const fpp = 0.01;
     printTable(runBench({ cap, fpp }), cap, fpp);
+    printCountingTable(runBenchCounting({ cap, fpp }), measureRemove(cap, fpp, 0xC0FFEE ^ 0x44), cap, fpp);
 }

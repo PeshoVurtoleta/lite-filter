@@ -31,14 +31,21 @@
  *     int key, a corrupt snapshot, or a `remove` on an add-only member all throw a
  *     `[lite-filter]`-tagged Error. null is not zero.
  *
+ * The 2nd member -- `CountingBloom` -- swaps the bit array for 4-bit SATURATING
+ * counters (two per byte) so it can `remove()`: add increments, remove decrements,
+ * `mightContain` is true iff every probed counter is nonzero. It costs ~4x a plain
+ * Bloom's space and carries two honest caveats (decisions/0009): removing a key that
+ * was never added can corrupt OTHER keys, and a counter that saturates at 15 sticks.
+ *
  * Design decisions live in decisions/ (0001 hashing; 0002 sizing; 0003 remove +
- * count; 0004 fpp; 0005 snapshot; 0006 deferred static-build API) and are
- * summarized in ROADMAP.md.
+ * count; 0004 fpp; 0005 snapshot; 0006 deferred static-build API; 0007 counter
+ * width; 0008 saturation; 0009 remove caveat; 0010 count deferred; 0011 CBF
+ * snapshot) and are summarized in ROADMAP.md.
  *
  * @license MIT
  */
 
-export const VERSION = "0.1.0";
+export const VERSION = "0.2.0";
 
 /* -------------------------------------------------------------------------- *
  * Constants + fail-closed messages (built ONCE, thrown only on misuse).
@@ -74,6 +81,14 @@ const STATS_OFF_MSG =
  *  rejects any other value fail-closed. Versioned so a future layout change is a
  *  clean, detectable break rather than a silent misread. */
 const SNAP_TAG = "litefilter/1";
+
+/** CountingBloom counter width (decisions/0007): 4 bits per counter (a nibble),
+ *  two counters packed per byte. The saturation ceiling is MAX_COUNT = 15 -- a
+ *  nibble at 15 is CLAMPED (never wraps on add, never decrements on remove;
+ *  decisions/0008). Four bits is the width where the packed store still costs
+ *  ~4x a plain Bloom's bits while making overflow negligibly rare at a 1% fpp. */
+const COUNTER_WIDTH = 4;
+const MAX_COUNT = 15;
 
 /** Default target false-positive probability when the caller omits `fpp`
  *  (decisions/0002): the textbook 1% baseline. Explicit and documented, never a
@@ -489,6 +504,332 @@ export class Bloom {
             }
         }
         for (let i = 0; i < bits.length; i++) inst._words[i] = bits[i];
+        inst._count = snap.count;
+        return inst;
+    }
+}
+
+/* -------------------------------------------------------------------------- *
+ * CountingBloom -- the deletable member (decisions/0007..0011). A Bloom whose bit
+ * array is replaced by an array of small SATURATING counters (4-bit nibbles): add
+ * increments, remove decrements, mightContain is true iff every probed counter is
+ * nonzero. This buys `remove()` -- at ~4x the space of a plain Bloom -- with two
+ * documented caveats (decisions/0009): removing a NEVER-ADDED key can corrupt
+ * OTHER keys' state (a later false negative), and a counter that SATURATES at 15 is
+ * clamped forever (it never decrements again, so its keys stick present).
+ * -------------------------------------------------------------------------- */
+
+export class CountingBloom {
+    /**
+     * @param {number} capacity  Items the filter is sized for. Integer >= 1.
+     * @param {{ fpp?: number, seed?: number, keys?: 'int', stats?: boolean }} [options]
+     */
+    constructor(capacity, options) {
+        // Cold sizing door: reuse Bloom's derivation (decisions/0002) verbatim, so a
+        // CountingBloom and a Bloom sized for the same (n, fpp) share m and k.
+        const fpp = (options && options.fpp !== undefined) ? options.fpp : DEFAULT_FPP;
+        const dims = sizeFor(capacity, fpp);
+
+        this._cap = capacity;      // items sized for (the configured capacity)
+        this._fpp = fpp;           // the CONFIGURED target fpp (decisions/0004)
+        this._m = dims.m;          // counter count
+        this._k = dims.k;          // hash positions per key
+
+        this._int = validateKeys(options && options.keys);
+        this._seed = validateSeed(options && options.seed);
+        this._seed2 = fmix32(this._seed ^ 0x9e3779b9);
+
+        // The ONE preallocated counter store: ceil(m/2) bytes, two 4-bit counters per
+        // byte (decisions/0007). Sized once, reused forever; clear() zeroes it in
+        // place -- same ArrayBuffer identity.
+        this._cnts = new Uint8Array((this._m + 1) >>> 1);
+
+        // Presence counter (decisions/0003): net add() minus successful remove(). NOT
+        // an estimate and NOT a distinct-key count -- a plain call counter.
+        this._count = 0;
+
+        // Opt-in stats (decisions/0004): null when off so the hot path writes NOTHING.
+        this._stats = validateStats(options && options.stats);
+    }
+
+    // size/count is net add() minus successful remove(). It is EXACT only when you
+    // remove only keys you actually added; under the documented unsound-remove misuse
+    // (decisions/0009) it is an approximation, floored at 0 (never negative).
+    get size() { return this._count; }
+    get count() { return this._count; }
+    get capacity() { return this._cap; }
+
+    // --- hot path (zero allocation; strict on keys:'int') ---------------------
+
+    /**
+     * Record a key. Increments `k` 4-bit counters derived from two base hashes via
+     * enhanced double hashing (decisions/0001). Each increment SATURATES at 15
+     * (decisions/0008): a counter already at 15 stays 15, it never wraps to 0. Zero
+     * allocation on the int + string paths; nibble read/modify/write is pure int ops.
+     */
+    add(key) {
+        const m = this._m;
+        let a, b;
+        if (this._int) {
+            if (!Number.isInteger(key) || key < INT_MIN || key > INT_MAX) {
+                throw new TypeError(INT_KEY_MSG + String(key));
+            }
+            a = fmix32((key ^ this._seed) | 0);
+            b = (fmix32((Math.imul(key | 0, 0x9e3779b1) ^ this._seed2) | 0) | 1) >>> 0;
+        } else {
+            a = this._hashKey(key);
+            b = (fmix32(a ^ this._seed2) | 1) >>> 0;
+        }
+        const cnts = this._cnts;
+        const k = this._k;
+        for (let i = 0; i < k; i++) {
+            const pos = ((a + Math.imul(i, b)) >>> 0) % m;
+            const bi = pos >>> 1;
+            const sh = (pos & 1) << 2;
+            const byte = cnts[bi];
+            const nib = (byte >>> sh) & 0x0f;
+            // Saturating increment: a nibble at MAX_COUNT is CLAMPED (never wraps to 0).
+            if (nib < MAX_COUNT) cnts[bi] = (byte & ~(0x0f << sh)) | ((nib + 1) << sh);
+        }
+        this._count++;
+        if (this._stats !== null) this._stats.adds++;
+    }
+
+    /**
+     * The query. Returns true only if ALL `k` counters are NONZERO. One-sided: NO
+     * false negatives for a key that is currently present (decisions/0009 states the
+     * exception -- removing a never-added key can corrupt this). Zero allocation.
+     */
+    mightContain(key) {
+        const m = this._m;
+        let a, b;
+        if (this._int) {
+            if (!Number.isInteger(key) || key < INT_MIN || key > INT_MAX) {
+                throw new TypeError(INT_KEY_MSG + String(key));
+            }
+            a = fmix32((key ^ this._seed) | 0);
+            b = (fmix32((Math.imul(key | 0, 0x9e3779b1) ^ this._seed2) | 0) | 1) >>> 0;
+        } else {
+            a = this._hashKey(key);
+            b = (fmix32(a ^ this._seed2) | 1) >>> 0;
+        }
+        const cnts = this._cnts;
+        const k = this._k;
+        let hit = true;
+        for (let i = 0; i < k; i++) {
+            const pos = ((a + Math.imul(i, b)) >>> 0) % m;
+            if (((cnts[pos >>> 1] >>> ((pos & 1) << 2)) & 0x0f) === 0) { hit = false; break; }
+        }
+        if (this._stats !== null) {
+            this._stats.queries++;
+            if (hit) this._stats.hits++; else this._stats.misses++;
+        }
+        return hit;
+    }
+
+    /** The SOLE alias of `mightContain` (decisions/0003), same one-sided semantics. */
+    has(key) { return this.mightContain(key); }
+
+    /**
+     * Delete a key (decisions/0009). TWO passes, NO scratch storage. Pass 1 verifies
+     * EVERY probed counter is > 0; if any is 0 the key is definitely absent, so we
+     * return false and mutate NOTHING (a decrement here would corrupt other keys).
+     * Pass 2 decrements each counter that is in 1..14; a counter at 15 is SATURATED
+     * and is NEVER decremented (decisions/0008), and a 0 cannot occur (pass 1 proved
+     * it). Zero allocation; the probe body is branch-identical to add so the perf gate
+     * does not drift (the planner's flagged risk). Returns true on a real delete.
+     */
+    remove(key) {
+        const m = this._m;
+        let a, b;
+        if (this._int) {
+            if (!Number.isInteger(key) || key < INT_MIN || key > INT_MAX) {
+                throw new TypeError(INT_KEY_MSG + String(key));
+            }
+            a = fmix32((key ^ this._seed) | 0);
+            b = (fmix32((Math.imul(key | 0, 0x9e3779b1) ^ this._seed2) | 0) | 1) >>> 0;
+        } else {
+            a = this._hashKey(key);
+            b = (fmix32(a ^ this._seed2) | 1) >>> 0;
+        }
+        const cnts = this._cnts;
+        const k = this._k;
+        // Pass 1: verify presence. A single zero counter means definitely-absent ->
+        // fail closed WITHOUT mutating (decisions/0009): decrementing a partial match
+        // would drop a shared counter and cause a false negative for another key.
+        for (let i = 0; i < k; i++) {
+            const pos = ((a + Math.imul(i, b)) >>> 0) % m;
+            if (((cnts[pos >>> 1] >>> ((pos & 1) << 2)) & 0x0f) === 0) return false;
+        }
+        // Pass 2: decrement each counter in 1..MAX_COUNT-1; leave MAX_COUNT saturated
+        // (decisions/0008).
+        for (let i = 0; i < k; i++) {
+            const pos = ((a + Math.imul(i, b)) >>> 0) % m;
+            const bi = pos >>> 1;
+            const sh = (pos & 1) << 2;
+            const byte = cnts[bi];
+            const nib = (byte >>> sh) & 0x0f;
+            if (nib >= 1 && nib <= MAX_COUNT - 1) cnts[bi] = (byte & ~(0x0f << sh)) | ((nib - 1) << sh);
+        }
+        // Floor the counter at 0: under the documented unsound-remove misuse (removing
+        // a false-positive key that was never added, decisions/0009) size would else
+        // drift negative. remove is already gated (not the measured hot loop), so this
+        // guard is free of the perf concern. size stays an approximation under misuse.
+        if (this._count > 0) this._count--;
+        return true;
+    }
+
+    /**
+     * Hash an arbitrary key to a 32-bit base (decisions/0001). A string hashes over
+     * its code units (alloc-free); any other type is `String()`-encoded first (the
+     * honest amortized caveat). Never called on the keys:'int' path.
+     */
+    _hashKey(key) {
+        if (typeof key === "string") return hashStr(key, this._seed);
+        return hashStr(String(key), this._seed);
+    }
+
+    // --- cold inspection ------------------------------------------------------
+
+    /**
+     * The false-positive probability (decisions/0004). Configured target while empty,
+     * else the fill-derived closed-form ESTIMATE `(1 - e^(-k*n/m))^k` -- a formula,
+     * NOT a measurement of your keys. Cold, O(1).
+     */
+    fpp() {
+        if (this._count === 0) return this._fpp;
+        const exponent = -(this._k * this._count) / this._m;
+        return Math.pow(1 - Math.exp(exponent), this._k);
+    }
+
+    /** Reset to empty. Allocates NOTHING: zeroes the existing counter store in place,
+     *  so the ArrayBuffer identity is preserved. */
+    clear() {
+        this._cnts.fill(0);
+        this._count = 0;
+    }
+
+    // --- opt-in stats (decisions/0004) ----------------------------------------
+
+    /** The live per-instance counter holder BY REFERENCE. Requires `{ stats: true }`;
+     *  throws fail-closed otherwise (null is not zero). */
+    stats() {
+        if (this._stats === null) throw new Error(STATS_OFF_MSG);
+        return this._stats;
+    }
+
+    /** Zero the four counters IN PLACE. Requires `{ stats: true }`; else fail closed. */
+    resetStats() {
+        if (this._stats === null) throw new Error(STATS_OFF_MSG);
+        this._stats.adds = 0;
+        this._stats.queries = 0;
+        this._stats.hits = 0;
+        this._stats.misses = 0;
+    }
+
+    // --- snapshot / restore (decisions/0011) ----------------------------------
+
+    /**
+     * Serialize to a plain, structurally-cloneable snapshot (decisions/0011). COLD --
+     * never a hot path -- and MAY allocate. The Uint8Array counter store IS the serial
+     * form, emitted as a plain Array so it round-trips through structuredClone AND
+     * JSON. `w: 4` records the counter width; `cnts` is the packed nibble store. The
+     * fail-closed tag lets `restore()` reject any mismatch or corruption.
+     */
+    dump() {
+        return {
+            f: SNAP_TAG,
+            mem: "CountingBloom",
+            w: COUNTER_WIDTH,
+            m: this._m,
+            k: this._k,
+            cap: this._cap,
+            fpp: this._fpp,
+            seed: this._seed,
+            keys: this._int ? "int" : null,
+            count: this._count,
+            cnts: Array.from(this._cnts),
+        };
+    }
+
+    /**
+     * Reconstruct a FRESH CountingBloom from a snapshot (decisions/0011). Fail closed
+     * on ANY tag / member / width / capacity / fpp / seed / keys / counter-count
+     * mismatch AND on a corrupt store (REJECT, never truncate -- null is not zero).
+     * EVERY element must be an exact byte 0..255 (so every packed nibble is 0..15)
+     * BEFORE any instance is mutated: a `>>> 0` coercion would silently turn a garbled
+     * value into a wrong counter and cause a false negative. `opts` re-derives
+     * runtime-only options (stats); everything structural comes FROM the snapshot.
+     */
+    static restore(snap, opts) {
+        if (snap === null || typeof snap !== "object") {
+            throw new TypeError("[lite-filter] restore(snap): snapshot must be an object");
+        }
+        if (snap.f !== SNAP_TAG) {
+            throw new Error(
+                "[lite-filter] restore(): bad format tag " + String(snap.f) +
+                " (expected " + SNAP_TAG + ")");
+        }
+        if (snap.mem !== "CountingBloom") {
+            throw new Error(
+                "[lite-filter] restore(): member mismatch " + String(snap.mem) +
+                " (this is CountingBloom.restore)");
+        }
+        if (snap.w !== COUNTER_WIDTH) {
+            throw new Error(
+                "[lite-filter] restore(): counter-width mismatch " + String(snap.w) +
+                " (expected " + COUNTER_WIDTH + ")");
+        }
+        if (!Number.isInteger(snap.seed) || snap.seed < 0 || snap.seed > 0xffffffff) {
+            throw new Error(
+                "[lite-filter] restore(): corrupt seed " + String(snap.seed) +
+                " (must be a 32-bit unsigned integer)");
+        }
+        if (snap.keys !== "int" && snap.keys !== null) {
+            throw new Error(
+                "[lite-filter] restore(): corrupt keys mode " + String(snap.keys) +
+                " (must be 'int' or null)");
+        }
+        const keys = snap.keys === "int" ? "int" : undefined;
+        const inst = new CountingBloom(snap.cap, {
+            fpp: snap.fpp,
+            seed: snap.seed,
+            keys: keys,
+            stats: opts && opts.stats,
+        });
+        if (snap.m !== inst._m) {
+            throw new Error(
+                "[lite-filter] restore(): counter-count mismatch (snapshot m=" + String(snap.m) +
+                ", derived m=" + inst._m + ")");
+        }
+        if (snap.k !== inst._k) {
+            throw new Error(
+                "[lite-filter] restore(): hash-count mismatch (snapshot k=" + String(snap.k) +
+                ", derived k=" + inst._k + ")");
+        }
+        const cnts = snap.cnts;
+        if (!Array.isArray(cnts) || cnts.length !== inst._cnts.length) {
+            throw new Error(
+                "[lite-filter] restore(): corrupt counter store (expected " + inst._cnts.length +
+                " bytes, got " + (Array.isArray(cnts) ? cnts.length : String(cnts)) + ")");
+        }
+        if (!Number.isInteger(snap.count) || snap.count < 0) {
+            throw new Error(
+                "[lite-filter] restore(): corrupt count " + String(snap.count));
+        }
+        // Validate EVERY byte BEFORE mutating (REJECT never truncate; null is not
+        // zero). Each element must be an exact byte 0..255 -- which makes each of its
+        // two packed nibbles 0..15 by construction. A non-byte would be a corrupt or
+        // foreign store and is rejected loudly rather than coerced to garbage.
+        for (let i = 0; i < cnts.length; i++) {
+            const v = cnts[i];
+            if (!Number.isInteger(v) || v < 0 || v > 0xff) {
+                throw new Error(
+                    "[lite-filter] restore(): corrupt counter-store byte at index " + i +
+                    " (" + String(v) + "); each element must be an integer 0..255");
+            }
+        }
+        for (let i = 0; i < cnts.length; i++) inst._cnts[i] = cnts[i];
         inst._count = snap.count;
         return inst;
     }

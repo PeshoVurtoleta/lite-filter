@@ -127,7 +127,51 @@ positions and return `true` only if ALL `k` bits are set.
 All `k` positions come from just TWO base hashes via enhanced double hashing
 (`pos_i = (h1 + i*h2) mod m`), so a probe needs zero scratch storage. Bloom cannot
 delete -- clearing a key's bits would corrupt every other key sharing one of them --
-so `remove()` throws (use a deletable member when the roster ships one).
+so `remove()` throws (use `CountingBloom` when you need deletes).
+
+</details>
+
+## The members
+
+| Member | Deletes? | Space | Status | Import |
+| --- | --- | --- | --- | --- |
+| `Bloom` | no (`remove` throws) | 1x (`~1.44 log2(1/fpp)` bits/item) | SHIPPED (v0.1.0) | `import { Bloom } from '@zakkster/lite-filter'` |
+| `CountingBloom` | **yes** (`remove -> boolean`) | ~4x Bloom (4-bit counters) | SHIPPED (v0.2.0) | `import { CountingBloom } from '@zakkster/lite-filter'` |
+
+Both implement the same `LiteFilter<K>` surface, so a member is a one-line
+constructor swap; the only surface difference is `remove` (member-specific).
+
+<details>
+<summary>CountingBloom -- the deletable member (and its two honest caveats)</summary>
+
+`CountingBloom` replaces Bloom's single bit per position with a 4-bit SATURATING
+counter (two packed per byte, one `Uint8Array`). `add` increments the `k` counters,
+`remove` decrements them, and `mightContain` is `true` iff every probed counter is
+nonzero. This buys a real `remove(key): boolean` at ~4x a plain Bloom's space. Its
+false-positive rate tracks the SAME formula as Bloom (the bench confirms the measured
+`% over theoretical` matches Bloom's across all four workloads).
+
+```js
+import { CountingBloom } from '@zakkster/lite-filter';
+
+const f = new CountingBloom(100000, { fpp: 0.01, keys: 'int' });
+f.add(42);
+f.remove(42);            // true  -- a real delete; returns false if the key is absent
+f.mightContain(42);      // false -- gone
+```
+
+`remove` runs **two passes** with no scratch storage: pass 1 verifies every probed
+counter is nonzero (else it returns `false` and mutates NOTHING), pass 2 decrements
+each counter in `1..14`. Two caveats are inherent to a Counting Bloom and stated, not
+hidden:
+
+- **Only remove keys you actually added.** If a never-added key is a false positive
+  (all `k` counters nonzero via other keys), `remove` will decrement REAL keys and can
+  cause a later **false negative** (decisions/0009).
+- **A saturated counter (15) is clamped forever** -- never incremented past 15, never
+  decremented (decisions/0008) -- so a key routed only through saturated counters can
+  stick present after removal. At a 1% fpp this is negligibly rare. The multiplicity
+  readout is deferred (decisions/0010) because saturation makes it an over-estimate.
 
 </details>
 
@@ -156,7 +200,7 @@ a bit count that would overflow a safe typed-array length; an unknown `keys` or
 | `add(key)` | `void` | Record a key. Zero-alloc on int + string keys. |
 | `mightContain(key)` | `boolean` | The query. NO false negatives; false positives bounded by `fpp`. |
 | `has(key)` | `boolean` | The sole alias of `mightContain`, same semantics. |
-| `remove(key)` | `never` | Bloom is add-only: **throws** `[lite-filter]` (fail closed). |
+| `remove(key)` | `never` / `boolean` | **Bloom**: add-only, **throws** `[lite-filter]`. **CountingBloom**: a real delete, returns `boolean` (member-specific). |
 | `size` / `count` | `number` | Adds recorded (a plain counter, not a distinct-key count). |
 | `capacity` | `number` | The item count the filter was sized for. |
 | `fpp()` | `number` | Configured target while empty, else the fill-derived estimate. |
@@ -215,8 +259,9 @@ const rows = runBench({ cap: 100000, fpp: 0.01 });
 
 | Export | Meaning |
 | --- | --- |
-| `VERSION` | the package version string (`"0.1.0"`) |
+| `VERSION` | the package version string (`"0.2.0"`) |
 | `Bloom` | the reference member (also the default export) |
+| `CountingBloom` | the deletable member (4-bit saturating counters; a real `remove`) |
 
 ## Composability
 
@@ -273,7 +318,10 @@ parsed straight out of a foreign binary buffer, with no intermediate `Set`.
 Gated numbers (this repo, `npm run test:perf` + `npm run torture`): add + mightContain
 on `keys:'int'` = **0 B/op**, **maxMajor 0**; 1e6 adds then requery = **0 false
 negatives**; n=1e5, fpp=0.01, 1e6 disjoint probes = measured FPR **<= 0.0125**
-(<= 25% over the formula). ns/op figures are machine-local -- run `npm run bench`.
+(<= 25% over the formula). CountingBloom `add` / `mightContain` / `remove` on
+`keys:'int'` are also **0 scavenges** at N and 8N (nibble read/modify/write, no scratch
+array), and 1e5 mixed add/remove ops = **0 false negatives** for present keys. ns/op
+figures are machine-local -- run `npm run bench`.
 
 </details>
 
@@ -290,6 +338,19 @@ negatives**; n=1e5, fpp=0.01, 1e6 disjoint probes = measured FPR **<= 0.0125**
 - **The snapshot rejects, never truncates** (decisions/0005). A corrupt or foreign
   snapshot is an error, not a silently-wrong filter.
 - **The static-build API is deferred** (decisions/0006) to the first static member.
+- **CountingBloom counters are 4-bit nibbles, two per byte** (decisions/0007) -- ~4x
+  Bloom's space for a real `remove`, chosen over 8-bit for space at a 1% fpp.
+- **Counters saturate at 15, never wrap** (decisions/0008). A wrap would turn a present
+  key into a false negative; clamping keeps reads correct, at the cost that a saturated
+  counter never decrements.
+- **`remove` is two-pass and fail-closed** (decisions/0009): verify-then-decrement,
+  no mutation on a partial match. Removing a never-added key can corrupt other keys --
+  only remove keys you added.
+- **The multiplicity readout is deferred** (decisions/0010): saturation + collisions
+  make "how many times added?" an over-estimate, so it is not shipped un-characterized.
+- **CountingBloom's snapshot is the same envelope with per-byte validation**
+  (decisions/0011): `mem:"CountingBloom"`, `w:4`, `cnts` bytes each validated `0..255`
+  (so every nibble is `0..15`) before any instance is built.
 
 ## Testing
 
@@ -297,13 +358,16 @@ negatives**; n=1e5, fpp=0.01, 1e6 disjoint probes = measured FPR **<= 0.0125**
 
 - `npm test` -- the boundary suite: every method, every one-sided law, every
   fail-closed door, plus an ASCII-source guard.
-- `npm run test:types` -- `tsc --noEmit` proves `Bloom` satisfies `LiteFilter<K>`.
+- `npm run test:types` -- `tsc --noEmit` proves `Bloom` and `CountingBloom` satisfy
+  `LiteFilter<K>` and that `CountingBloom.remove` is a real `boolean`.
 - `npm run torture` -- `node --expose-gc`: the leak tracker (retention returns to 0)
   + the GC profiler (maxMajor 0) + the Set-differential oracle (no false negatives,
-  bounded FPR) + the `clear()` ArrayBuffer-identity check.
+  bounded FPR) + a CountingBloom add/remove churn oracle + the `clear()`
+  ArrayBuffer-identity check for both members.
 - `npm run torture:controls` -- the must-fail proof: a broken build MUST fail.
-- `npm run test:perf` -- the `@zakkster/lite-perf-gate` zero-alloc scenarios
-  (add-churn + query-hit on `keys:'int'`), with an allocating mustFail for teeth.
+- `npm run test:perf` -- the `@zakkster/lite-perf-gate` zero-alloc scenarios on
+  `keys:'int'` (Bloom add-churn + query-hit; CountingBloom add-churn + query-hit +
+  remove-churn), with an allocating mustFail for teeth.
 - `npm run bench` -- the measurement tool.
 
 ## What this is not

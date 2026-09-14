@@ -5,7 +5,7 @@
 > `llms.txt` carries the per-member "good for / not for"; this is the long form with
 > the flowchart and the MEASURED numbers.
 
-> SKELETON (v0.1.0). Only Bloom ships today, so most rows below are marked PLANNED --
+> SKELETON (v0.2.0). Bloom + CountingBloom ship today; the rest are marked PLANNED --
 > they name the axis the member will occupy and are filled in with a MEASURED bench
 > number when the member lands (ROADMAP section 10). No un-numbered assertion ships.
 
@@ -27,8 +27,8 @@ npm run bench     # measured vs theoretical FPR, bits/item, add/query ns, per wo
 | Your need | Start with | Why | Status |
 | --- | --- | --- | --- |
 | Simple, well-understood baseline | **Bloom** | the textbook default; the floor | SHIPPED (v0.1.0) |
-| Need deletes | Cuckoo (alt: Counting Bloom) | deletable; Cuckoo better space at low fpp | PLANNED |
-| Approximate multiplicity, not just presence | Counting Bloom | counters carry a count | PLANNED |
+| Need deletes | **CountingBloom** (alt: Cuckoo) | 4-bit counters decrement; real `remove()` | SHIPPED (v0.2.0) |
+| Approximate multiplicity, not just presence | CountingBloom | counters carry a count (readout deferred, decisions/0010) | PARTIAL |
 | Maximum query throughput | Blocked Bloom | one cache miss per query | PLANNED |
 | Mergeable / resizable | Quotient | the only member that merges + resizes | PLANNED |
 | Known static set, minimize space | Binary Fuse (alt: XOR) | near the ~1.23x lower bound, no inserts | PLANNED |
@@ -38,13 +38,11 @@ npm run bench     # measured vs theoretical FPR, bits/item, add/query ns, per wo
 ```mermaid
 flowchart TD
     A[Do I need to DELETE keys?] -->|no| B[Is the key set KNOWN up front?]
-    A -->|yes| C[Need a COUNT, not just presence?]
+    A -->|yes| C[CountingBloom -- SHIPPED; or Cuckoo/Quotient -- PLANNED]
     B -->|yes, static| D[Binary Fuse / XOR -- PLANNED]
     B -->|no, incremental| E[Max query throughput?]
     E -->|yes| F[Blocked Bloom -- PLANNED]
     E -->|no| G[Bloom -- SHIPPED]
-    C -->|yes| H[Counting Bloom -- PLANNED]
-    C -->|no| I[Cuckoo / Quotient -- PLANNED]
 ```
 
 ## Per-member mental model
@@ -61,6 +59,31 @@ when you want a simple, predictable membership filter and do not need deletes.
 *Measured (fill this in from `npm run bench` on your hardware):* uniform / zipfian /
 sequential / adversarial near-full -- bits/item, measured FPR, `% over theoretical`.
 
+### CountingBloom (SHIPPED)
+
+Bloom with each bit replaced by a 4-bit SATURATING counter, two packed per byte
+(decisions/0007): `add` increments, `remove` decrements, `mightContain` is true iff
+every probed counter is nonzero. It is the deletable member -- a real
+`remove(key) -> boolean` -- at ~4x a plain Bloom's space (4 bits vs 1). Its FPR tracks
+the SAME theoretical formula as Bloom (measured `% over theoretical` matches Bloom's
+across all four workloads). Two honest caveats to internalize before reaching for it:
+
+- **Only remove keys you actually added.** `remove` runs two passes -- verify all `k`
+  counters are nonzero, then decrement -- and returns `false` without mutating if any
+  is zero. But if a never-added key happens to be a false positive (all `k` counters
+  nonzero via other keys), removing it decrements REAL keys and can cause a later
+  false negative (decisions/0009).
+- **Saturated counters stick.** A counter that reaches 15 is clamped and never
+  decremented again (decisions/0008), so a key routed only through saturated counters
+  stays present after removal. At a 1% fpp saturation is negligibly rare, but it is
+  real. The multiplicity readout ("how many times added?") is deferred (decisions/0010)
+  precisely because saturation + collisions make it an over-estimate.
+
+*Measured (fill this in from `npm run bench`):* the CountingBloom table mirrors
+Bloom's FPR columns at 4x bits/item, plus a `remove-churn` line (add N, remove half,
+requery) whose `falseNegPresent` MUST be 0 and whose `residual` is the shared-counter
+false-positive residue.
+
 ## Reach-for / avoid (Bloom)
 
 - REACH FOR Bloom when: the key set grows incrementally, you never delete, a ~1%
@@ -68,3 +91,11 @@ sequential / adversarial near-full -- bits/item, measured FPR, `% over theoretic
 - AVOID Bloom when: you need deletes (use a deletable member), you need the smallest
   possible space at very low fpp (use a static member), or you need one cache miss
   per query at high throughput (use Blocked Bloom).
+
+## Reach-for / avoid (CountingBloom)
+
+- REACH FOR CountingBloom when: you need real deletes with Bloom's one-sided read
+  semantics, you can pay ~4x the space, and you only ever remove keys you added.
+- AVOID CountingBloom when: you cannot guarantee removes are of added keys (risk a
+  false negative), you need the lowest space per deletable item (prefer Cuckoo,
+  PLANNED), or you never delete at all (plain Bloom is 4x smaller).

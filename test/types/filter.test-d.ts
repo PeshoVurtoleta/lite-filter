@@ -6,7 +6,7 @@
  *
  * Test-only; not in files[]. ASCII-only.
  */
-import Bloom, { VERSION } from "../../Filter.js";
+import Bloom, { VERSION, CountingBloom } from "../../Filter.js";
 import type { LiteFilter, FilterOptions, FilterSnapshot } from "../../Filter.js";
 
 type Equal<A, B> =
@@ -49,3 +49,20 @@ void new Bloom(10, { keys: "int32" });
 
 // @ts-expect-error -- capacity is required
 void new Bloom();
+
+// ---- CountingBloom: the deletable member, remove() is REAL (boolean) ---------
+const cbf = new CountingBloom<number>(1000, { fpp: 0.01, keys: "int" });
+expectTrue<Equal<ReturnType<typeof cbf.mightContain>, boolean>>();
+const removed: boolean = cbf.remove(1);
+expectTrue<Equal<typeof removed, boolean>>();
+
+// CountingBloom SATISFIES the uniform surface (one-line member swap).
+const iface2: LiteFilter<number> = new CountingBloom<number>(1000);
+iface2.add(1);
+const got2 = iface2.mightContain(1);
+expectTrue<Equal<typeof got2, boolean>>();
+
+// snapshot round-trips through the typed surface.
+const cbfSnap: FilterSnapshot = cbf.dump();
+const cbfRestored: CountingBloom<number> = CountingBloom.restore(cbfSnap);
+void cbfRestored;

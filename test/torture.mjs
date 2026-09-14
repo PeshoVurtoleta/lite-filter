@@ -49,9 +49,9 @@ async function main() {
         createOwnerCascadeOrphanKernel,
     } = await import("@zakkster/lite-leak");
     const { createRoot, effect, dispose } = await import("@zakkster/lite-signal");
-    const { Bloom } = await import("../Filter.js");
-    const { validate } = await import("./validate.mjs");
-    const { differentialInt } = await import("./torture/oracle.mjs");
+    const { Bloom, CountingBloom } = await import("../Filter.js");
+    const { validate, validateCounting } = await import("./validate.mjs");
+    const { differentialInt, differentialChurnInt } = await import("./torture/oracle.mjs");
 
     const SEED = (process.env.TORTURE_SEED >>> 0) || 0x1f2e3d4c;
     const BREAK = process.env.LFILTER_TORTURE_BREAK === "1";
@@ -82,8 +82,14 @@ async function main() {
                 f.add(i | 0);
                 f.mightContain(i | 0);
                 tracker.track(f, () => {}, "bloom", { audit: true });
+                // CountingBloom holds only a Uint8Array -- same retention shape. Churn
+                // it through the SAME owner scope so a leak here surfaces too.
+                const g = new CountingBloom(1024, { keys: "int" });
+                g.add(i | 0);
+                g.remove(i | 0);
+                tracker.track(g, () => {}, "counting-bloom", { audit: true });
             });
-            dispose(e); // disposing the owner untracks the filter -> collectable
+            dispose(e); // disposing the owner untracks the filters -> collectable
         }
     });
     globalThis.gc();
@@ -97,6 +103,10 @@ async function main() {
     const HOT = 3000000;
     const inst = new Bloom(HOT_CAP, { keys: "int" });
     const bufBefore = inst._words.buffer;
+    // CountingBloom steady-state instance: add / mightContain / remove all on the hot
+    // path, all strictly zero-alloc (nibble read/modify/write, no scratch array).
+    const cinst = new CountingBloom(HOT_CAP, { keys: "int" });
+    const cbufBefore = cinst._cnts.buffer;
 
     // The BREAK control: a retained sink the hot loop feeds one fresh object per op,
     // so heapUsed climbs and the major-GC / pause gate rejects the window.
@@ -108,6 +118,11 @@ async function main() {
     for (let i = 0; i < HOT; i++) {
         inst.add(i & MASK);
         acc = (acc + (inst.mightContain((i * 2 + 1) & MASK) ? 1 : 0)) | 0;
+        // CountingBloom: add then immediately remove the same key so the store stays
+        // bounded and both hot paths (two-pass remove included) are exercised.
+        cinst.add(i & MASK);
+        acc = (acc + (cinst.mightContain(i & MASK) ? 1 : 0)) | 0;
+        cinst.remove(i & MASK);
         if (BREAK) sink.push({ i: i, acc: acc }); // retained: MUST trip the gate
         if ((i & 8191) === 0) {
             gc.sampleHeap(performance.now(), process.memoryUsage().heapUsed);
@@ -122,10 +137,12 @@ async function main() {
     const report = checkNoGc(s, { maxMajor: 0, maxPauseMs: 4 });
     gc.stop();
 
-    // clear() must reuse the SAME ArrayBuffer (zero-alloc reset).
+    // clear() must reuse the SAME ArrayBuffer (zero-alloc reset) for both members.
     inst.clear();
-    const sameBuffer = inst._words.buffer === bufBefore;
+    cinst.clear();
+    const sameBuffer = inst._words.buffer === bufBefore && cinst._cnts.buffer === cbufBefore;
     validate(inst);
+    validateCounting(cinst);
 
     const allocPerOp = Math.max(0, Math.round((heapAfter - heapBefore) / HOT));
 
@@ -135,12 +152,18 @@ async function main() {
     // Law 2: n=1e5, fpp=0.01, 1e6 disjoint probes -- FPR <= 0.0125 (<= 25% over formula).
     const law2 = differentialInt(Bloom, { n: 100000, fpp: 0.01, probes: 1000000, seed: SEED ^ 0x55 });
     const FPR_LIMIT = 0.0125;
+    // Law 3 (CountingBloom): 1e5 mixed add/remove ops mirrored against a Set -- 0 false
+    // negatives for keys CURRENTLY present, and the net count tracks the present-set.
+    const churn = differentialChurnInt(CountingBloom,
+        { n: 20000, fpp: 0.01, ops: 100000, seed: SEED ^ 0xa5 });
 
     // ---- verdict --------------------------------------------------------------
     const oracleOk =
         law1.falseNegatives === 0 &&
         law2.falseNegatives === 0 &&
-        law2.fpr <= FPR_LIMIT;
+        law2.fpr <= FPR_LIMIT &&
+        churn.falseNegatives === 0 &&
+        churn.present === churn.filterSize;
     const ok =
         report.ok &&
         live === 0 &&
@@ -158,6 +181,8 @@ async function main() {
         " | oracle fn=" + (law1.falseNegatives + law2.falseNegatives) +
         " fpr=" + law2.fpr.toFixed(5) + " target=" + law2.target.toFixed(5) +
         " over=" + (((law2.fpr - law2.target) / law2.target) * 100).toFixed(1) + "%" +
+        " | cbf churn fn=" + churn.falseNegatives +
+        " present=" + churn.present + " size=" + churn.filterSize +
         " clearReuse=" + sameBuffer +
         " | " + (ok ? "ok" : "FAIL") + "\n");
 
@@ -169,8 +194,10 @@ async function main() {
         for (const f of findings) process.stderr.write("  finding " + f.kind + ":" + f.reason + "\n");
         for (const l of leaks) process.stderr.write("  leak " + l + "\n");
         if (!sameBuffer) process.stderr.write("  clear() reallocated the bit store\n");
-        if (law1.falseNegatives + law2.falseNegatives > 0)
+        if (law1.falseNegatives + law2.falseNegatives + churn.falseNegatives > 0)
             process.stderr.write("  FALSE NEGATIVE -- the one-sided guarantee is void\n");
+        if (churn.present !== churn.filterSize)
+            process.stderr.write("  CBF size " + churn.filterSize + " != present " + churn.present + "\n");
         if (law2.fpr > FPR_LIMIT)
             process.stderr.write("  FPR " + law2.fpr.toFixed(5) + " over limit " + FPR_LIMIT + "\n");
         process.stderr.write("  replay: TORTURE_SEED=" + SEED + " node --expose-gc test/torture.mjs\n");
