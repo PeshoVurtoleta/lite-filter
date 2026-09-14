@@ -9,8 +9,8 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { Bloom, CountingBloom } from "../Filter.js";
-import { validate, validateCounting } from "./validate.mjs";
+import { Bloom, CountingBloom, BlockedBloom } from "../Filter.js";
+import { validate, validateCounting, validateBlocked } from "./validate.mjs";
 
 function filled(opts) {
     const f = new Bloom(1000, opts);
@@ -20,6 +20,12 @@ function filled(opts) {
 
 function filledCounting(opts) {
     const f = new CountingBloom(1000, opts);
+    for (let i = 0; i < 800; i++) f.add(opts && opts.keys === "int" ? i : "k-" + i);
+    return f;
+}
+
+function filledBlocked(opts) {
+    const f = new BlockedBloom(1000, opts);
     for (let i = 0; i < 800; i++) f.add(opts && opts.keys === "int" ? i : "k-" + i);
     return f;
 }
@@ -246,4 +252,95 @@ test("CountingBloom restore door: bad format tag / seed / keys / count fail clos
     const s4 = filledCounting({ keys: "int" }).dump(); s4.count = -1;
     assert.throws(() => CountingBloom.restore(s4), /\[lite-filter\].*count/);
     assert.throws(() => CountingBloom.restore(null), /\[lite-filter\]/);
+});
+
+/* ------------------------------------------------------------------------- *
+ * BlockedBloom snapshot (decisions/0012): same envelope, bb:512 + nb + word store.
+ * ------------------------------------------------------------------------- */
+
+test("BlockedBloom dump/restore: exact round-trip preserves membership + count", () => {
+    const f = filledBlocked({ fpp: 0.01, keys: "int" });
+    const g = BlockedBloom.restore(f.dump());
+    assert.equal(g.size, f.size);
+    assert.equal(g.capacity, f.capacity);
+    for (let i = 0; i < 800; i++) assert.equal(g.mightContain(i), true);
+    validateBlocked(g);
+});
+
+test("BlockedBloom dump: round-trips through JSON and structuredClone", () => {
+    const f = filledBlocked({ fpp: 0.01, keys: "int" });
+    const snap = f.dump();
+    const viaJson = BlockedBloom.restore(JSON.parse(JSON.stringify(snap)));
+    const viaClone = BlockedBloom.restore(structuredClone(snap));
+    for (let i = 0; i < 800; i++) {
+        assert.equal(viaJson.mightContain(i), true);
+        assert.equal(viaClone.mightContain(i), true);
+    }
+});
+
+test("BlockedBloom dump: the tag shape is stable and self-describing (mem + bb:512 + nb + bits)", () => {
+    const snap = filledBlocked({ fpp: 0.01, keys: "int" }).dump();
+    assert.equal(snap.f, "litefilter/1");
+    assert.equal(snap.mem, "BlockedBloom");
+    assert.equal(snap.bb, 512);
+    assert.equal(typeof snap.nb, "number");
+    assert.equal(snap.keys, "int");
+    assert.equal(Array.isArray(snap.bits), true);
+    assert.equal(snap.bits.length, snap.nb * 16);
+});
+
+test("BlockedBloom restore door: member mismatch fails closed (both directions)", () => {
+    const bloomSnap = filled({ keys: "int" }).dump();
+    assert.throws(() => BlockedBloom.restore(bloomSnap), /\[lite-filter\].*member/);
+    const bbSnap = filledBlocked({ keys: "int" }).dump();
+    assert.throws(() => Bloom.restore(bbSnap), /\[lite-filter\].*member/);
+});
+
+test("BlockedBloom restore door: block-size (bb) mismatch fails closed", () => {
+    const snap = filledBlocked({ keys: "int" }).dump();
+    snap.bb = 256;
+    assert.throws(() => BlockedBloom.restore(snap), /\[lite-filter\].*block-size/);
+});
+
+test("BlockedBloom restore door: block-count (nb) mismatch fails closed", () => {
+    const snap = filledBlocked({ keys: "int" }).dump();
+    snap.nb = snap.nb + 1;
+    assert.throws(() => BlockedBloom.restore(snap), /\[lite-filter\].*block-count/);
+});
+
+test("BlockedBloom restore door: a short / oversized bit store is REJECTED, never truncated", () => {
+    const shortSnap = filledBlocked({ keys: "int" }).dump();
+    shortSnap.bits = shortSnap.bits.slice(0, shortSnap.bits.length - 1);
+    assert.throws(() => BlockedBloom.restore(shortSnap), /\[lite-filter\].*bit store/);
+    const longSnap = filledBlocked({ keys: "int" }).dump();
+    longSnap.bits = longSnap.bits.concat([0, 0, 0]);
+    assert.throws(() => BlockedBloom.restore(longSnap), /\[lite-filter\].*bit store/);
+});
+
+test("BlockedBloom restore door: an out-of-range / corrupt bit-store word is REJECTED, never coerced", () => {
+    for (const bad of [NaN, "not-a-number", -1, 4294967296, 4294967296.7, {}, null]) {
+        const snap = filledBlocked({ keys: "int" }).dump();
+        snap.bits[0] = bad;
+        assert.throws(() => BlockedBloom.restore(snap), /\[lite-filter\]/,
+            "restore() must reject a corrupt bit word " + String(bad));
+    }
+});
+
+test("BlockedBloom restore door: bad format tag / seed / keys / count fail closed", () => {
+    const s1 = filledBlocked({ keys: "int" }).dump(); s1.f = "litefilter/2";
+    assert.throws(() => BlockedBloom.restore(s1), /\[lite-filter\].*format tag/);
+    const s2 = filledBlocked({ keys: "int" }).dump(); s2.seed = 1.5;
+    assert.throws(() => BlockedBloom.restore(s2), /\[lite-filter\].*seed/);
+    const s3 = filledBlocked({ keys: "int" }).dump(); delete s3.keys;
+    assert.throws(() => BlockedBloom.restore(s3), /\[lite-filter\].*keys mode/);
+    const s4 = filledBlocked({ keys: "int" }).dump(); s4.count = -1;
+    assert.throws(() => BlockedBloom.restore(s4), /\[lite-filter\].*count/);
+    assert.throws(() => BlockedBloom.restore(null), /\[lite-filter\]/);
+});
+
+test("BlockedBloom restore opts: stats can be re-derived on restore", () => {
+    const snap = filledBlocked({ keys: "int" }).dump();
+    const g = BlockedBloom.restore(snap, { stats: true });
+    g.mightContain(1);
+    assert.equal(g.stats().queries, 1);
 });

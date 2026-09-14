@@ -12,7 +12,10 @@
  *                             bounded pause. clear() must reuse the SAME ArrayBuffer.
  *   phase 3  DIFFERENTIAL   -- the Set-oracle falsifiable laws: 1e6 adds -> 0 false
  *                             negatives; n=1e5/fpp=0.01 over 1e6 disjoint probes ->
- *                             measured FPR <= 0.0125 (<= 25% over the formula).
+ *                             measured FPR <= 0.0125 (<= 25% over the formula). Also
+ *                             the BlockedBloom laws: 0 false negatives, and a measured
+ *                             FPR within its HONEST looser ceiling (<= 0.0175) that is
+ *                             PROVEN to run OVER the plain-Bloom theory (decisions/0013).
  *
  * ENTRY CONTRACT (mirrors lite-lru): the --expose-gc guard, a dynamic peer preflight
  * AFTER the guard, and a printed replay seed on failure. The GATE line prints to
@@ -49,8 +52,8 @@ async function main() {
         createOwnerCascadeOrphanKernel,
     } = await import("@zakkster/lite-leak");
     const { createRoot, effect, dispose } = await import("@zakkster/lite-signal");
-    const { Bloom, CountingBloom } = await import("../Filter.js");
-    const { validate, validateCounting } = await import("./validate.mjs");
+    const { Bloom, CountingBloom, BlockedBloom } = await import("../Filter.js");
+    const { validate, validateCounting, validateBlocked } = await import("./validate.mjs");
     const { differentialInt, differentialChurnInt } = await import("./torture/oracle.mjs");
 
     const SEED = (process.env.TORTURE_SEED >>> 0) || 0x1f2e3d4c;
@@ -88,6 +91,12 @@ async function main() {
                 g.add(i | 0);
                 g.remove(i | 0);
                 tracker.track(g, () => {}, "counting-bloom", { audit: true });
+                // BlockedBloom holds only a Uint32Array -- same retention shape as Bloom.
+                // Churn it through the SAME owner scope so a leak here surfaces too.
+                const h = new BlockedBloom(1024, { keys: "int" });
+                h.add(i | 0);
+                h.mightContain(i | 0);
+                tracker.track(h, () => {}, "blocked-bloom", { audit: true });
             });
             dispose(e); // disposing the owner untracks the filters -> collectable
         }
@@ -107,6 +116,10 @@ async function main() {
     // path, all strictly zero-alloc (nibble read/modify/write, no scratch array).
     const cinst = new CountingBloom(HOT_CAP, { keys: "int" });
     const cbufBefore = cinst._cnts.buffer;
+    // BlockedBloom steady-state instance: add / mightContain on the hot path, both
+    // strictly zero-alloc (one block, odd-stride within-block walk, no scratch).
+    const binst = new BlockedBloom(HOT_CAP, { keys: "int" });
+    const bbufBefore = binst._words.buffer;
 
     // The BREAK control: a retained sink the hot loop feeds one fresh object per op,
     // so heapUsed climbs and the major-GC / pause gate rejects the window.
@@ -123,6 +136,9 @@ async function main() {
         cinst.add(i & MASK);
         acc = (acc + (cinst.mightContain(i & MASK) ? 1 : 0)) | 0;
         cinst.remove(i & MASK);
+        // BlockedBloom: add then query on the hot path, both zero-alloc on keys:'int'.
+        binst.add(i & MASK);
+        acc = (acc + (binst.mightContain((i * 2 + 1) & MASK) ? 1 : 0)) | 0;
         if (BREAK) sink.push({ i: i, acc: acc }); // retained: MUST trip the gate
         if ((i & 8191) === 0) {
             gc.sampleHeap(performance.now(), process.memoryUsage().heapUsed);
@@ -140,9 +156,13 @@ async function main() {
     // clear() must reuse the SAME ArrayBuffer (zero-alloc reset) for both members.
     inst.clear();
     cinst.clear();
-    const sameBuffer = inst._words.buffer === bufBefore && cinst._cnts.buffer === cbufBefore;
+    binst.clear();
+    const sameBuffer = inst._words.buffer === bufBefore &&
+        cinst._cnts.buffer === cbufBefore &&
+        binst._words.buffer === bbufBefore;
     validate(inst);
     validateCounting(cinst);
+    validateBlocked(binst);
 
     const allocPerOp = Math.max(0, Math.round((heapAfter - heapBefore) / HOT));
 
@@ -157,13 +177,30 @@ async function main() {
     const churn = differentialChurnInt(CountingBloom,
         { n: 20000, fpp: 0.01, ops: 100000, seed: SEED ^ 0xa5 });
 
+    // Law 4 (BlockedBloom): 1e6 adds -> exactly 0 false negatives (add-only, one-sided).
+    const bbLaw1 = differentialInt(BlockedBloom, { n: 1000000, fpp: 0.01, probes: 1, seed: SEED });
+    // Law 5 (BlockedBloom): n=1e5, fpp=0.01, 1e6 disjoint probes -> measured FPR within
+    // the HONEST looser ceiling (decisions/0013): <= 0.0175. AND the penalty must be
+    // PROVEN present -- the measured FPR must run OVER a floor set ABOVE plain Bloom's
+    // OWN measured rate for this fill (law2.fpr ~ 0.00997, itself over the 0.00949 closed
+    // form), so a penalty-free / plain-behaving build CANNOT pass this gate. BlockedBloom
+    // measures ~0.01378 here, so a 0.0115 floor has real teeth with safe margin on both
+    // sides (comfortably above plain ~0.00997, comfortably below blocked ~0.01378).
+    const bbLaw2 = differentialInt(BlockedBloom, { n: 100000, fpp: 0.01, probes: 1000000, seed: SEED ^ 0x55 });
+    const BB_FPR_LIMIT = 0.0175;   // honest ceiling: blocked runs OVER plain (decisions/0013)
+    const BB_THEORY_FLOOR = 0.0115; // ABOVE plain Bloom's MEASURED rate -- must be EXCEEDED
+
     // ---- verdict --------------------------------------------------------------
     const oracleOk =
         law1.falseNegatives === 0 &&
         law2.falseNegatives === 0 &&
         law2.fpr <= FPR_LIMIT &&
         churn.falseNegatives === 0 &&
-        churn.present === churn.filterSize;
+        churn.present === churn.filterSize &&
+        bbLaw1.falseNegatives === 0 &&
+        bbLaw2.falseNegatives === 0 &&
+        bbLaw2.fpr <= BB_FPR_LIMIT &&
+        bbLaw2.fpr > BB_THEORY_FLOOR;
     const ok =
         report.ok &&
         live === 0 &&
@@ -183,6 +220,10 @@ async function main() {
         " over=" + (((law2.fpr - law2.target) / law2.target) * 100).toFixed(1) + "%" +
         " | cbf churn fn=" + churn.falseNegatives +
         " present=" + churn.present + " size=" + churn.filterSize +
+        " | bb fn=" + (bbLaw1.falseNegatives + bbLaw2.falseNegatives) +
+        " fpr=" + bbLaw2.fpr.toFixed(5) + " ceiling=" + BB_FPR_LIMIT.toFixed(5) +
+        " floor=" + BB_THEORY_FLOOR.toFixed(5) +
+        " overTheory=" + (bbLaw2.fpr > BB_THEORY_FLOOR) +
         " clearReuse=" + sameBuffer +
         " | " + (ok ? "ok" : "FAIL") + "\n");
 
@@ -194,12 +235,19 @@ async function main() {
         for (const f of findings) process.stderr.write("  finding " + f.kind + ":" + f.reason + "\n");
         for (const l of leaks) process.stderr.write("  leak " + l + "\n");
         if (!sameBuffer) process.stderr.write("  clear() reallocated the bit store\n");
-        if (law1.falseNegatives + law2.falseNegatives + churn.falseNegatives > 0)
+        if (law1.falseNegatives + law2.falseNegatives + churn.falseNegatives +
+            bbLaw1.falseNegatives + bbLaw2.falseNegatives > 0)
             process.stderr.write("  FALSE NEGATIVE -- the one-sided guarantee is void\n");
         if (churn.present !== churn.filterSize)
             process.stderr.write("  CBF size " + churn.filterSize + " != present " + churn.present + "\n");
         if (law2.fpr > FPR_LIMIT)
             process.stderr.write("  FPR " + law2.fpr.toFixed(5) + " over limit " + FPR_LIMIT + "\n");
+        if (bbLaw2.fpr > BB_FPR_LIMIT)
+            process.stderr.write("  BB FPR " + bbLaw2.fpr.toFixed(5) + " over ceiling " + BB_FPR_LIMIT + "\n");
+        if (!(bbLaw2.fpr > BB_THEORY_FLOOR))
+            process.stderr.write("  BB FPR " + bbLaw2.fpr.toFixed(5) +
+                " NOT over plain-Bloom theory " + BB_THEORY_FLOOR +
+                " -- the locality penalty is not visible (check h1/h2 independence)\n");
         process.stderr.write("  replay: TORTURE_SEED=" + SEED + " node --expose-gc test/torture.mjs\n");
         process.exit(1);
     }

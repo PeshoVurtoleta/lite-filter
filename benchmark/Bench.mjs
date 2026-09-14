@@ -27,7 +27,7 @@
  * @license MIT
  */
 
-import { Bloom, CountingBloom, VERSION } from "../Filter.js";
+import { Bloom, CountingBloom, BlockedBloom, VERSION } from "../Filter.js";
 
 /** Seeded xorshift32 -- byte-reproducible from its seed. */
 export function makePrng(seed) {
@@ -191,6 +191,51 @@ export function measureCounting(name, gen, cap, fpp, seed) {
 }
 
 /**
+ * Measure one workload against a fresh BlockedBloom sized (cap, fpp). Same row shape as
+ * `measure` so the two members print into the same side-by-side table. bits/item is 1x
+ * (same store size as Bloom); the honest deltas are query ns (LOWER -- one cache miss)
+ * and measured FPR (HIGHER -- lost cross-block independence, decisions/0013).
+ */
+export function measureBlocked(name, gen, cap, fpp, seed) {
+    const { keys, probes } = gen(cap, Math.max(cap * 10, 100000), seed);
+    const filter = new BlockedBloom(cap, { fpp, keys: "int" });
+    const truth = new Set();
+
+    const t0 = performance.now();
+    for (let i = 0; i < keys.length; i++) filter.add(keys[i]);
+    const addNs = ((performance.now() - t0) * 1e6) / keys.length;
+    for (let i = 0; i < keys.length; i++) truth.add(keys[i]);
+
+    let falseNeg = 0;
+    for (const key of truth) if (!filter.mightContain(key)) falseNeg++;
+
+    const t1 = performance.now();
+    let acc = 0;
+    for (let i = 0; i < probes.length; i++) acc += filter.mightContain(probes[i]) ? 1 : 0;
+    const queryNs = ((performance.now() - t1) * 1e6) / probes.length;
+    if (acc === -1) process.stdout.write(""); // keep acc observable
+    let falsePos = 0, probed = 0;
+    for (let i = 0; i < probes.length; i++) {
+        if (truth.has(probes[i])) continue;
+        probed++;
+        if (filter.mightContain(probes[i])) falsePos++;
+    }
+
+    const distinct = truth.size;
+    const m = filter._m;
+    const k = filter._k;
+    const measuredFpr = probed === 0 ? 0 : falsePos / probed;
+    const theoretical = Math.pow(1 - Math.exp(-(k * distinct) / m), k);
+    const overPct = theoretical === 0 ? 0 : ((measuredFpr - theoretical) / theoretical) * 100;
+    const bitsPerItem = m / distinct;
+
+    return {
+        name, added: keys.length, distinct, bitsPerItem, k,
+        measuredFpr, theoretical, overPct, addNs, queryNs, falseNeg,
+    };
+}
+
+/**
  * The remove/churn workload (CountingBloom only): add N distinct keys, remove HALF,
  * then requery -- the still-present half MUST show 0 false negatives, and the removed
  * half should mostly read absent. Reports remove ns/op and the two counts. This is the
@@ -235,6 +280,20 @@ export function runBench(opts) {
     rows.push(measure("sequential", sequential, cap, fpp, seed ^ 0x22));
     // adversarial: oversize the key set to ~1.5x cap -> near-full load factor.
     rows.push(measure("adversarial", (n, p, s) => adversarial(Math.floor(cap * 1.5), p, s),
+        cap, fpp, seed ^ 0x33));
+    return rows;
+}
+
+/** Run the BlockedBloom workload matrix (FPR-vs-theory across the 4 workloads). */
+export function runBenchBlocked(opts) {
+    const cap = (opts && opts.cap) || 100000;
+    const fpp = (opts && opts.fpp) || 0.01;
+    const seed = (opts && opts.seed) || 0xC0FFEE;
+    const rows = [];
+    rows.push(measureBlocked("uniform", uniform, cap, fpp, seed));
+    rows.push(measureBlocked("zipfian", zipfian, cap, fpp, seed ^ 0x11));
+    rows.push(measureBlocked("sequential", sequential, cap, fpp, seed ^ 0x22));
+    rows.push(measureBlocked("adversarial", (n, p, s) => adversarial(Math.floor(cap * 1.5), p, s),
         cap, fpp, seed ^ 0x33));
     return rows;
 }
@@ -307,11 +366,49 @@ function printCountingTable(rows, remove, cap, fpp) {
         "false-POSITIVE effect; the never-false-negative law is falseNegPresent=0.\n\n");
 }
 
+/**
+ * The MANDATORY honesty output (decisions/0013): Bloom vs BlockedBloom SIDE BY SIDE at
+ * the same bits/item across the four workloads. The two columns that tell the whole
+ * story: query ns (BlockedBloom should be LOWER -- one cache miss) and measured FPR
+ * (BlockedBloom should be HIGHER -- the locality penalty). No "same fpp for free".
+ */
+function printBlockedTable(bloomRows, blockedRows, cap, fpp) {
+    process.stdout.write(
+        "@zakkster/lite-filter v" + VERSION + " -- Bloom vs BlockedBloom (cap=" + cap +
+        ", target fpp=" + fpp + ")\n" +
+        "Same bits/item. BlockedBloom trades a HIGHER measured FPR (lost cross-block\n" +
+        "independence, decisions/0013) for a LOWER query ns (one 64-byte cache line).\n\n");
+    process.stdout.write(
+        pad("workload", 12) + pad("bits/item", 11) +
+        pad("Bloom FPR", 12) + pad("Blkd FPR", 12) + pad("FPR delta", 11) +
+        pad("Bloom qns", 11) + pad("Blkd qns", 11) + pad("qns delta", 11) + "\n");
+    for (let i = 0; i < bloomRows.length; i++) {
+        const bl = bloomRows[i];
+        const bb = blockedRows[i];
+        const fprDelta = bb.measuredFpr - bl.measuredFpr;
+        const qnsDelta = bb.queryNs - bl.queryNs;
+        process.stdout.write(
+            pad(bl.name, 12) +
+            pad(bl.bitsPerItem.toFixed(2), 11) +
+            pad(bl.measuredFpr.toFixed(5), 12) +
+            pad(bb.measuredFpr.toFixed(5), 12) +
+            pad((fprDelta >= 0 ? "+" : "") + fprDelta.toFixed(5), 11) +
+            pad(bl.queryNs.toFixed(1), 11) +
+            pad(bb.queryNs.toFixed(1), 11) +
+            pad((qnsDelta >= 0 ? "+" : "") + qnsDelta.toFixed(1), 11) + "\n");
+    }
+    process.stdout.write(
+        "\nBlkd FPR > Bloom FPR is the PENALTY (decisions/0013); Blkd qns < Bloom qns is\n" +
+        "the WIN. fpp() reports the plain-Bloom FLOOR -- MEASURE your own keys.\n\n");
+}
+
 // Runnable entry: `node benchmark/Bench.mjs`.
 if (import.meta.url === "file://" + process.argv[1] ||
     import.meta.url === new URL("file://" + process.argv[1]).href) {
     const cap = 100000;
     const fpp = 0.01;
-    printTable(runBench({ cap, fpp }), cap, fpp);
+    const bloomRows = runBench({ cap, fpp });
+    printTable(bloomRows, cap, fpp);
     printCountingTable(runBenchCounting({ cap, fpp }), measureRemove(cap, fpp, 0xC0FFEE ^ 0x44), cap, fpp);
+    printBlockedTable(bloomRows, runBenchBlocked({ cap, fpp }), cap, fpp);
 }

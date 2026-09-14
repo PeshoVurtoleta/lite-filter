@@ -68,6 +68,10 @@ export interface FilterSnapshot {
   w?: number;
   /** CountingBloom: the packed counter store as bytes (0..255). */
   cnts?: number[];
+  /** BlockedBloom: the block size in bits (512). */
+  bb?: number;
+  /** BlockedBloom: the block count (ceil(m / 512)). */
+  nb?: number;
 }
 
 /** Construction options shared by every filter member. */
@@ -171,6 +175,36 @@ export class CountingBloom<K = unknown> implements LiteFilter<K> {
   dump(): FilterSnapshot;
   /** Reconstruct a fresh CountingBloom from a snapshot. Fail closed on any mismatch. */
   static restore(snap: FilterSnapshot, opts?: FilterRestoreOptions): CountingBloom;
+}
+
+/**
+ * Blocked Bloom filter -- the cache-local member (decisions/0012, 0013). Partitions the
+ * bit array into fixed 512-bit BLOCKS (one 64-byte cache line each) and routes every key
+ * to ONE block, so a query touches ONE cache line regardless of k -- the throughput win.
+ * Add-only like `Bloom`: `remove()` throws a `[lite-filter]`-tagged Error. The honest
+ * price (decisions/0013): partitioning loses cross-block independence, so the MEASURED
+ * false-positive rate runs OVER the plain-Bloom formula for the same bits/item. `fpp()`
+ * returns the plain closed-form as a labeled FLOOR, not a prediction -- MEASURE with the
+ * bench (`npm run bench`), which prints Bloom vs BlockedBloom side by side.
+ */
+export class BlockedBloom<K = unknown> implements LiteFilter<K> {
+  constructor(capacity: number, options?: FilterOptions);
+  add(key: K): void;
+  mightContain(key: K): boolean;
+  has(key: K): boolean;
+  /** BlockedBloom is add-only: this always throws a `[lite-filter]`-tagged Error. */
+  remove(key: K): never;
+  readonly size: number;
+  readonly count: number;
+  readonly capacity: number;
+  /** The plain-Bloom closed-form FLOOR (blocked runs OVER it); MEASURE the real rate. */
+  fpp(): number;
+  clear(): void;
+  stats(): FilterStats;
+  resetStats(): void;
+  dump(): FilterSnapshot;
+  /** Reconstruct a fresh BlockedBloom from a snapshot. Fail closed on any mismatch. */
+  static restore(snap: FilterSnapshot, opts?: FilterRestoreOptions): BlockedBloom;
 }
 
 export const VERSION: string;

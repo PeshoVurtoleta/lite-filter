@@ -5,7 +5,7 @@
 > `llms.txt` carries the per-member "good for / not for"; this is the long form with
 > the flowchart and the MEASURED numbers.
 
-> SKELETON (v0.2.0). Bloom + CountingBloom ship today; the rest are marked PLANNED --
+> SKELETON (v0.3.0). Bloom + CountingBloom + BlockedBloom ship today; the rest are marked PLANNED --
 > they name the axis the member will occupy and are filled in with a MEASURED bench
 > number when the member lands (ROADMAP section 10). No un-numbered assertion ships.
 
@@ -29,7 +29,7 @@ npm run bench     # measured vs theoretical FPR, bits/item, add/query ns, per wo
 | Simple, well-understood baseline | **Bloom** | the textbook default; the floor | SHIPPED (v0.1.0) |
 | Need deletes | **CountingBloom** (alt: Cuckoo) | 4-bit counters decrement; real `remove()` | SHIPPED (v0.2.0) |
 | Approximate multiplicity, not just presence | CountingBloom | counters carry a count (readout deferred, decisions/0010) | PARTIAL |
-| Maximum query throughput | Blocked Bloom | one cache miss per query | PLANNED |
+| Maximum query throughput | **BlockedBloom** | one cache miss per query (at a HIGHER measured FPR) | SHIPPED (v0.3.0) |
 | Mergeable / resizable | Quotient | the only member that merges + resizes | PLANNED |
 | Known static set, minimize space | Binary Fuse (alt: XOR) | near the ~1.23x lower bound, no inserts | PLANNED |
 
@@ -41,7 +41,7 @@ flowchart TD
     A -->|yes| C[CountingBloom -- SHIPPED; or Cuckoo/Quotient -- PLANNED]
     B -->|yes, static| D[Binary Fuse / XOR -- PLANNED]
     B -->|no, incremental| E[Max query throughput?]
-    E -->|yes| F[Blocked Bloom -- PLANNED]
+    E -->|yes, can pay a higher FPR| F[BlockedBloom -- SHIPPED]
     E -->|no| G[Bloom -- SHIPPED]
 ```
 
@@ -83,6 +83,36 @@ across all four workloads). Two honest caveats to internalize before reaching fo
 Bloom's FPR columns at 4x bits/item, plus a `remove-churn` line (add N, remove half,
 requery) whose `falseNegPresent` MUST be 0 and whose `residual` is the shared-counter
 false-positive residue.
+
+### BlockedBloom (SHIPPED)
+
+Bloom partitioned into fixed 512-bit BLOCKS -- 16 x 32-bit words = 64 bytes, one cache
+line (decisions/0012). Every key is routed to ONE block (from its first base hash), and
+all `k` bits live inside that block via an odd-stride within-block walk. So a query
+touches ONE cache line regardless of `k` -- the throughput win the bench shows on the
+uniform / sequential / adversarial workloads (query ns DOWN vs Bloom at the SAME
+bits/item). It is add-only like Bloom: `remove()` throws.
+
+The caveat is inherent and MEASURED, never hidden (decisions/0013): confining a key to
+one block loses the cross-block independence the textbook formula assumes, so its
+MEASURED false-positive rate runs OVER a plain Bloom's for the same bits/item. `fpp()`
+reports the plain closed-form as a labeled FLOOR, not a prediction. The bench prints
+Bloom vs BlockedBloom side by side so the trade -- lower query ns, higher FPR -- is the
+first thing you see. To hit a target measured FPR, raise the configured `fpp` slightly
+or measure your own keys; never trust the floor as the delivered rate.
+
+*Measured (fill this in from `npm run bench`):* the side-by-side table -- `FPR delta`
+(BlockedBloom higher) and `qns delta` (BlockedBloom lower on uniform) across the four
+workloads.
+
+## Reach-for / avoid (BlockedBloom)
+
+- REACH FOR BlockedBloom when: query throughput dominates, the key set grows
+  incrementally, you never delete, and you can pay a modestly higher (measured) FPR --
+  or raise `fpp` to buy it back -- for one cache miss per query.
+- AVOID BlockedBloom when: you need the tightest FPR at a given bits/item (plain Bloom
+  is lower), you need deletes (CountingBloom), or your working set already fits in cache
+  (the locality win shrinks and the FPR penalty is not worth it -- MEASURE).
 
 ## Reach-for / avoid (Bloom)
 

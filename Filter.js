@@ -37,15 +37,23 @@
  * Bloom's space and carries two honest caveats (decisions/0009): removing a key that
  * was never added can corrupt OTHER keys, and a counter that saturates at 15 sticks.
  *
+ * The 3rd member -- `BlockedBloom` -- partitions the bit array into fixed 512-bit
+ * BLOCKS (one 64-byte cache line each) and routes every key to ONE block, so a query
+ * is ONE cache miss regardless of k (decisions/0012). It is add-only like Bloom. The
+ * honest price (decisions/0013): partitioning loses cross-block independence, so its
+ * MEASURED false-positive rate runs OVER the plain-Bloom formula for the same bits/item
+ * -- fpp() reports the plain closed-form as a labeled FLOOR and the bench prints the two
+ * members side by side (query ns down, FPR up). No "same fpp for free" claim.
+ *
  * Design decisions live in decisions/ (0001 hashing; 0002 sizing; 0003 remove +
  * count; 0004 fpp; 0005 snapshot; 0006 deferred static-build API; 0007 counter
  * width; 0008 saturation; 0009 remove caveat; 0010 count deferred; 0011 CBF
- * snapshot) and are summarized in ROADMAP.md.
+ * snapshot; 0012 block size; 0013 FPR locality) and are summarized in ROADMAP.md.
  *
  * @license MIT
  */
 
-export const VERSION = "0.2.0";
+export const VERSION = "0.3.0";
 
 /* -------------------------------------------------------------------------- *
  * Constants + fail-closed messages (built ONCE, thrown only on misuse).
@@ -89,6 +97,22 @@ const SNAP_TAG = "litefilter/1";
  *  ~4x a plain Bloom's bits while making overflow negligibly rare at a 1% fpp. */
 const COUNTER_WIDTH = 4;
 const MAX_COUNT = 15;
+
+/** BlockedBloom block geometry (decisions/0012). A key touches exactly ONE 512-bit
+ *  block -- 16 x 32-bit words = 64 bytes, one cache line on x86-64 and Apple Silicon --
+ *  so a query is ONE cache miss regardless of k. 512 is PINNED, the only production
+ *  path, NOT configurable (decisions/0012). BLOCK_BITS is the within-block position
+ *  mask domain (`pos & (BLOCK_BITS-1)`); BLOCK_WORDS is the per-block word count. */
+const BLOCK_BITS = 512;
+const BLOCK_WORDS = 16;
+
+/** Fail-closed message for remove() on BlockedBloom (decisions/0003, add-only like
+ *  Bloom). Clearing k block-local bits would corrupt every other key that shares one
+ *  of them (a later FALSE NEGATIVE), so we reject loudly. Built once, thrown on misuse. */
+const BB_REMOVE_MSG =
+    "[lite-filter] BlockedBloom is add-only and cannot remove(); clearing bits would " +
+    "cause false negatives for other keys. Use a deletable member (Counting Bloom / " +
+    "Cuckoo) when the roster ships one.";
 
 /** Default target false-positive probability when the caller omits `fpp`
  *  (decisions/0002): the textbook 1% baseline. Explicit and documented, never a
@@ -370,7 +394,8 @@ export class Bloom {
 
     /** Reset to empty. Allocates NOTHING: zeroes the existing bit store in place, so
      *  the ArrayBuffer identity is preserved (decisions/0002, proven by the torture
-     *  gate). The presence counter and stats-adds semantics reset too. */
+     *  gate). The presence counter resets; opt-in stats are cumulative instrumentation
+     *  and SURVIVE a clear() -- reset them explicitly with resetStats(). */
     clear() {
         this._words.fill(0);
         this._count = 0;
@@ -830,6 +855,312 @@ export class CountingBloom {
             }
         }
         for (let i = 0; i < cnts.length; i++) inst._cnts[i] = cnts[i];
+        inst._count = snap.count;
+        return inst;
+    }
+}
+
+/* -------------------------------------------------------------------------- *
+ * BlockedBloom -- the cache-local member (decisions/0012, 0013). A Bloom whose bit
+ * array is partitioned into fixed 512-bit BLOCKS: every key is routed to exactly ONE
+ * block (chosen from the first base hash), and all k bits live inside that block. A
+ * query therefore touches ONE 64-byte cache line instead of k scattered words -- the
+ * throughput win. The honest price (decisions/0013): partitioning loses cross-block
+ * independence, so the MEASURED false-positive rate runs OVER the plain-Bloom formula
+ * for the same bits/item. fpp() reports the plain closed-form as an explicit FLOOR;
+ * the bench prints Bloom vs BlockedBloom side by side (query ns down, FPR up). Add-only
+ * like Bloom -- remove() throws (decisions/0003).
+ * -------------------------------------------------------------------------- */
+
+export class BlockedBloom {
+    /**
+     * @param {number} capacity  Items the filter is sized for. Integer >= 1.
+     * @param {{ fpp?: number, seed?: number, keys?: 'int', stats?: boolean }} [options]
+     */
+    constructor(capacity, options) {
+        // Cold sizing door: reuse Bloom's (n, fpp) derivation (decisions/0002) verbatim,
+        // so a BlockedBloom and a Bloom sized for the same target share m and k.
+        const fpp = (options && options.fpp !== undefined) ? options.fpp : DEFAULT_FPP;
+        const dims = sizeFor(capacity, fpp);
+
+        this._cap = capacity;      // items sized for (the configured capacity)
+        this._fpp = fpp;           // the CONFIGURED target fpp (decisions/0004)
+        this._m = dims.m;          // bit count (across all blocks)
+        // k is CLAMPED to <= BLOCK_BITS: only 512 distinct positions exist inside a
+        // block, so a larger k cannot set more bits (decisions/0012). Fail-safe clamp.
+        this._k = dims.k > BLOCK_BITS ? BLOCK_BITS : dims.k;
+
+        this._int = validateKeys(options && options.keys);
+        this._seed = validateSeed(options && options.seed);
+        this._seed2 = fmix32(this._seed ^ 0x9e3779b9);
+
+        // Block count: ceil(m / 512). m >= 1 (sizeFor guarantees), so _nb >= 1 always;
+        // assert it fail-closed regardless (null is not zero -- a 0-block filter is
+        // never valid). The store is _nb * 16 words; reject a word count that would
+        // overflow a safe typed-array length BEFORE the allocation throws opaquely.
+        const nb = Math.ceil(this._m / BLOCK_BITS);
+        if (!(nb >= 1)) {
+            throw new RangeError(
+                "[lite-filter] BlockedBloom requires >= 1 block, derived nb=" + String(nb));
+        }
+        const words = nb * BLOCK_WORDS;
+        if (!Number.isFinite(words) || words > 0xffffffff) {
+            throw new RangeError(
+                "[lite-filter] requested filter is too large (nb=" + String(nb) +
+                " blocks); lower the capacity or raise the fpp");
+        }
+        this._nb = nb;
+
+        // The ONE preallocated bit store: _nb blocks x 16 words each, sized once and
+        // reused forever. clear() zeroes it in place -- same ArrayBuffer identity.
+        this._words = new Uint32Array(words);
+
+        // Presence counter (decisions/0003): the number of add() calls (not distinct).
+        this._count = 0;
+
+        // Opt-in stats (decisions/0004): null when off so the hot path writes NOTHING.
+        this._stats = validateStats(options && options.stats);
+    }
+
+    get size() { return this._count; }
+    get count() { return this._count; }
+    get capacity() { return this._cap; }
+
+    // --- hot path (zero allocation; strict on keys:'int') ---------------------
+
+    /**
+     * Record a key. Routes the key to ONE 512-bit block (from the first base hash) and
+     * sets k bits INSIDE it via an odd-stride walk (decisions/0012), so a whole add
+     * touches one cache line. Zero allocation on the int + string paths. Add-only --
+     * there is no remove (decisions/0003).
+     */
+    add(key) {
+        let a, b;
+        if (this._int) {
+            if (!Number.isInteger(key) || key < INT_MIN || key > INT_MAX) {
+                throw new TypeError(INT_KEY_MSG + String(key));
+            }
+            a = fmix32((key ^ this._seed) | 0);
+            b = (fmix32((Math.imul(key | 0, 0x9e3779b1) ^ this._seed2) | 0) | 1) >>> 0;
+        } else {
+            a = this._hashKey(key);
+            b = (fmix32(a ^ this._seed2) | 1) >>> 0;
+        }
+        const words = this._words;
+        const k = this._k;
+        const base = (a % this._nb) << 4;          // first word of the chosen block
+        const p0 = b & 511;                        // start position within the block
+        const st = ((b >>> 9) | 1) & 511;          // ODD stride -> distinct positions
+        for (let i = 0; i < k; i++) {
+            const pos = (p0 + Math.imul(i, st)) & 511;
+            words[base + (pos >>> 5)] |= (1 << (pos & 31));
+        }
+        this._count++;
+        if (this._stats !== null) this._stats.adds++;
+    }
+
+    /**
+     * The query. Returns true only if ALL k block-local bits are set. One-sided: NO
+     * false negatives (an added key always reads true), only false POSITIVES -- whose
+     * MEASURED rate runs OVER the plain-Bloom formula (decisions/0013). Zero allocation
+     * on the int + string paths; returns false on the first unset bit (no alloc).
+     */
+    mightContain(key) {
+        let a, b;
+        if (this._int) {
+            if (!Number.isInteger(key) || key < INT_MIN || key > INT_MAX) {
+                throw new TypeError(INT_KEY_MSG + String(key));
+            }
+            a = fmix32((key ^ this._seed) | 0);
+            b = (fmix32((Math.imul(key | 0, 0x9e3779b1) ^ this._seed2) | 0) | 1) >>> 0;
+        } else {
+            a = this._hashKey(key);
+            b = (fmix32(a ^ this._seed2) | 1) >>> 0;
+        }
+        const words = this._words;
+        const k = this._k;
+        const base = (a % this._nb) << 4;
+        const p0 = b & 511;
+        const st = ((b >>> 9) | 1) & 511;
+        let hit = true;
+        for (let i = 0; i < k; i++) {
+            const pos = (p0 + Math.imul(i, st)) & 511;
+            if ((words[base + (pos >>> 5)] & (1 << (pos & 31))) === 0) { hit = false; break; }
+        }
+        if (this._stats !== null) {
+            this._stats.queries++;
+            if (hit) this._stats.hits++; else this._stats.misses++;
+        }
+        return hit;
+    }
+
+    /** The SOLE alias of `mightContain` (decisions/0003), same one-sided semantics. */
+    has(key) { return this.mightContain(key); }
+
+    /**
+     * Hash an arbitrary key to a 32-bit base (decisions/0001). A string hashes over its
+     * code units (alloc-free); any other type is `String()`-encoded first (the honest
+     * amortized caveat). Never called on the keys:'int' path.
+     */
+    _hashKey(key) {
+        if (typeof key === "string") return hashStr(key, this._seed);
+        return hashStr(String(key), this._seed);
+    }
+
+    // --- add-only door (decisions/0003) ---------------------------------------
+
+    /** BlockedBloom is add-only. Fail closed rather than silently no-op or corrupt. */
+    remove() {
+        throw new Error(BB_REMOVE_MSG);
+    }
+
+    // --- cold inspection ------------------------------------------------------
+
+    /**
+     * The false-positive probability FLOOR (decisions/0004, 0013). For an EMPTY filter
+     * this is the CONFIGURED target; once keys are added it is the PLAIN-Bloom
+     * closed-form estimate `(1 - e^(-k*n/m))^k`. It is a LOWER BOUND, not a prediction:
+     * blocking loses cross-block independence, so the MEASURED FPR runs OVER this value
+     * (decisions/0013). Cold, O(1). MEASURE with the bench (`npm run bench`).
+     */
+    fpp() {
+        if (this._count === 0) return this._fpp;
+        const exponent = -(this._k * this._count) / this._m;
+        return Math.pow(1 - Math.exp(exponent), this._k);
+    }
+
+    /** Reset to empty. Allocates NOTHING: zeroes the existing bit store in place, so the
+     *  ArrayBuffer identity is preserved. */
+    clear() {
+        this._words.fill(0);
+        this._count = 0;
+    }
+
+    // --- opt-in stats (decisions/0004) ----------------------------------------
+
+    /** The live per-instance counter holder BY REFERENCE. Requires `{ stats: true }`;
+     *  throws fail-closed otherwise (null is not zero). */
+    stats() {
+        if (this._stats === null) throw new Error(STATS_OFF_MSG);
+        return this._stats;
+    }
+
+    /** Zero the four counters IN PLACE. Requires `{ stats: true }`; else fail closed. */
+    resetStats() {
+        if (this._stats === null) throw new Error(STATS_OFF_MSG);
+        this._stats.adds = 0;
+        this._stats.queries = 0;
+        this._stats.hits = 0;
+        this._stats.misses = 0;
+    }
+
+    // --- snapshot / restore (decisions/0005, 0012) ----------------------------
+
+    /**
+     * Serialize to a plain, structurally-cloneable snapshot. COLD -- never a hot path --
+     * and MAY allocate. The Uint32Array block store IS the serial form, emitted as a
+     * plain Array so it round-trips through structuredClone AND JSON. `bb: 512` records
+     * the block geometry (decisions/0012) and `nb` the block count, so a future block
+     * size change is a clean, detectable break. The fail-closed tag lets `restore()`
+     * reject any mismatch or corruption (REJECT, never truncate).
+     */
+    dump() {
+        return {
+            f: SNAP_TAG,
+            mem: "BlockedBloom",
+            bb: BLOCK_BITS,
+            nb: this._nb,
+            m: this._m,
+            k: this._k,
+            cap: this._cap,
+            fpp: this._fpp,
+            seed: this._seed,
+            keys: this._int ? "int" : null,
+            count: this._count,
+            bits: Array.from(this._words),
+        };
+    }
+
+    /**
+     * Reconstruct a FRESH BlockedBloom from a snapshot (decisions/0005, 0012). Fail
+     * closed on ANY tag / member / block-size / capacity / fpp / seed / keys / bit-count
+     * / block-count mismatch AND on a corrupt or wrong-length store (REJECT, never
+     * truncate -- null is not zero). EVERY word must be an exact 32-bit unsigned integer
+     * BEFORE any instance is mutated: a `>>> 0` coercion would silently drop set bits
+     * and cause a false negative on a previously-added key. `opts` re-derives
+     * runtime-only options (stats); everything structural comes FROM the snapshot.
+     */
+    static restore(snap, opts) {
+        if (snap === null || typeof snap !== "object") {
+            throw new TypeError("[lite-filter] restore(snap): snapshot must be an object");
+        }
+        if (snap.f !== SNAP_TAG) {
+            throw new Error(
+                "[lite-filter] restore(): bad format tag " + String(snap.f) +
+                " (expected " + SNAP_TAG + ")");
+        }
+        if (snap.mem !== "BlockedBloom") {
+            throw new Error(
+                "[lite-filter] restore(): member mismatch " + String(snap.mem) +
+                " (this is BlockedBloom.restore)");
+        }
+        if (snap.bb !== BLOCK_BITS) {
+            throw new Error(
+                "[lite-filter] restore(): block-size mismatch " + String(snap.bb) +
+                " (expected " + BLOCK_BITS + ")");
+        }
+        if (!Number.isInteger(snap.seed) || snap.seed < 0 || snap.seed > 0xffffffff) {
+            throw new Error(
+                "[lite-filter] restore(): corrupt seed " + String(snap.seed) +
+                " (must be a 32-bit unsigned integer)");
+        }
+        if (snap.keys !== "int" && snap.keys !== null) {
+            throw new Error(
+                "[lite-filter] restore(): corrupt keys mode " + String(snap.keys) +
+                " (must be 'int' or null)");
+        }
+        const keys = snap.keys === "int" ? "int" : undefined;
+        const inst = new BlockedBloom(snap.cap, {
+            fpp: snap.fpp,
+            seed: snap.seed,
+            keys: keys,
+            stats: opts && opts.stats,
+        });
+        if (snap.m !== inst._m) {
+            throw new Error(
+                "[lite-filter] restore(): bit-count mismatch (snapshot m=" + String(snap.m) +
+                ", derived m=" + inst._m + ")");
+        }
+        if (snap.k !== inst._k) {
+            throw new Error(
+                "[lite-filter] restore(): hash-count mismatch (snapshot k=" + String(snap.k) +
+                ", derived k=" + inst._k + ")");
+        }
+        if (snap.nb !== inst._nb) {
+            throw new Error(
+                "[lite-filter] restore(): block-count mismatch (snapshot nb=" + String(snap.nb) +
+                ", derived nb=" + inst._nb + ")");
+        }
+        const bits = snap.bits;
+        if (!Array.isArray(bits) || bits.length !== inst._words.length) {
+            throw new Error(
+                "[lite-filter] restore(): corrupt bit store (expected " + inst._words.length +
+                " words, got " + (Array.isArray(bits) ? bits.length : String(bits)) + ")");
+        }
+        if (!Number.isInteger(snap.count) || snap.count < 0) {
+            throw new Error(
+                "[lite-filter] restore(): corrupt count " + String(snap.count));
+        }
+        // Validate EVERY word BEFORE mutating (REJECT never truncate; null is not zero).
+        for (let i = 0; i < bits.length; i++) {
+            const w = bits[i];
+            if (!Number.isInteger(w) || w < 0 || w > 0xffffffff) {
+                throw new Error(
+                    "[lite-filter] restore(): corrupt bit-store word at index " + i +
+                    " (" + String(w) + "); each word must be a 32-bit unsigned integer");
+            }
+        }
+        for (let i = 0; i < bits.length; i++) inst._words[i] = bits[i];
         inst._count = snap.count;
         return inst;
     }

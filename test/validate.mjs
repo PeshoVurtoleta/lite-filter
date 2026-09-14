@@ -121,3 +121,84 @@ export function validateCounting(filter) {
         throw new Error("[validate] non-empty CountingBloom (count=" + count + ") has all-zero counters");
     }
 }
+
+/**
+ * Assert the CONSERVATION invariant for a BlockedBloom (test/debug only, O(words)).
+ *
+ *   words.length === nb * 16                   (16 words per 512-bit block)
+ *   nb === ceil(m / 512) && nb >= 1            (the block count matches the sizing)
+ *   m >= 1 && k >= 1 && k <= 512               (a validly sized, clamped filter)
+ *   count === 0  ->  popcount === 0            (an empty filter has NO bits set)
+ *   popcount <= min(nb*512, k * count)         (each add sets at most k bits, all in
+ *                                               ONE block -- decisions/0012)
+ *   count > 0   ->  popcount >= 1              (a non-empty filter has >= 1 bit set)
+ *
+ * The store is exactly `nb*512` bits, so "no bit set outside nb*512" holds by
+ * construction and is enforced via the length check. Throws an Error naming the first
+ * violation, or returns void.
+ */
+export function validateBlocked(filter) {
+    const m = filter._m;
+    const k = filter._k;
+    const nb = filter._nb;
+    const words = filter._words;
+    const count = filter._count;
+
+    const expectedWords = nb * 16;
+    if (words.length !== expectedWords) {
+        throw new Error(
+            "[validate] block store length " + words.length + " != nb*16=" + expectedWords);
+    }
+    if (!(nb >= 1)) {
+        throw new Error("[validate] invalid block count nb=" + nb);
+    }
+    if (nb !== Math.ceil(m / 512)) {
+        throw new Error(
+            "[validate] block count nb=" + nb + " != ceil(m/512)=" + Math.ceil(m / 512));
+    }
+    if (!(m >= 1) || !(k >= 1)) {
+        throw new Error("[validate] invalid sizing m=" + m + " k=" + k);
+    }
+    if (!(k <= 512)) {
+        throw new Error("[validate] k=" + k + " exceeds the 512-bit block (must be clamped)");
+    }
+
+    const pop = bitsSet(filter);
+    if (count === 0 && pop !== 0) {
+        throw new Error("[validate] empty BlockedBloom has " + pop + " bits set (expected 0)");
+    }
+    const ceil = Math.min(nb * 512, k * count);
+    if (pop > ceil) {
+        throw new Error(
+            "[validate] popcount " + pop + " exceeds k*count bound " + ceil +
+            " (k=" + k + ", count=" + count + ")");
+    }
+    if (count > 0 && pop < 1) {
+        throw new Error("[validate] non-empty BlockedBloom (count=" + count + ") has 0 bits set");
+    }
+}
+
+/**
+ * Assert the LOCALITY property (decisions/0012): a BlockedBloom into which EXACTLY ONE
+ * key was added must have ALL its set bits inside ONE 16-word (512-bit) aligned block.
+ * Hash-independent -- it does not replicate the address math -- so it proves the whole
+ * key landed in a single block, i.e. every set bit lies in `[blk<<4, blk<<4+16)`.
+ * Throws if two distinct blocks carry set bits (a locality bug). Returns the block
+ * index (or -1 if nothing was set).
+ */
+export function validateBlockedLocality(filter) {
+    const words = filter._words;
+    let block = -1;
+    for (let i = 0; i < words.length; i++) {
+        if (words[i] !== 0) {
+            const blk = i >> 4;
+            if (block === -1) block = blk;
+            else if (blk !== block) {
+                throw new Error(
+                    "[validate] single key set bits across two blocks: " + block + " and " + blk +
+                    " (locality broken, decisions/0012)");
+            }
+        }
+    }
+    return block;
+}

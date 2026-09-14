@@ -6,7 +6,7 @@
  *
  * Test-only; not in files[]. ASCII-only.
  */
-import Bloom, { VERSION, CountingBloom } from "../../Filter.js";
+import Bloom, { VERSION, CountingBloom, BlockedBloom } from "../../Filter.js";
 import type { LiteFilter, FilterOptions, FilterSnapshot } from "../../Filter.js";
 
 type Equal<A, B> =
@@ -66,3 +66,23 @@ expectTrue<Equal<typeof got2, boolean>>();
 const cbfSnap: FilterSnapshot = cbf.dump();
 const cbfRestored: CountingBloom<number> = CountingBloom.restore(cbfSnap);
 void cbfRestored;
+
+// ---- BlockedBloom: the cache-local member, add-only (remove is `never`) -------
+const bb = new BlockedBloom<number>(1000, { fpp: 0.01, keys: "int" });
+expectTrue<Equal<ReturnType<typeof bb.mightContain>, boolean>>();
+expectTrue<Equal<ReturnType<typeof bb.has>, boolean>>();
+expectTrue<Equal<ReturnType<typeof bb.fpp>, number>>();
+
+// remove() is add-only -> `never` (like Bloom, unlike CountingBloom's boolean).
+expectTrue<Equal<ReturnType<typeof bb.remove>, never>>();
+
+// BlockedBloom SATISFIES the uniform surface (one-line member swap).
+const iface3: LiteFilter<number> = new BlockedBloom<number>(1000);
+iface3.add(1);
+const got3 = iface3.mightContain(1);
+expectTrue<Equal<typeof got3, boolean>>();
+
+// snapshot round-trips through the typed surface.
+const bbSnap: FilterSnapshot = bb.dump();
+const bbRestored: BlockedBloom<number> = BlockedBloom.restore(bbSnap);
+void bbRestored;

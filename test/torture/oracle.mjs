@@ -28,9 +28,13 @@ export function makePrng(seed) {
 }
 
 /**
- * Run the differential oracle for an integer-keyed member.
+ * Run the differential oracle for an integer-keyed ADD-ONLY member. Generic over the
+ * member: `Bloom` and `BlockedBloom` both pass through unchanged (same add / query
+ * surface). The two laws below -- 0 false negatives, bounded FPR -- hold for both; the
+ * FPR CEILING differs (BlockedBloom runs OVER the plain-Bloom form, decisions/0013), so
+ * the caller applies the member-appropriate limit to `.fpr`, not this function.
  *
- * @param {Function} Ctor  the member constructor (e.g. Bloom)
+ * @param {Function} Ctor  the member constructor (e.g. Bloom, BlockedBloom)
  * @param {{ n:number, fpp:number, probes:number, seed:number }} opts
  * @returns {{ falseNegatives:number, falsePositives:number, fpr:number,
  *             target:number, added:number, probed:number }}

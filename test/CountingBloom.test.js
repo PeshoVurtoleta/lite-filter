@@ -161,6 +161,28 @@ test("clear(): empties the filter and reuses the same ArrayBuffer", () => {
     validateCounting(f);
 });
 
+test("clear(): stats are cumulative instrumentation and SURVIVE a clear()", () => {
+    const f = new CountingBloom(100, { stats: true });
+    f.add("a"); f.add("b");
+    f.mightContain("a");
+    f.mightContain("definitely-not-present-zzz");
+    const before = f.stats();
+    assert.equal(before.adds, 2);
+    assert.equal(before.queries, 2);
+    f.clear();
+    // Filter contents + presence counter reset; the stats holder does NOT.
+    assert.equal(f.size, 0);
+    const after = f.stats();
+    assert.equal(after, before, "clear() must not reallocate the stats holder");
+    assert.equal(after.adds, 2, "adds survive clear()");
+    assert.equal(after.queries, 2, "queries survive clear()");
+    assert.equal(after.hits + after.misses, 2, "hits/misses survive clear()");
+    // resetStats() is the explicit way to zero them.
+    f.resetStats();
+    assert.equal(f.stats().adds, 0);
+    validateCounting(f);
+});
+
 // --- opt-in stats -------------------------------------------------------------
 
 test("stats: OFF by default -- accessors fail closed", () => {

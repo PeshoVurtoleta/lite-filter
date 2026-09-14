@@ -24,7 +24,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { zgcSuite } from "@zakkster/lite-perf-gate";
-import { Bloom, CountingBloom } from "../../Filter.js";
+import { Bloom, CountingBloom, BlockedBloom } from "../../Filter.js";
 
 const CAP = 4096;
 const MASK = CAP - 1;
@@ -120,6 +120,41 @@ const cbfRemoveChurn = {
     statsOf(s) { return { grows: cntsBytes(s.c) }; },
 };
 
+/** BlockedBloom add-churn: fresh int keys; every op sets k bits in ONE block of the
+ *  fixed store (odd-stride within-block walk, no scratch -- strict zero-alloc). */
+const bbAddChurn = {
+    name: "BlockedBloom add-churn (int)",
+    setup() {
+        const c = new BlockedBloom(CAP, { fpp: 0.01, keys: "int" });
+        return { c, k: 0 };
+    },
+    hot(s, n) {
+        const c = s.c;
+        let k = s.k | 0;
+        for (let i = 0; i < n; i++) { c.add(k & MASK); k = (k + 1) | 0; }
+        s.k = k | 0;
+    },
+    statsOf(s) { return { grows: bitsBytes(s.c) }; },
+};
+
+/** BlockedBloom query-hit: a pre-filled filter; every op reads all k block-local bits
+ *  set (one cache line, no alloc). */
+const bbQueryHit = {
+    name: "BlockedBloom query-hit (int)",
+    setup() {
+        const c = new BlockedBloom(CAP, { fpp: 0.01, keys: "int" });
+        for (let i = 0; i < CAP; i++) c.add(i);
+        return { c, acc: 0 };
+    },
+    hot(s, n) {
+        const c = s.c;
+        let acc = s.acc | 0;
+        for (let i = 0; i < n; i++) acc = (acc + (c.mightContain(i & MASK) ? 1 : 0)) | 0;
+        s.acc = acc | 0;
+    },
+    statsOf(s) { return { grows: bitsBytes(s.c) }; },
+};
+
 /**
  * The teeth: an object-key churn on the default backing that String()-encodes one
  * fresh object key per op -- it MUST trip the gate (scavenges scale with n).
@@ -139,7 +174,7 @@ zgcSuite({
     maxOldGen: 0,
     maxArrayBuffersKB: 0,
     counters: { grows: 0 },
-    scenarios: [addChurn, queryHit, cbfAddChurn, cbfQueryHit, cbfRemoveChurn],
+    scenarios: [addChurn, queryHit, cbfAddChurn, cbfQueryHit, cbfRemoveChurn, bbAddChurn, bbQueryHit],
     mustFail: [mustFailAlloc],
 });
 
@@ -161,5 +196,14 @@ test("perf-gate cross-check: CountingBloom clear() reuses the counter store buff
     for (let i = 0; i < CAP; i++) c.remove(i);
     c.clear();
     assert.equal(c._cnts.buffer, buf, "clear() must reuse the same ArrayBuffer");
+    assert.equal(c.size, 0);
+});
+
+test("perf-gate cross-check: BlockedBloom clear() reuses the bit store buffer", () => {
+    const c = new BlockedBloom(CAP, { fpp: 0.01, keys: "int" });
+    const buf = c._words.buffer;
+    for (let i = 0; i < CAP; i++) c.add(i);
+    c.clear();
+    assert.equal(c._words.buffer, buf, "clear() must reuse the same ArrayBuffer");
     assert.equal(c.size, 0);
 });

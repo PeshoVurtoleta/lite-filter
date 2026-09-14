@@ -1,6 +1,6 @@
 # @zakkster/lite-filter
 
-> A zero-GC approximate-membership filter FAMILY under one `LiteFilter<K>` surface: a Bloom reference member today, the modern space-optimal members (Cuckoo, XOR, Binary Fuse) to come -- one-line swappable, tree-shakeable to a single filter, with a shipped bench that measures ACTUAL vs THEORETICAL false-positive rate on your own keys instead of trusting a formula.
+> A zero-GC approximate-membership filter FAMILY under one `LiteFilter<K>` surface: `Bloom` (the add-only reference), `CountingBloom` (deletable, ~4x space), and `BlockedBloom` (one cache miss per query, at a higher measured FPR) ship today, with the space-optimal and mergeable members (Cuckoo, Quotient, XOR, Binary Fuse) to come -- one-line swappable, tree-shakeable to a single filter, with a shipped bench that measures ACTUAL vs THEORETICAL false-positive rate on your own keys instead of trusting a formula.
 
 [![npm version](https://img.shields.io/npm/v/@zakkster/lite-filter.svg?style=for-the-badge&color=latest)](https://www.npmjs.com/package/@zakkster/lite-filter)
 [![sponsor](https://img.shields.io/badge/sponsor-PeshoVurtoleta-ea4aaa.svg?logo=github)](https://github.com/sponsors/PeshoVurtoleta)
@@ -38,7 +38,7 @@ seen.size;                      // 2     -- adds recorded
 seen.fpp();                     // the fill-derived FPR estimate (a formula, not a measurement)
 ```
 
-One `LiteFilter<K>` surface, `add`/`mightContain`/`has`/`size`/`capacity`/`fpp`/`clear`, zero allocation on every hot path after construction. Integer keys opt into a strict-zero-alloc backing. `import { Bloom }` is the whole library today; future members ship as further named exports (`sideEffects: false` drops whichever you do not import).
+One `LiteFilter<K>` surface, `add`/`mightContain`/`has`/`size`/`capacity`/`fpp`/`clear`, zero allocation on every hot path after construction. Integer keys opt into a strict-zero-alloc backing. `Bloom`, `CountingBloom`, and `BlockedBloom` are shipped named exports today; the remaining members (Cuckoo, Quotient, XOR, Binary Fuse) ship as further named exports (`sideEffects: false` drops whichever you do not import).
 
 Then measure, do not guess:
 
@@ -53,6 +53,9 @@ npm run bench     # measured vs theoretical FPR (% over), bits/item, add/query n
 - [Why this exists](#why-this-exists)
 - [What you get](#what-you-get)
 - [The Bloom filter, in brief](#the-bloom-filter-in-brief)
+- [The members](#the-members)
+  - [CountingBloom -- the deletable member](#the-members)
+  - [BlockedBloom -- the cache-local member](#the-members)
 - [API reference](#api-reference)
   - [Construction](#construction)
   - [The surface](#the-surface)
@@ -137,8 +140,9 @@ so `remove()` throws (use `CountingBloom` when you need deletes).
 | --- | --- | --- | --- | --- |
 | `Bloom` | no (`remove` throws) | 1x (`~1.44 log2(1/fpp)` bits/item) | SHIPPED (v0.1.0) | `import { Bloom } from '@zakkster/lite-filter'` |
 | `CountingBloom` | **yes** (`remove -> boolean`) | ~4x Bloom (4-bit counters) | SHIPPED (v0.2.0) | `import { CountingBloom } from '@zakkster/lite-filter'` |
+| `BlockedBloom` | no (`remove` throws) | 1x Bloom (one 512-bit cache line per key) | SHIPPED (v0.3.0) | `import { BlockedBloom } from '@zakkster/lite-filter'` |
 
-Both implement the same `LiteFilter<K>` surface, so a member is a one-line
+All three implement the same `LiteFilter<K>` surface, so a member is a one-line
 constructor swap; the only surface difference is `remove` (member-specific).
 
 <details>
@@ -175,6 +179,35 @@ hidden:
 
 </details>
 
+<details>
+<summary>BlockedBloom -- the cache-local member (one cache miss per query, at a higher FPR)</summary>
+
+`BlockedBloom` partitions the bit array into fixed 512-bit BLOCKS -- 16 x 32-bit words
+= 64 bytes, one cache line (decisions/0012). Every key is routed to ONE block (from its
+first base hash), and all `k` bits live inside that block. So a `mightContain` touches
+ONE cache line regardless of `k` -- the throughput win. It is add-only like Bloom:
+`remove()` throws.
+
+```js
+import { BlockedBloom } from '@zakkster/lite-filter';
+
+const f = new BlockedBloom(100000, { fpp: 0.01, keys: 'int' });
+f.add(42);
+f.mightContain(42);      // true -- one cache line touched, regardless of k
+```
+
+The caveat is inherent and MEASURED, never hidden (decisions/0013): confining a key to
+one block loses the cross-block independence the textbook formula assumes, so the
+MEASURED false-positive rate runs OVER a plain Bloom's for the SAME bits/item. `fpp()`
+reports the plain closed-form as a labeled FLOOR, not a prediction. `npm run bench`
+prints Bloom vs BlockedBloom side by side so the trade is the first thing you see: on
+this repo's uniform int workload, BlockedBloom query ns is LOWER than Bloom's while its
+measured FPR is HIGHER (e.g. ~0.014 vs ~0.010 at the same ~9.6 bits/item). To hit a
+target measured FPR, raise the configured `fpp` slightly -- never trust the floor as the
+delivered rate.
+
+</details>
+
 ## API reference
 
 ### Construction
@@ -200,7 +233,7 @@ a bit count that would overflow a safe typed-array length; an unknown `keys` or
 | `add(key)` | `void` | Record a key. Zero-alloc on int + string keys. |
 | `mightContain(key)` | `boolean` | The query. NO false negatives; false positives bounded by `fpp`. |
 | `has(key)` | `boolean` | The sole alias of `mightContain`, same semantics. |
-| `remove(key)` | `never` / `boolean` | **Bloom**: add-only, **throws** `[lite-filter]`. **CountingBloom**: a real delete, returns `boolean` (member-specific). |
+| `remove(key)` | `never` / `boolean` | **Bloom** + **BlockedBloom**: add-only, **throw** `[lite-filter]`. **CountingBloom**: a real delete, returns `boolean` (member-specific). |
 | `size` / `count` | `number` | Adds recorded (a plain counter, not a distinct-key count). |
 | `capacity` | `number` | The item count the filter was sized for. |
 | `fpp()` | `number` | Configured target while empty, else the fill-derived estimate. |
@@ -259,9 +292,10 @@ const rows = runBench({ cap: 100000, fpp: 0.01 });
 
 | Export | Meaning |
 | --- | --- |
-| `VERSION` | the package version string (`"0.2.0"`) |
+| `VERSION` | the package version string (`"0.3.0"`) |
 | `Bloom` | the reference member (also the default export) |
 | `CountingBloom` | the deletable member (4-bit saturating counters; a real `remove`) |
+| `BlockedBloom` | the cache-local member (one 512-bit block per key; one cache miss per query, at a higher measured FPR) |
 
 ## Composability
 
@@ -320,8 +354,11 @@ on `keys:'int'` = **0 B/op**, **maxMajor 0**; 1e6 adds then requery = **0 false
 negatives**; n=1e5, fpp=0.01, 1e6 disjoint probes = measured FPR **<= 0.0125**
 (<= 25% over the formula). CountingBloom `add` / `mightContain` / `remove` on
 `keys:'int'` are also **0 scavenges** at N and 8N (nibble read/modify/write, no scratch
-array), and 1e5 mixed add/remove ops = **0 false negatives** for present keys. ns/op
-figures are machine-local -- run `npm run bench`.
+array), and 1e5 mixed add/remove ops = **0 false negatives** for present keys.
+BlockedBloom `add` / `mightContain` on `keys:'int'` are **0 scavenges** at N and 8N too
+(one block, odd-stride within-block walk, no scratch), with a measured FPR within its
+honest ceiling (**<= 0.0175**) that is PROVEN to run OVER the plain-Bloom theory
+(decisions/0013). ns/op figures are machine-local -- run `npm run bench`.
 
 </details>
 
@@ -351,6 +388,13 @@ figures are machine-local -- run `npm run bench`.
 - **CountingBloom's snapshot is the same envelope with per-byte validation**
   (decisions/0011): `mem:"CountingBloom"`, `w:4`, `cnts` bytes each validated `0..255`
   (so every nibble is `0..15`) before any instance is built.
+- **BlockedBloom pins a 512-bit block, not configurable** (decisions/0012): one 64-byte
+  cache line per key, store `nb*16` words, block from the first hash + within-block bits
+  via an odd stride; snapshot records `bb:512` + `nb`.
+- **BlockedBloom's FPR penalty is exposed, not compensated** (decisions/0013): `m` is
+  NOT upsized to hide it. `fpp()` reports the plain-Bloom form as a FLOOR the measured
+  rate runs OVER, and the bench prints Bloom vs BlockedBloom side by side. No "same fpp
+  for free" claim.
 
 ## Testing
 
@@ -358,16 +402,18 @@ figures are machine-local -- run `npm run bench`.
 
 - `npm test` -- the boundary suite: every method, every one-sided law, every
   fail-closed door, plus an ASCII-source guard.
-- `npm run test:types` -- `tsc --noEmit` proves `Bloom` and `CountingBloom` satisfy
-  `LiteFilter<K>` and that `CountingBloom.remove` is a real `boolean`.
+- `npm run test:types` -- `tsc --noEmit` proves `Bloom`, `CountingBloom`, and
+  `BlockedBloom` satisfy `LiteFilter<K>`, that `CountingBloom.remove` is a real
+  `boolean`, and that `Bloom`/`BlockedBloom` `remove` is `never`.
 - `npm run torture` -- `node --expose-gc`: the leak tracker (retention returns to 0)
   + the GC profiler (maxMajor 0) + the Set-differential oracle (no false negatives,
-  bounded FPR) + a CountingBloom add/remove churn oracle + the `clear()`
-  ArrayBuffer-identity check for both members.
+  bounded FPR) + a CountingBloom add/remove churn oracle + a BlockedBloom oracle (0
+  false negatives; measured FPR within its honest ceiling AND proven OVER plain-Bloom
+  theory) + the `clear()` ArrayBuffer-identity check for all three members.
 - `npm run torture:controls` -- the must-fail proof: a broken build MUST fail.
 - `npm run test:perf` -- the `@zakkster/lite-perf-gate` zero-alloc scenarios on
   `keys:'int'` (Bloom add-churn + query-hit; CountingBloom add-churn + query-hit +
-  remove-churn), with an allocating mustFail for teeth.
+  remove-churn; BlockedBloom add-churn + query-hit), with an allocating mustFail for teeth.
 - `npm run bench` -- the measurement tool.
 
 ## What this is not
