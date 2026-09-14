@@ -78,6 +78,18 @@ export interface FilterSnapshot {
   b?: number;
   /** Cuckoo: the fingerprint store as a plain array of slots (0 = empty). */
   fp?: number[];
+  /** Quotient: the remainder width in bits (r = ceil(log2(1/fpp))). */
+  r?: number;
+  /** Quotient: the quotient width in bits (q; nslots === 2^q; tracks a resize). */
+  q?: number;
+  /** Quotient: the fixed fingerprint bit budget (p = q0 + r; invariant across resize). */
+  p?: number;
+  /** Quotient: the slot count (2^q). */
+  nslots?: number;
+  /** Quotient: the load ceiling (0.90). */
+  load?: number;
+  /** Quotient: the slot store as a plain array of packed words ((remainder<<3)|metadata). */
+  store?: number[];
 }
 
 /** Construction options shared by every filter member. */
@@ -246,6 +258,53 @@ export class Cuckoo<K = unknown> implements LiteFilter<K> {
   dump(): FilterSnapshot;
   /** Reconstruct a fresh Cuckoo from a snapshot. Fail closed on any mismatch. */
   static restore(snap: FilterSnapshot, opts?: FilterRestoreOptions): Cuckoo;
+}
+
+/**
+ * Quotient filter (Bender et al., VLDB 2012) -- the mergeable + resizable deletable member
+ * (decisions/0016, 0017). ONE open-addressed linear slot array; a key's hash splits into a
+ * QUOTIENT (home slot index) and a REMAINDER (stored, r bits), with 3 metadata bits per
+ * slot (is_occupied, is_continuation, is_shifted) encoding runs and clusters. It DELETES
+ * via a real `remove(key): boolean` and, uniquely in the family so far, ships `merge()` and
+ * `resize()` -- cold paths that reconstruct each element's identity from its stored
+ * `(quotient, remainder)` pair WITHOUT the original keys (the bit budget p = q0 + r is fixed
+ * for the filter's lifetime). Three honest edges:
+ *   - `add(key)` at the 0.90 load ceiling (or whose linear cluster shift would run off the
+ *     end) THROWS a `[lite-filter]`-tagged Error and is a BYTE-IDENTICAL no-op
+ *     (decisions/0016) -- never a silent drop; headroom via size/capacity.
+ *   - `remove(key)` on a NEVER-INSERTED key whose (quotient, remainder) COLLIDES with a
+ *     real key removes that other key's fingerprint -> a later false negative for it
+ *     (decisions/0017). Only remove keys you inserted.
+ *   - a Quotient stores MULTIPLICITY (it does not dedup, like Cuckoo), and its FPR is the
+ *     remainder-quantized `load * 2^-r` once non-empty (typically BELOW target -- r rounds
+ *     up). `fpp()` reports that. Space is metadata + shift overhead on top of r bits/item.
+ */
+export class Quotient<K = unknown> implements LiteFilter<K> {
+  constructor(capacity: number, options?: FilterOptions);
+  add(key: K): void;
+  mightContain(key: K): boolean;
+  has(key: K): boolean;
+  /** Delete a key. Returns true on a real delete, false if the key is absent (no
+   *  mutation). See the class caveat on never-inserted, fingerprint-colliding keys. */
+  remove(key: K): boolean;
+  readonly size: number;
+  readonly count: number;
+  readonly capacity: number;
+  /** The configured target while empty, else the remainder-quantized `load * 2^-r`. */
+  fpp(): number;
+  clear(): void;
+  stats(): FilterStats;
+  resetStats(): void;
+  dump(): FilterSnapshot;
+  /** Rebuild into a fresh slot array sized for `newCapacity`, preserving membership and
+   *  exact size without the original keys. Cold; may allocate. Returns this filter. */
+  resize(newCapacity: number): Quotient<K>;
+  /** Merge an identically-configured Quotient into this one (union membership, exact
+   *  additive size). Rejects a mismatched filter fail-closed. Cold; may allocate.
+   *  Returns this filter. */
+  merge(other: Quotient<K>): Quotient<K>;
+  /** Reconstruct a fresh Quotient from a snapshot. Fail closed on any mismatch. */
+  static restore(snap: FilterSnapshot, opts?: FilterRestoreOptions): Quotient;
 }
 
 export const VERSION: string;

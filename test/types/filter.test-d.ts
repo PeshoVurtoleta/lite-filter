@@ -6,7 +6,7 @@
  *
  * Test-only; not in files[]. ASCII-only.
  */
-import Bloom, { VERSION, CountingBloom, BlockedBloom } from "../../Filter.js";
+import Bloom, { VERSION, CountingBloom, BlockedBloom, Quotient } from "../../Filter.js";
 import type { LiteFilter, FilterOptions, FilterSnapshot } from "../../Filter.js";
 
 type Equal<A, B> =
@@ -86,3 +86,25 @@ expectTrue<Equal<typeof got3, boolean>>();
 const bbSnap: FilterSnapshot = bb.dump();
 const bbRestored: BlockedBloom<number> = BlockedBloom.restore(bbSnap);
 void bbRestored;
+
+// ---- Quotient: the mergeable + resizable deletable member --------------------
+const qf = new Quotient<number>(1000, { fpp: 0.01, keys: "int" });
+expectTrue<Equal<ReturnType<typeof qf.mightContain>, boolean>>();
+const qfRemoved: boolean = qf.remove(1);
+expectTrue<Equal<typeof qfRemoved, boolean>>();
+// resize() and merge() return the filter (chainable), NOT void.
+const qfResized: Quotient<number> = qf.resize(2000);
+const qfMerged: Quotient<number> = qf.merge(new Quotient<number>(1000, { fpp: 0.01, keys: "int" }));
+void qfResized;
+void qfMerged;
+
+// Quotient SATISFIES the uniform surface (one-line member swap).
+const iface4: LiteFilter<number> = new Quotient<number>(1000);
+iface4.add(1);
+const got4 = iface4.mightContain(1);
+expectTrue<Equal<typeof got4, boolean>>();
+
+// snapshot round-trips through the typed surface.
+const qfSnap: FilterSnapshot = qf.dump();
+const qfRestored: Quotient<number> = Quotient.restore(qfSnap);
+void qfRestored;

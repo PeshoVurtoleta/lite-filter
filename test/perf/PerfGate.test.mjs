@@ -24,7 +24,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { zgcSuite } from "@zakkster/lite-perf-gate";
-import { Bloom, CountingBloom, BlockedBloom, Cuckoo } from "../../Filter.js";
+import { Bloom, CountingBloom, BlockedBloom, Cuckoo, Quotient } from "../../Filter.js";
 
 const CAP = 4096;
 const MASK = CAP - 1;
@@ -38,6 +38,9 @@ function cntsBytes(c) { return c._cnts.buffer.byteLength; }
 
 /** The Cuckoo equivalent: the fingerprint store's byte length, fixed at construction. */
 function storeBytes(c) { return c._store.buffer.byteLength; }
+
+/** The Quotient equivalent: the slot store's byte length, fixed at construction. */
+function qfBytes(c) { return c._store.buffer.byteLength; }
 
 /** add-churn: fresh int keys; every op sets k bits in the fixed store. */
 const addChurn = {
@@ -219,6 +222,67 @@ const cfRemoveChurn = {
     statsOf(s) { return { grows: storeBytes(s.c) }; },
 };
 
+/** Quotient add-churn: fresh distinct int keys, each a linear-probe split + shift.
+ *  clear() at the half-load mark keeps occupancy under the ceiling so no add throws --
+ *  both clear() and add() zero-alloc on keys:'int'. */
+const qfAddChurn = {
+    name: "Quotient add-churn (int)",
+    setup() {
+        const c = new Quotient(CAP, { fpp: 0.01, keys: "int" });
+        return { c, k: 0, limit: Math.floor(0.45 * c._nslots) };
+    },
+    hot(s, n) {
+        const c = s.c;
+        let k = s.k | 0;
+        const lim = s.limit;
+        for (let i = 0; i < n; i++) {
+            if (c.size >= lim) c.clear();
+            c.add(k & 0x3fffffff);
+            k = (k + 1) | 0;
+        }
+        s.k = k | 0;
+    },
+    statsOf(s) { return { grows: qfBytes(s.c) }; },
+};
+
+/** Quotient query-hit: a half-loaded filter; every op is a present-fingerprint positive
+ *  (linear-probe run scan, no alloc). */
+const qfQueryHit = {
+    name: "Quotient query-hit (int)",
+    setup() {
+        const c = new Quotient(CAP, { fpp: 0.01, keys: "int" });
+        const f = Math.floor(0.45 * c._nslots);
+        for (let i = 0; i < f; i++) c.add(i);
+        return { c, acc: 0, mask: MASK };
+    },
+    hot(s, n) {
+        const c = s.c;
+        let acc = s.acc | 0;
+        const m = s.mask;
+        for (let i = 0; i < n; i++) acc = (acc + (c.mightContain(i & m) ? 1 : 0)) | 0;
+        s.acc = acc | 0;
+    },
+    statsOf(s) { return { grows: qfBytes(s.c) }; },
+};
+
+/** Quotient remove-churn: add then remove the same key each op -- the shift-back cluster
+ *  repair on the hot path, strictly zero-alloc (the cluster scratch is preallocated); the
+ *  filter stays near-empty so add never runs off the end or throws. */
+const qfRemoveChurn = {
+    name: "Quotient remove-churn (int)",
+    setup() {
+        const c = new Quotient(CAP, { fpp: 0.01, keys: "int" });
+        return { c, k: 0 };
+    },
+    hot(s, n) {
+        const c = s.c;
+        let k = s.k | 0;
+        for (let i = 0; i < n; i++) { c.add(k & MASK); c.remove(k & MASK); k = (k + 1) | 0; }
+        s.k = k | 0;
+    },
+    statsOf(s) { return { grows: qfBytes(s.c) }; },
+};
+
 /**
  * The teeth: an object-key churn on the default backing that String()-encodes one
  * fresh object key per op -- it MUST trip the gate (scavenges scale with n).
@@ -239,7 +303,7 @@ zgcSuite({
     maxArrayBuffersKB: 0,
     counters: { grows: 0 },
     scenarios: [addChurn, queryHit, cbfAddChurn, cbfQueryHit, cbfRemoveChurn, bbAddChurn, bbQueryHit,
-        cfAddChurn, cfQueryHit, cfRemoveChurn],
+        cfAddChurn, cfQueryHit, cfRemoveChurn, qfAddChurn, qfQueryHit, qfRemoveChurn],
     mustFail: [mustFailAlloc],
 });
 
@@ -277,6 +341,16 @@ test("perf-gate cross-check: Cuckoo clear() reuses the fingerprint store buffer"
     const c = new Cuckoo(CAP, { fpp: 0.01, keys: "int" });
     const buf = c._store.buffer;
     const half = c._store.length >> 1;
+    for (let i = 0; i < half; i++) c.add(i);
+    c.clear();
+    assert.equal(c._store.buffer, buf, "clear() must reuse the same ArrayBuffer");
+    assert.equal(c.size, 0);
+});
+
+test("perf-gate cross-check: Quotient clear() reuses the slot store buffer", () => {
+    const c = new Quotient(CAP, { fpp: 0.01, keys: "int" });
+    const buf = c._store.buffer;
+    const half = Math.floor(0.45 * c._nslots);
     for (let i = 0; i < half; i++) c.add(i);
     c.clear();
     assert.equal(c._store.buffer, buf, "clear() must reuse the same ArrayBuffer");

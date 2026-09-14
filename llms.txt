@@ -3,16 +3,17 @@
 Zero-dependency, zero-GC approximate-membership filter FAMILY for JavaScript under
 one uniform LiteFilter<K> surface. v0.1.0 ships the substrate + the reference
 member: Bloom (Bloom, CACM 1970) -- the differential oracle and the honest floor the
-rest of the family (Quotient, XOR, Binary Fuse) will improve
+rest of the family (XOR, Binary Fuse) will improve
 on, one member per release. v0.2.0 adds CountingBloom (deletable); v0.3.0 adds
 BlockedBloom (one 512-bit cache-line block per key); v0.4.0 adds Cuckoo (deletable,
-fingerprint-based, fail-closed at capacity). Every member exposes the SAME
+fingerprint-based, fail-closed at capacity); v0.5.0 adds Quotient (deletable,
+mergeable + resizable, fail-closed at the 0.90 load ceiling). Every member exposes the SAME
 add/mightContain/has/size/count/capacity/fpp/clear API, so the filter is a one-line
 constructor swap. Single-file ESM, zero runtime dependencies, node:test only. Ships
 a runnable + importable bench (Bench.mjs) that measures ACTUAL vs THEORETICAL
 false-positive rate on your own keys, checked against a real Set oracle.
 
-## Status: 0.4.0 - Bloom (reference) + CountingBloom (deletable) + BlockedBloom (cache-local) + Cuckoo (fingerprint).
+## Status: 0.5.0 - Bloom (reference) + CountingBloom (deletable) + BlockedBloom (cache-local) + Cuckoo (fingerprint) + Quotient (mergeable/resizable).
 
 The problem it solves: "have I seen this key?" -- dedup, set membership, cache
 admission -- at a handful of BITS per entry instead of the tens of bytes a Set costs
@@ -35,8 +36,8 @@ behavior on your keys, instead of copying a number from a paper.
 - has(key): the SOLE alias of mightContain (same one-sided semantics). No third name.
 - remove(key): member-specific. Bloom and BlockedBloom are ADD-ONLY -- they throw a
   [lite-filter] Error (fail closed; clearing bits would cause false negatives for other
-  keys). CountingBloom and Cuckoo implement a REAL remove(key) -> boolean (return false
-  and mutate nothing if the key is absent). Further deletable members (Quotient) later.
+  keys). CountingBloom, Cuckoo and Quotient implement a REAL remove(key) -> boolean (return
+  false and mutate nothing if the key is absent). Quotient also ships merge() + resize().
 - size / count -> number: the number of adds recorded (a plain counter, not an
   estimate, not a distinct-key count -- Bloom cannot detect a duplicate add).
 - capacity -> number: the item count the filter was sized for at construction.
@@ -108,6 +109,34 @@ Cross-cutting, mirrored from lite-lru:
   FPR bounded by the fingerprint width, not the load. Not for: removing untrusted /
   never-inserted keys, or duplicate-heavy streams (a key added > 2b times overflows its
   bucket pair), or the smallest static space (XOR / Binary Fuse, planned).
+- Quotient (decisions/0016..0017): ONE open-addressed LINEAR slot array. A key's 32-bit hash
+  splits into a QUOTIENT (home slot index, high bits) and a REMAINDER (stored, low r bits);
+  same-home keys form a RUN, adjacent runs a CLUSTER under linear probing, encoded by 3
+  METADATA bits per slot (is_occupied bit0, is_continuation bit1, is_shifted bit2) packed in
+  the low 3 bits of each byte-aligned word (remainder in the high bits: word=(remainder<<3)|
+  metadata). A slot is EMPTY iff all 3 metadata bits are 0 (remainder 0 is a legal remainder).
+  Query: !is_occupied(home) -> absent; else walk left to the cluster start, count occupied
+  homes to find this home's run, scan the (sorted) run for r. It DELETES via a real
+  remove(key) -> boolean (repairs metadata by REBUILDING the affected cluster through the
+  insert path -- correct by construction), and ALSO ships merge() + resize() -- cold paths
+  that reconstruct each element's identity from its stored (quotient,remainder) pair WITHOUT
+  the original keys (the bit budget p=q0+r is fixed for the filter's lifetime), preserving
+  membership (0 false negatives) + exact size. Remainder width r=ceil(log2(1/fpp)); the slot
+  word is r+3 bits, byte-aligned to Uint8Array (r<=5) or Uint16Array (r 6..13); r+3>16
+  (fpp<1/2^13 ~0.000122) throws at construction. Slot count 2^q >= ceil(capacity/0.90); q+r
+  must fit one 32-bit hash. Stores MULTIPLICITY (does not dedup, like Cuckoo). FPR is
+  remainder-quantized to load*2^-r (typically UNDER target -- r rounds up); fpp() reports
+  that. Two honest fail-closed edges: (1) add at the 0.90 load ceiling (or whose linear
+  cluster shift would run off the end) THROWS a [lite-filter] Error and is a byte-identical
+  no-op (decisions/0016), never a silent drop; headroom via size vs capacity; (2) removing a
+  NEVER-INSERTED key whose (quotient,remainder) collides with a real key removes that other
+  key's fingerprint -> a false negative for it (decisions/0017) -- only remove keys you
+  inserted. Space ~23 bits/item at fpp 0.01 (16-bit slot words + guard, metadata + shift
+  overhead). Good for: membership + deletes when the filter must MERGE or GROW over its
+  lifetime (the first family member that does either without the keys). Not for: removing
+  untrusted keys, duplicate-heavy streams (multiplicity fills toward the ceiling), the
+  tightest space (Bloom is lower), growing quotient entropy past q0 (resize adds headroom,
+  not new quotient bits -- decisions/0016), or the smallest static space (XOR / Binary Fuse).
 
 ## Construction
 
@@ -115,6 +144,7 @@ new Bloom(capacity, { fpp = 0.01, seed?, keys?: 'int', stats?: true })
 new CountingBloom(capacity, { fpp = 0.01, seed?, keys?: 'int', stats?: true })
 new BlockedBloom(capacity, { fpp = 0.01, seed?, keys?: 'int', stats?: true })
 new Cuckoo(capacity, { fpp = 0.01, seed?, keys?: 'int', stats?: true })
+new Quotient(capacity, { fpp = 0.01, seed?, keys?: 'int', stats?: true })
 
 Sizing (decisions/0002): m = ceil(-n * ln(fpp) / ln(2)^2), k = round((m/n) * ln(2)),
 k clamped to >= 1. All Bloom-family members share the sizing; CountingBloom stores
@@ -123,9 +153,13 @@ BlockedBloom stores ceil(m/512)*16 words (nb 512-bit blocks) and clamps k to <= 
 Cuckoo sizes differently (decisions/0014): fingerprint width f = ceil(log2(8/fpp))
 byte-aligned to 8 or 16 bits, bucket count nb = pow2 >= ceil(capacity/(4*0.95)), store
 nb*4 slots (Uint8Array or Uint16Array); real slot capacity is nb*4, headroom via size vs
-capacity. Fail-closed doors: fpp not in (0,1), capacity < 1, an overflowing store, or (for
-Cuckoo) a fingerprint width > 16 bits all throw a [lite-filter] Error at construction.
-null is not zero: an unsized filter is never a zero-capacity one.
+capacity. Quotient sizes differently (decisions/0016): remainder width r = ceil(log2(1/fpp)),
+slot word r+3 bits byte-aligned to 8 or 16 bits, slot count nslots = pow2 >= ceil(capacity/
+0.90), plus GUARD spillover slots (max(1024, nslots>>3)); q+r must fit one 32-bit hash.
+Fail-closed doors: fpp not in (0,1), capacity < 1, an overflowing store, (for Cuckoo) a
+fingerprint width > 16 bits, or (for Quotient) a slot word > 16 bits or a q+r budget > 32
+bits all throw a [lite-filter] Error at construction. null is not zero: an unsized filter is
+never a zero-capacity one.
 
 ## The honesty hook (the bench's whole point)
 
@@ -157,6 +191,15 @@ is a hypothesis, not your filter's behavior on your keys -- MEASURE.
   (~0.0061, UNDER the configured 0.01 -- width quantization) with 0 false negatives; and a
   small over-filled filter PROVABLY THROWS after 500 kicks (fail-closed, torture,
   decisions/0014). nonzero-slot count == size (validate).
+- Quotient deletes + merges + resizes + fail-closed: add/mightContain/remove on keys:'int'
+  are 0 scavenges at N and 8N (perf-gate; linear-probe split + shift, preallocated cluster
+  scratch on remove); 1e6 adds -> 0 false negatives; bounded-keyspace add/remove churn -> 0
+  false negatives for present keys and net size == present; measured FPR <= 0.0090 (~0.0060,
+  UNDER the configured 0.01 -- remainder quantization) with 0 false negatives; resize (grow +
+  shrink) and disjoint merge round-trips -> 0 false negatives + preserved/additive size; a
+  small over-filled filter PROVABLY THROWS at the 0.90 load ceiling and a thrown add is a
+  byte-identical no-op (torture, decisions/0016). metadata-set-slot count == size and
+  per-cluster #homes == #runs after churn (validateQuotient -- the shift-back repair proof).
 - Fail closed on every unverified state; [lite-filter]-tagged errors throughout.
 
 ## Testing

@@ -61,16 +61,32 @@
  * emits 0. The store is ONE `Uint8Array` (f<=8) or `Uint16Array` (9..16 bits) of nb*b
  * slots, sized once and reused; clear() zeroes it in place.
  *
+ * The 5th member -- `Quotient` (Bender et al., "Don't Thrash: How to Cache Your Hash on
+ * Flash", VLDB 2012) -- is ONE open-addressed linear slot array. A key's hash splits into a
+ * QUOTIENT (home slot index, high bits) and a REMAINDER (stored, low r bits); same-home
+ * keys form a RUN and adjacent runs a CLUSTER, encoded by 3 METADATA bits per slot
+ * (is_occupied, is_continuation, is_shifted) packed in the low 3 bits of each byte-aligned
+ * word (remainder in the high bits). It DELETES (remove -> boolean), and ALSO ships
+ * `merge()` + `resize()` -- both cold paths that reconstruct each element's identity from
+ * its stored `(quotient, remainder)` pair WITHOUT the original keys (the fingerprint bit
+ * budget p = q0 + r is fixed for the filter's lifetime, decisions/0016). Its FPR is
+ * remainder-quantized (`load * 2^-r`, typically UNDER target because r rounds up). Two
+ * honest edges: a fail-closed insert at the 0.90 load ceiling / off the linear end (a
+ * byte-identical no-op, decisions/0016), and the same never-added delete caveat as Cuckoo
+ * (decisions/0017). Delete repairs metadata by REBUILDING the affected cluster through the
+ * verified insert path -- so the shift-back is provably correct by construction.
+ *
  * Design decisions live in decisions/ (0001 hashing; 0002 sizing; 0003 remove +
  * count; 0004 fpp; 0005 snapshot; 0006 deferred static-build API; 0007 counter
  * width; 0008 saturation; 0009 remove caveat; 0010 count deferred; 0011 CBF
  * snapshot; 0012 block size; 0013 FPR locality; 0014 Cuckoo sizing/overload; 0015
- * Cuckoo delete caveat) and are summarized in ROADMAP.md.
+ * Cuckoo delete caveat; 0016 Quotient sizing/split/storage/ceiling/resize; 0017
+ * Quotient delete caveat) and are summarized in ROADMAP.md.
  *
  * @license MIT
  */
 
-export const VERSION = "0.4.0";
+export const VERSION = "0.5.0";
 
 /* -------------------------------------------------------------------------- *
  * Constants + fail-closed messages (built ONCE, thrown only on misuse).
@@ -164,6 +180,63 @@ const CUCKOO_FULL_MSG =
     "[lite-filter] Cuckoo insert failed after 500 kicks: the filter is at capacity (load " +
     "factor too high). Raise the capacity (size up) -- the overload is FAIL-CLOSED, never " +
     "a silent drop. Observe headroom via size vs capacity before it bites.";
+
+/** Quotient filter load ceiling (decisions/0016): 0.90. The slot count is the
+ *  smallest power of two `2^q >= ceil(capacity / 0.90)`, so a filter sized for
+ *  `capacity` items can hold at least that many before the ceiling bites. An insert
+ *  that would push occupancy past `floor(0.90 * nslots)`, or whose linear cluster
+ *  shift would run off the end of the slot array, THROWS fail-closed (a byte-identical
+ *  no-op). PINNED, not a constructor option. */
+const QF_LOAD = 0.90;
+
+/** Quotient filter metadata bit masks (decisions/0016). Each slot word packs three
+ *  metadata bits in the LOW 3 bits and the remainder in the HIGH bits:
+ *  `word = (remainder << 3) | metadata`. A slot is EMPTY iff all three metadata bits
+ *  are 0 (remainder 0 is a LEGAL remainder -- emptiness is carried by metadata, never
+ *  by the remainder value). */
+const QF_OCCUPIED = 1;      // bit0: this canonical slot is home to some stored key
+const QF_CONTINUATION = 2;  // bit1: the remainder here continues a run (not its head)
+const QF_SHIFTED = 4;       // bit2: the remainder here is not in its canonical slot
+const QF_META = 7;          // all three metadata bits
+const QF_RSHIFT = 3;        // remainder occupies bits [3, 3+r)
+
+/** Fail-closed message when the requested fpp needs a remainder wider than the
+ *  byte-aligned slot word can carry (decisions/0016). `r = ceil(log2(1/fpp))`; the slot
+ *  word is `r + 3` bits (remainder + 3 metadata), byte-aligned to a Uint8Array (r <= 5)
+ *  or Uint16Array (r 6..13). `r + 3 > 16` (fpp below ~1/2^13) exceeds the 16-bit floor
+ *  and throws -- parallel to Cuckoo's 16-bit fingerprint floor. Built once. */
+const QF_FPP_MSG =
+    "[lite-filter] Quotient fpp too small: the derived remainder width r + 3 metadata " +
+    "bits would exceed a 16-bit slot word (r <= 13); the smallest supported fpp is " +
+    "1/2^13 (~0.000122). Raise the fpp, or use a space-optimal static member (XOR / " +
+    "Binary Fuse) when the roster ships one.";
+
+/** Fail-closed message when the quotient + remainder bit budget exceeds the 32-bit base
+ *  hash (decisions/0016). A key's hash supplies `q + r` bits (quotient high, remainder
+ *  low); `q + r > 32` cannot be drawn from one 32-bit fmix, so construction throws.
+ *  Built once, thrown only at construction for very large capacities. */
+const QF_BITS_MSG =
+    "[lite-filter] requested Quotient filter is too large: the quotient + remainder bit " +
+    "budget (q + r) would exceed the 32-bit base hash; lower the capacity or raise the fpp";
+
+/** Fail-closed message when an insert cannot place (decisions/0016): the load ceiling is
+ *  reached or the linear cluster shift would run off the end of the slot array. The
+ *  insert THROWS and is a BYTE-IDENTICAL no-op (no partial shift is left behind). Built
+ *  once, thrown only on a genuinely full filter. */
+const QF_FULL_MSG =
+    "[lite-filter] Quotient insert failed: the filter is at the 0.90 load ceiling (or the " +
+    "cluster shift would run off the end). Raise the capacity (size up) or resize() -- the " +
+    "overload is FAIL-CLOSED and a byte-identical no-op, never a silent drop. Observe " +
+    "headroom via size vs capacity before it bites.";
+
+/** Fail-closed message when merge() is called with a filter of non-identical params
+ *  (decisions/0016). merge requires the SAME seed, remainder width, fingerprint bit
+ *  budget, and keys mode; anything else would misalign the (quotient, remainder) split
+ *  and corrupt membership. Built once, thrown only on a mismatched merge. */
+const QF_MERGE_MSG =
+    "[lite-filter] merge(other) requires an identically-configured Quotient (same seed, " +
+    "fpp-derived remainder width, hash bit budget, and keys mode); merging mismatched " +
+    "filters would misalign the quotient/remainder split and cause false negatives.";
 
 /** Default target false-positive probability when the caller omits `fpp`
  *  (decisions/0002): the textbook 1% baseline. Explicit and documented, never a
@@ -308,6 +381,120 @@ function cuckooSizeFor(n, fpp) {
     let nb = 1;
     while (nb < need) nb *= 2;
     return { f: f, bits: bits, nb: nb };
+}
+
+/**
+ * Derive the Quotient-filter geometry for a target (n, fpp) (decisions/0016). Cold --
+ * called ONCE per constructor, never on a hot path. Two derivations and three fail-closed
+ * doors:
+ *
+ *   - remainder width  r  = ceil(log2(1/fpp)). The slot WORD is `r + 3` bits (remainder
+ *     in the high bits, 3 metadata bits in the low bits), byte-aligned UP: `r + 3 <= 8`
+ *     (r <= 5) -> a Uint8Array; `r + 3 <= 16` (r 6..13) -> a Uint16Array; `r + 3 > 16`
+ *     (fpp below ~1/2^13) THROWS (the byte-aligned 16-bit floor, parallel to Cuckoo).
+ *   - quotient width   q  chosen so `nslots = 2^q >= ceil(n / 0.90)` (the load ceiling).
+ *
+ * The base hash supplies `q + r` bits (quotient from the HIGH bits, remainder from the
+ * LOW bits, decisions/0016); `q + r > 32` cannot come from one 32-bit fmix and throws.
+ * A fail-closed too-large door caps `q` before the doubling loop (mirrors cuckooSizeFor's
+ * MAX_NB). Returns a plain `{ r, bits, q, nslots }` (cold path -- alloc here is fine).
+ */
+function quotientSizeFor(n, fpp) {
+    if (!Number.isInteger(n) || n < 1) {
+        throw new RangeError(
+            "[lite-filter] capacity must be an integer >= 1, got " + String(n));
+    }
+    if (typeof fpp !== "number" || !(fpp > 0) || !(fpp < 1)) {
+        throw new RangeError(
+            "[lite-filter] fpp must be a number in the open interval (0, 1), got " + String(fpp));
+    }
+    // Remainder width from the target FPR (~2^-r), byte-aligned via the r+3 slot word.
+    let r = Math.ceil(Math.log2(1 / fpp));
+    if (r < 1) r = 1;
+    if (r + QF_RSHIFT > 16) {
+        throw new RangeError(QF_FPP_MSG);
+    }
+    const bits = (r + QF_RSHIFT) <= 8 ? 8 : 16;
+    // Slot count: the smallest power of two >= ceil(n / load). The largest slot count that
+    // stays within a safe typed-array length is 2^31 (fits a Uint16Array's element count);
+    // any request needing more is rejected BEFORE the doubling loop, so the count is
+    // derived entirely in the Number domain and can never 32-bit-overflow into a spin.
+    const MAX_NSLOTS = 0x80000000; // 2^31 slots
+    const need = Math.ceil(n / QF_LOAD);
+    if (!Number.isFinite(need) || need > MAX_NSLOTS) {
+        throw new RangeError(
+            "[lite-filter] requested Quotient filter is too large (needs ~" + String(need) +
+            " slots, max " + MAX_NSLOTS + "); lower the capacity or raise the fpp");
+    }
+    // Number-domain doubling (never `<<`, which would wrap at 2^31).
+    let nslots = 1;
+    let q = 0;
+    while (nslots < need) { nslots *= 2; q++; }
+    if (q < 1) { q = 1; nslots = 2; }   // at least 2 slots so q >= 1 (a valid quotient)
+    // The base hash must supply q + r bits (quotient high, remainder low). Fail closed
+    // when the budget exceeds one 32-bit fmix; null is not zero (decisions/0016).
+    if (q + r > 32) {
+        throw new RangeError(QF_BITS_MSG);
+    }
+    return { r: r, bits: bits, q: q, nslots: nslots };
+}
+
+/**
+ * The linear Quotient filter's GUARD spillover count for a slot total (decisions/0016).
+ * The quotient range is [0, nslots) but clusters near the top must be able to shift right
+ * without running off the end at ordinary load, so the physical array is `nslots + guard`.
+ * `max(1024, nslots >> 3)` (12.5%, floored at 1024) comfortably absorbs the longest cluster
+ * a well-distributed key set produces at the 0.90 load ceiling; a pathological single-
+ * quotient stream that still exhausts it THROWS fail-closed (a byte-identical no-op).
+ * Deterministic from nslots so restore()/resize() re-derive the same physical length.
+ */
+function _qfGuard(nslots) {
+    const g = nslots >> 3;
+    return g > 1024 ? g : 1024;
+}
+
+/**
+ * Deep STRUCTURAL check of a Quotient slot array (decisions/0016). Cold -- used by
+ * `restore()` so a corrupt-but-in-range snapshot is REJECTED (never truncated), matching the
+ * fail-closed law fully: per-word range checks alone let a lone continuation, or a
+ * shifted/continuation cluster start, slip through. Walks each cluster (maximal run of non-
+ * empty slots) and enforces: slot 0 is never shifted; a cluster start is neither a
+ * continuation nor shifted; #occupied homes == #runs; each run's remainders are non-
+ * decreasing. Returns an error message string on the first violation, or null if sound.
+ */
+function _qfStructureError(store, len) {
+    if ((store[0] & QF_SHIFTED) !== 0) {
+        return "slot 0 is is_shifted (nothing lies left of 0)";
+    }
+    let p = 0;
+    while (p < len) {
+        if ((store[p] & QF_META) === 0) { p++; continue; }
+        const cs = p;
+        let ce = p;
+        while (ce < len && (store[ce] & QF_META) !== 0) ce++;
+        if ((store[cs] & QF_CONTINUATION) !== 0) {
+            return "cluster start " + cs + " is a continuation";
+        }
+        if ((store[cs] & QF_SHIFTED) !== 0) {
+            return "cluster start " + cs + " is is_shifted";
+        }
+        let homes = 0, runs = 0, prevRem = -1;
+        for (let i = cs; i < ce; i++) {
+            if (store[i] & QF_OCCUPIED) homes++;
+            const isRunStart = (i === cs) || !(store[i] & QF_CONTINUATION);
+            if (isRunStart) { runs++; prevRem = store[i] >>> QF_RSHIFT; }
+            else {
+                const rem = store[i] >>> QF_RSHIFT;
+                if (rem < prevRem) return "run not sorted at slot " + i;
+                prevRem = rem;
+            }
+        }
+        if (homes !== runs) {
+            return "cluster [" + cs + "," + ce + ") has " + homes + " occupied homes but " + runs + " runs";
+        }
+        p = ce;
+    }
+    return null;
 }
 
 /* -------------------------------------------------------------------------- *
@@ -1668,6 +1855,671 @@ export class Cuckoo {
             }
         }
         for (let i = 0; i < fp.length; i++) inst._store[i] = fp[i];
+        inst._count = snap.count;
+        return inst;
+    }
+}
+
+/* -------------------------------------------------------------------------- *
+ * Quotient -- the mergeable + resizable deletable member (decisions/0016, 0017;
+ * Bender, Farach-Colton, Johnson, Kraner, Kuszmaul, Medjedovic, Montes, Shetty, Spillane
+ * & Zadok, "Don't Thrash: How to Cache Your Hash on Flash", VLDB 2012). ONE open-
+ * addressed linear slot array. A key's 32-bit base hash splits into a QUOTIENT (the home
+ * slot index, high bits) and a REMAINDER (stored, low r bits). Same-home keys form a RUN;
+ * adjacent runs form a CLUSTER under linear probing. Three METADATA bits per slot encode
+ * the structure (packed in the low 3 bits of each word, remainder in the high bits):
+ *
+ *   is_occupied     (bit0) -- this canonical slot is home to some stored key
+ *   is_continuation (bit1) -- the remainder here continues a run (is not its head)
+ *   is_shifted      (bit2) -- the remainder here is not in its canonical slot
+ *
+ * A slot is EMPTY iff all three metadata bits are 0 (remainder 0 is a LEGAL remainder --
+ * emptiness is carried by metadata, never by the remainder value, decisions/0016).
+ *
+ * Query: !is_occupied(home) -> absent; else walk left to the cluster start, count occupied
+ * homes to locate this home's run, then scan the run's (sorted) remainders for r. Insert:
+ * locate the run, insert r in sorted order, shift the cluster tail FORWARD (linear -- an
+ * insert that would run off the end, or push occupancy past the 0.90 ceiling, THROWS a
+ * byte-identical no-op, decisions/0016 -- parallel to Cuckoo's fail-closed overload).
+ * Delete: rebuild the affected cluster from its surviving (home, remainder) pairs, so the
+ * shift-back metadata repair is PROVABLY correct (it reuses the insert path, not a bespoke
+ * bit fixup -- the planner's flagged risk, retired by construction). remove -> boolean.
+ *
+ * merge() + resize() ship now as COLD paths (they may allocate; add/mightContain/remove
+ * stay zero-alloc). The fingerprint bit budget `p = q0 + r` is FIXED for the filter's
+ * lifetime: resize reconstructs each element's full hash as `(quotient << r) | remainder`
+ * and re-splits it under the new slot count WITHOUT the original keys (decisions/0016), and
+ * merge rejects any filter whose (seed, r, p, keys) differ. Both preserve membership (0
+ * false negatives) and exact size. fpp() reports the configured target while empty, else
+ * the honest remainder-quantized characteristic rate `load * 2^-r` (typically UNDER target
+ * because r rounds up -- the family's measure-vs-configured honesty hook). Delete carries
+ * the same never-added caveat as Cuckoo / CountingBloom (decisions/0017).
+ * -------------------------------------------------------------------------- */
+
+export class Quotient {
+    /**
+     * @param {number} capacity  Items the filter is sized for. Integer >= 1.
+     * @param {{ fpp?: number, seed?: number, keys?: 'int', stats?: boolean }} [options]
+     */
+    constructor(capacity, options) {
+        // Cold sizing door: fail closed on every impossible request (decisions/0016).
+        const fpp = (options && options.fpp !== undefined) ? options.fpp : DEFAULT_FPP;
+        const dims = quotientSizeFor(capacity, fpp);
+
+        this._cap = capacity;                    // items sized for (the configured capacity)
+        this._fpp = fpp;                         // the CONFIGURED target fpp (decisions/0004)
+        this._r = dims.r;                         // remainder width in bits
+        this._q = dims.q;                         // quotient width in bits (slot addressing)
+        this._nslots = dims.nslots;               // slot count = 2^q
+        this._qMask = dims.nslots - 1;            // quotient/slot-index mask (nslots is pow2)
+        this._rMask = (1 << dims.r) - 1;          // remainder value mask ((1<<r)-1)
+        // The fingerprint bit budget p = q + r is FIXED for the filter's lifetime so a
+        // resize/merge can re-derive the split from stored (quotient, remainder) pairs
+        // WITHOUT the original keys (decisions/0016). p <= 32 (guarded in quotientSizeFor).
+        this._p = dims.q + dims.r;
+        this._pMask = this._p >= 32 ? 0xffffffff : (((1 << this._p) >>> 0) - 1) >>> 0;
+        // The load ceiling in absolute slots: an insert past this throws (decisions/0016).
+        this._maxLoad = Math.floor(QF_LOAD * dims.nslots);
+        // The quotient range is [0, nslots), but the PHYSICAL array carries GUARD spillover
+        // slots beyond it so a cluster whose home is near the top can shift right without
+        // running off the end at ordinary load (a linear -- not circular -- filter,
+        // decisions/0016). A shift that still exhausts the guard THROWS fail-closed. The
+        // guard is deterministic from nslots so restore() can re-derive it.
+        this._bytes = dims.bits;
+        this._guard = _qfGuard(dims.nslots);
+        this._len = dims.nslots + this._guard;
+
+        this._int = validateKeys(options && options.keys);
+        this._seed = validateSeed(options && options.seed);
+
+        // The ONE preallocated slot store: _len words (nslots + guard), 8-bit (r <= 5) or
+        // 16-bit (r 6..13) per the byte-aligned word width. Sized once, reused forever;
+        // clear() zeroes it in place -- same ArrayBuffer identity.
+        this._store = dims.bits <= 8
+            ? new Uint8Array(this._len)
+            : new Uint16Array(this._len);
+
+        // Preallocated delete-rebuild scratch (decisions/0016): the (home, remainder) pairs
+        // of a cluster being repaired. Sized to _len (the worst-case cluster length),
+        // written only inside remove() -- so remove() stays zero-alloc. Never touched by
+        // add/mightContain. A Uint32Array carries both fields safely (q + r <= 32).
+        this._scratchHome = new Uint32Array(this._len);
+        this._scratchRem = new Uint32Array(this._len);
+
+        // Presence counter (decisions/0016): the number of stored slots WITH MULTIPLICITY.
+        // A Quotient does NOT dedup (like Cuckoo) -- every add stores one more (quotient,
+        // remainder) slot and increments count (even for an already-present fingerprint),
+        // and a successful remove decrements. 0017's delete-safety argument DEPENDS on this:
+        // two present keys sharing a fingerprint hold two slots, so removing one leaves the
+        // other resident. count equals the number of slots with any metadata bit set, so
+        // validateQuotient can cross-check it.
+        this._count = 0;
+
+        // Opt-in stats (decisions/0004): null when off so the hot path writes NOTHING.
+        this._stats = validateStats(options && options.stats);
+    }
+
+    get size() { return this._count; }
+    get count() { return this._count; }
+    get capacity() { return this._cap; }
+
+    // --- hot path (zero allocation; strict on keys:'int') ---------------------
+
+    /** The 32-bit base hash for a key (decisions/0016). keys:'int' mixes the int directly;
+     *  otherwise a string hashes over its code units (any other type is String()-encoded).
+     *  Masked to the fixed p = q + r bit budget by the caller. */
+    _hash(key) {
+        if (this._int) {
+            if (!Number.isInteger(key) || key < INT_MIN || key > INT_MAX) {
+                throw new TypeError(INT_KEY_MSG + String(key));
+            }
+            return fmix32((key ^ this._seed) | 0);
+        }
+        if (typeof key === "string") return hashStr(key, this._seed);
+        return hashStr(String(key), this._seed);
+    }
+
+    /**
+     * Find the first slot of the run that belongs to home quotient `q`. Read-only, zero
+     * allocation. Treats `q` as a home even if its is_occupied bit is not yet set (so the
+     * insert path can locate where a brand-new run goes), by stopping the home walk at `q`.
+     * Precondition for a QUERY: is_occupied(q) is set (checked by the caller).
+     */
+    _runStart(q) {
+        const store = this._store;
+        // Walk left to the cluster start (the first non-shifted slot at or left of q).
+        let b = q;
+        while (b > 0 && (store[b] & QF_SHIFTED)) b--;
+        // Count runs from the cluster start up to q's home, advancing a run pointer `s`.
+        let s = b;
+        while (b !== q) {
+            // Advance s to the next run start (past the current run's continuations).
+            s++;
+            while (s < this._len && (store[s] & QF_CONTINUATION)) s++;
+            // Advance b to the next occupied home (stop at q even if q is not yet occupied).
+            b++;
+            while (b < q && !(store[b] & QF_OCCUPIED)) b++;
+        }
+        return s;
+    }
+
+    /**
+     * Record a key (decisions/0016). Splits the base hash into (quotient, remainder),
+     * locates the run, inserts the remainder in sorted order, and shifts the cluster tail
+     * FORWARD. Zero allocation on the int + string paths. Fail-closed: an insert that would
+     * push occupancy past the 0.90 ceiling, or whose shift would run off the end of the
+     * slot array, THROWS a [lite-filter] Error and is a BYTE-IDENTICAL no-op (all mutations
+     * happen AFTER the last throw point). A Quotient stores MULTIPLICITY (it does NOT dedup,
+     * like Cuckoo), so re-adding the same key consumes another slot. add(key) -> void.
+     */
+    add(key) {
+        const hv = this._hash(key) & this._pMask;
+        const r = hv & this._rMask;
+        const q = (hv >>> this._r) & this._qMask;
+        // Load-ceiling door: fail closed BEFORE any mutation (byte-identical no-op).
+        if (this._count >= this._maxLoad) throw new Error(QF_FULL_MSG);
+        const placed = this._place(q, r);
+        if (placed) {
+            this._count++;
+            if (this._stats !== null) this._stats.adds++;
+        }
+    }
+
+    /**
+     * Place a (quotient, remainder) pair; always writes one slot (multiplicity is stored,
+     * decisions/0016) and returns true. THROWS a byte-identical [lite-filter] no-op when the
+     * linear shift would run off the end (no write happens before the throw check). The
+     * shared insert core for add() and the cold merge/resize/delete-rebuild paths.
+     */
+    _place(q, r) {
+        const store = this._store;
+        const len = this._len;
+        const canonical = store[q];
+
+        // Fast path: the home slot is empty -> place the run head in its canonical slot.
+        if ((canonical & QF_META) === 0) {
+            store[q] = (r << QF_RSHIFT) | QF_OCCUPIED;
+            return true;
+        }
+
+        const wasOccupied = (canonical & QF_OCCUPIED) !== 0;
+        const runStart = this._runStart(q);
+        let s = runStart;
+        let newIsCont = false;
+        let makeOldHeadCont = false;
+
+        if (wasOccupied) {
+            // Scan the (sorted) run for the insert position. Duplicate remainders are
+            // ALLOWED (a Quotient stores multiplicity like Cuckoo, NOT deduped -- so a
+            // delete of one instance preserves any other key sharing its fingerprint; this
+            // is what makes churn 0-false-negative + size==present, decisions/0016).
+            s = runStart;
+            while (true) {
+                const rem = store[s] >>> QF_RSHIFT;
+                if (rem >= r) break;                 // insert at s (keeps the run sorted)
+                s++;
+                if (s >= len) break;
+                if (!(store[s] & QF_CONTINUATION)) break; // end of this run
+            }
+            if (s === runStart) {
+                // The new remainder is the smallest -> it becomes the run head; the old
+                // head becomes a continuation (metadata repair, done in the write phase).
+                newIsCont = false;
+                makeOldHeadCont = true;
+            } else {
+                newIsCont = true;                    // inserted mid-run or appended
+            }
+        } else {
+            // A brand-new run for q; s = _runStart(q) is where it belongs.
+            newIsCont = false;
+        }
+
+        const newIsShifted = (s !== q);
+
+        // Find the first empty slot at or after s. If none exists in [s, nslots), the shift
+        // would run off the end -> fail closed BEFORE any write (byte-identical no-op).
+        let e = s;
+        while (e < len && (store[e] & QF_META) !== 0) e++;
+        if (e >= len) throw new Error(QF_FULL_MSG);
+
+        // ---- write phase (past the last throw point) ----
+        store[q] |= QF_OCCUPIED;                      // occupied bit is stationary at q
+        if (makeOldHeadCont) store[runStart] |= QF_CONTINUATION;
+        // Shift [s, e) forward into [s+1, e], preserving each slot's OWN occupied bit and
+        // marking every moved element shifted (it left its canonical slot).
+        for (let i = e; i > s; i--) {
+            const occ = store[i] & QF_OCCUPIED;      // slot i keeps its own home bit
+            const data = store[i - 1] & ~QF_OCCUPIED; // remainder + continuation + shifted
+            store[i] = (occ | data | QF_SHIFTED) & 0xffffffff;
+        }
+        // Place the new entry at s (keeping s's own occupied bit).
+        const occS = store[s] & QF_OCCUPIED;
+        store[s] = occS | (r << QF_RSHIFT) |
+            (newIsCont ? QF_CONTINUATION : 0) | (newIsShifted ? QF_SHIFTED : 0);
+        return true;
+    }
+
+    /**
+     * The query (decisions/0016). Returns true iff the key's (quotient, remainder) is
+     * stored. One-sided: NO false negatives for a currently-present key (decisions/0017
+     * states the delete-misuse exception), only false POSITIVES bounded by the
+     * remainder-quantized rate. Zero allocation on the int + string paths.
+     */
+    mightContain(key) {
+        const hv = this._hash(key) & this._pMask;
+        const r = hv & this._rMask;
+        const q = (hv >>> this._r) & this._qMask;
+        const store = this._store;
+        let hit = false;
+        if ((store[q] & QF_OCCUPIED) !== 0) {
+            let s = this._runStart(q);
+            const len = this._len;
+            while (true) {
+                const rem = store[s] >>> QF_RSHIFT;
+                if (rem === r) { hit = true; break; }
+                if (rem > r) break;                  // sorted run -> not present
+                s++;
+                if (s >= len) break;
+                if (!(store[s] & QF_CONTINUATION)) break; // end of run
+            }
+        }
+        if (this._stats !== null) {
+            this._stats.queries++;
+            if (hit) this._stats.hits++; else this._stats.misses++;
+        }
+        return hit;
+    }
+
+    /** The SOLE alias of `mightContain` (decisions/0003), same one-sided semantics. */
+    has(key) { return this.mightContain(key); }
+
+    /**
+     * Delete a key (decisions/0016, 0017). Locates the run, and on a match REBUILDS the
+     * affected cluster from its surviving (home, remainder) pairs -- so the shift-back
+     * metadata repair is PROVABLY correct (it reuses the verified insert path rather than a
+     * bespoke bit fixup). Returns true on a real delete; returns false and mutates NOTHING
+     * on a run-scan miss. Zero allocation (the cluster scratch is preallocated).
+     *
+     * CAVEAT (decisions/0017): deleting a NEVER-INSERTED key whose (quotient, remainder)
+     * COLLIDES with a real key removes THAT key's fingerprint -> a later FALSE NEGATIVE for
+     * the other key. Only remove keys you actually inserted.
+     */
+    remove(key) {
+        const hv = this._hash(key) & this._pMask;
+        const r = hv & this._rMask;
+        const q = (hv >>> this._r) & this._qMask;
+        const store = this._store;
+        const len = this._len;
+        if ((store[q] & QF_OCCUPIED) === 0) return false;
+        // Locate the slot holding remainder r within q's run.
+        let s = this._runStart(q);
+        let found = false;
+        while (true) {
+            const rem = store[s] >>> QF_RSHIFT;
+            if (rem === r) { found = true; break; }
+            if (rem > r) break;                      // sorted run -> not present
+            s++;
+            if (s >= len) break;
+            if (!(store[s] & QF_CONTINUATION)) break; // end of run
+        }
+        if (!found) return false;
+
+        // Rebuild the whole cluster containing slot s from its survivors. The cluster is the
+        // maximal run of non-empty slots [cs, ce) around s (clusters are separated by empty
+        // slots), so clearing [cs, ce) touches no other cluster.
+        let cs = s;
+        while (cs > 0 && (store[cs - 1] & QF_META) !== 0) cs--;
+        let ce = s;
+        while (ce < len && (store[ce] & QF_META) !== 0) ce++;
+
+        // Collect surviving (home, remainder) pairs. Within a cluster the homes are the
+        // occupied slots in order, and the k-th run (by continuation grouping) belongs to
+        // the k-th home. cs is always a home (an unshifted run start).
+        const homes = this._scratchHome;
+        const rems = this._scratchRem;
+        let n = 0;
+        let homeIdx = cs;
+        for (let p = cs; p < ce; p++) {
+            if (p !== cs && !(store[p] & QF_CONTINUATION)) {
+                // Next run: advance the home pointer to the next occupied slot.
+                homeIdx++;
+                while (homeIdx < ce && !(store[homeIdx] & QF_OCCUPIED)) homeIdx++;
+            }
+            if (p === s) continue;                    // skip the deleted element
+            homes[n] = homeIdx;
+            rems[n] = store[p] >>> QF_RSHIFT;
+            n++;
+        }
+
+        // Clear the cluster (metadata + remainders) and rebuild from the survivors. Every
+        // survivor's home is within [cs, ce), so re-inserting them cannot run off the end
+        // (one element was removed -> there is room) and touches no neighboring cluster.
+        for (let p = cs; p < ce; p++) store[p] = 0;
+        for (let i = 0; i < n; i++) this._place(homes[i], rems[i]);
+
+        this._count--;
+        return true;
+    }
+
+    // --- cold inspection ------------------------------------------------------
+
+    /**
+     * The false-positive probability (decisions/0004, 0016). Configured target while EMPTY;
+     * once non-empty it is the honest remainder-quantized characteristic rate
+     * `load * 2^-r`, where `load = size / nslots` is the fraction of occupied slots and
+     * `2^-r` is the per-comparison remainder-collision probability. Because r is byte-
+     * aligned UP (r = ceil(log2(1/fpp))) and load <= 0.90, this typically runs BELOW the
+     * configured target -- the family's measure-vs-configured honesty hook. It is a
+     * formula, NOT a measurement -- MEASURE with the bench (`npm run bench`). Cold, O(1).
+     */
+    fpp() {
+        if (this._count === 0) return this._fpp;
+        return (this._count / this._nslots) * Math.pow(2, -this._r);
+    }
+
+    /** Reset to empty. Allocates NOTHING: zeroes the existing slot store in place, so the
+     *  ArrayBuffer identity is preserved (decisions/0016). */
+    clear() {
+        this._store.fill(0);
+        this._count = 0;
+    }
+
+    // --- opt-in stats (decisions/0004) ----------------------------------------
+
+    /** The live per-instance counter holder BY REFERENCE. Requires `{ stats: true }`;
+     *  throws fail-closed otherwise (null is not zero). */
+    stats() {
+        if (this._stats === null) throw new Error(STATS_OFF_MSG);
+        return this._stats;
+    }
+
+    /** Zero the four counters IN PLACE. Requires `{ stats: true }`; else fail closed. */
+    resetStats() {
+        if (this._stats === null) throw new Error(STATS_OFF_MSG);
+        this._stats.adds = 0;
+        this._stats.queries = 0;
+        this._stats.hits = 0;
+        this._stats.misses = 0;
+    }
+
+    // --- cold rebuild helpers (merge / resize; MAY allocate) ------------------
+
+    /**
+     * Iterate every stored (quotient, remainder) pair, calling `fn(quotient, remainder)`.
+     * COLD -- used by merge/resize/dump, never on a hot path. Reconstructs the full
+     * fingerprint identity WITHOUT the original keys (decisions/0016): the pair itself IS
+     * the stored identity. Walks each cluster assigning runs to occupied homes in order.
+     */
+    _forEachPair(fn) {
+        const store = this._store;
+        const len = this._len;
+        let p = 0;
+        while (p < len) {
+            if ((store[p] & QF_META) === 0) { p++; continue; }
+            // Cluster [cs, ce).
+            const cs = p;
+            let ce = p;
+            while (ce < len && (store[ce] & QF_META) !== 0) ce++;
+            let homeIdx = cs;
+            for (let i = cs; i < ce; i++) {
+                if (i !== cs && !(store[i] & QF_CONTINUATION)) {
+                    homeIdx++;
+                    while (homeIdx < ce && !(store[homeIdx] & QF_OCCUPIED)) homeIdx++;
+                }
+                fn(homeIdx, store[i] >>> QF_RSHIFT);
+            }
+            p = ce;
+        }
+    }
+
+    /**
+     * Rebuild into a fresh slot array sized for `newCapacity`, preserving membership (0
+     * false negatives) and exact size WITHOUT the original keys (decisions/0016). COLD --
+     * MAY allocate. Each stored element's full fingerprint is `(quotient << r) | remainder`
+     * (a p-bit value; p is FIXED for the filter's lifetime), re-split under the new slot
+     * count. Mutates this filter in place and returns it (uniform with clear()).
+     *
+     * NOTE (decisions/0016): because p = q0 + r is fixed at construction (the discarded
+     * high hash bits cannot be recovered without the keys), a quotient never carries more
+     * than q0 bits of entropy; resizing LARGER than the original quotient width adds empty
+     * headroom (lower load, fewer collisions on the SHARED bits) but not new quotient
+     * entropy, and resizing SMALLER truncates the quotient consistently for both stored
+     * elements and fresh queries (so membership still holds, at a higher FPR).
+     */
+    resize(newCapacity) {
+        // Size for at least the requested capacity AND the current occupancy under the load
+        // ceiling; fail closed if the request cannot even hold what is already stored.
+        const need = Math.max(newCapacity, this._count);
+        const dims = quotientSizeFor(need, this._fpp);
+        const r = this._r;
+        // Snapshot the stored pairs before repointing the store (walk the OLD store).
+        const pairs = [];
+        this._forEachPair((qq, rr) => pairs.push(((qq << r) | rr) >>> 0));
+        // Repoint to the fresh geometry (p, r are INVARIANT across resize; decisions/0016).
+        const guard = _qfGuard(dims.nslots);
+        const len = dims.nslots + guard;
+        this._store = dims.bits <= 8 ? new Uint8Array(len) : new Uint16Array(len);
+        this._scratchHome = new Uint32Array(len);
+        this._scratchRem = new Uint32Array(len);
+        this._q = dims.q;
+        this._nslots = dims.nslots;
+        this._qMask = dims.nslots - 1;
+        this._guard = guard;
+        this._len = len;
+        this._maxLoad = Math.floor(QF_LOAD * dims.nslots);
+        this._cap = newCapacity;
+        this._count = 0;
+        // Re-insert every fingerprint, re-split under the new quotient width.
+        for (let i = 0; i < pairs.length; i++) {
+            const fp = pairs[i] & this._pMask;
+            const rr = fp & this._rMask;
+            const qq = (fp >>> r) & this._qMask;
+            if (this._place(qq, rr)) this._count++;
+        }
+        return this;
+    }
+
+    /**
+     * Merge another Quotient into this one, preserving membership (0 false negatives) and
+     * producing exact-size union semantics (decisions/0016). COLD -- MAY allocate. REJECTS
+     * fail-closed unless `other` is an identically-configured Quotient (same seed, fpp-
+     * derived remainder width r, fixed hash bit budget p, and keys mode) -- otherwise the
+     * quotient/remainder split would misalign. Grows this filter as needed to hold both,
+     * then re-inserts every pair from `other` (this filter's own pairs are already resident).
+     * Mutates this filter in place and returns it.
+     */
+    merge(other) {
+        if (!(other instanceof Quotient) ||
+            other._seed !== this._seed || other._r !== this._r ||
+            other._p !== this._p || other._int !== this._int) {
+            throw new Error(QF_MERGE_MSG);
+        }
+        const r = this._r;
+        // Collect other's pairs first (independent of this filter's mutation).
+        const pairs = [];
+        other._forEachPair((qq, rr) => pairs.push(((qq << r) | rr) >>> 0));
+        // Grow if the combined occupancy would exceed the load ceiling. A Quotient stores
+        // MULTIPLICITY (no dedup), so the merged size is EXACTLY this._count + other._count.
+        const combined = this._count + other._count;
+        if (combined > this._maxLoad) {
+            this.resize(Math.ceil(combined / QF_LOAD));
+        }
+        for (let i = 0; i < pairs.length; i++) {
+            const fp = pairs[i] & this._pMask;
+            const rr = fp & this._rMask;
+            const qq = (fp >>> r) & this._qMask;
+            if (this._place(qq, rr)) {
+                this._count++;
+                // Defensive: a clustered layout can still fill before the flat combined
+                // estimate expects it (linear probing), so grow again if the ceiling nears.
+                if (this._count >= this._maxLoad && i + 1 < pairs.length) {
+                    this.resize(Math.ceil((this._count + (pairs.length - i - 1)) / QF_LOAD));
+                }
+            }
+        }
+        return this;
+    }
+
+    // --- snapshot / restore (decisions/0005, 0016) ----------------------------
+
+    /**
+     * Serialize to a plain, structurally-cloneable snapshot (decisions/0016). COLD -- never
+     * a hot path -- and MAY allocate. The slot store IS the serial form, emitted as a plain
+     * Array (`store`) so it round-trips through structuredClone AND JSON. `r`, `q`, `p`,
+     * `nslots`, and `load` record the geometry (q/nslots track a resize; p is the fixed bit
+     * budget). NOTE: `f` is the shared FORMAT tag; `fpp` is the configured target.
+     */
+    dump() {
+        return {
+            f: SNAP_TAG,
+            mem: "Quotient",
+            r: this._r,
+            q: this._q,
+            p: this._p,
+            nslots: this._nslots,
+            load: QF_LOAD,
+            cap: this._cap,
+            fpp: this._fpp,
+            seed: this._seed,
+            keys: this._int ? "int" : null,
+            count: this._count,
+            store: Array.from(this._store),
+        };
+    }
+
+    /**
+     * Reconstruct a FRESH Quotient from a snapshot (decisions/0016). Fail closed on ANY tag
+     * / member / remainder-width / geometry / capacity / fpp / seed / keys mismatch AND on a
+     * corrupt or wrong-length store OR any malformed slot word (REJECT, never truncate --
+     * null is not zero). EVERY slot word is validated BEFORE any instance is mutated: the
+     * remainder must fit r bits, an EMPTY slot (metadata 0) must have a 0 remainder (a
+     * stored remainder with no metadata is unreachable garbage). `opts` re-derives
+     * runtime-only options (stats); everything structural comes FROM the snapshot.
+     */
+    static restore(snap, opts) {
+        if (snap === null || typeof snap !== "object") {
+            throw new TypeError("[lite-filter] restore(snap): snapshot must be an object");
+        }
+        if (snap.f !== SNAP_TAG) {
+            throw new Error(
+                "[lite-filter] restore(): bad format tag " + String(snap.f) +
+                " (expected " + SNAP_TAG + ")");
+        }
+        if (snap.mem !== "Quotient") {
+            throw new Error(
+                "[lite-filter] restore(): member mismatch " + String(snap.mem) +
+                " (this is Quotient.restore)");
+        }
+        if (!Number.isInteger(snap.seed) || snap.seed < 0 || snap.seed > 0xffffffff) {
+            throw new Error(
+                "[lite-filter] restore(): corrupt seed " + String(snap.seed) +
+                " (must be a 32-bit unsigned integer)");
+        }
+        if (snap.keys !== "int" && snap.keys !== null) {
+            throw new Error(
+                "[lite-filter] restore(): corrupt keys mode " + String(snap.keys) +
+                " (must be 'int' or null)");
+        }
+        const keys = snap.keys === "int" ? "int" : undefined;
+        const inst = new Quotient(snap.cap, {
+            fpp: snap.fpp,
+            seed: snap.seed,
+            keys: keys,
+            stats: opts && opts.stats,
+        });
+        // r depends only on fpp -> a mismatch means a corrupt or foreign snapshot.
+        if (snap.r !== inst._r) {
+            throw new Error(
+                "[lite-filter] restore(): remainder-width mismatch (snapshot r=" + String(snap.r) +
+                ", derived r=" + inst._r + ")");
+        }
+        // Geometry: q/nslots may differ from the capacity-derived defaults (a resized
+        // filter), but must be internally consistent (nslots === 2^q) and within budget.
+        if (!Number.isInteger(snap.q) || snap.q < 1 || snap.q > 32) {
+            throw new Error("[lite-filter] restore(): corrupt quotient width q=" + String(snap.q));
+        }
+        if (snap.nslots !== Math.pow(2, snap.q)) {
+            throw new Error(
+                "[lite-filter] restore(): slot-count mismatch (snapshot nslots=" +
+                String(snap.nslots) + " != 2^q=" + Math.pow(2, snap.q) + ")");
+        }
+        // The fixed bit budget p MUST leave at least ONE quotient bit (decisions/0016):
+        // p = q0 + r with q0 >= 1, so p > r ALWAYS. p === r (quotient width 0) would make
+        // quotient = (hv >>> r) & qMask ALWAYS 0, collapsing every key onto slot 0 and causing
+        // wholesale FALSE NEGATIVES -- REJECT it. (p is INVARIANT across resize -- it stays
+        // q0 + r while the current q/nslots change -- so it CANNOT be cross-checked against the
+        // snapshot's current q; it only needs to be a valid budget in (r, 32].) Never truncate.
+        if (!Number.isInteger(snap.p) || snap.p <= snap.r || snap.p > 32) {
+            throw new Error(
+                "[lite-filter] restore(): corrupt bit budget p=" + String(snap.p) +
+                " (must be an integer in " + (snap.r + 1) + "..32; quotient width 0 is impossible)");
+        }
+        // The physical store carries GUARD spillover slots beyond nslots (decisions/0016),
+        // deterministic from nslots -- so re-derive the expected physical length here.
+        const guard = _qfGuard(snap.nslots);
+        const physLen = snap.nslots + guard;
+        const store = snap.store;
+        if (!Array.isArray(store) || store.length !== physLen) {
+            throw new Error(
+                "[lite-filter] restore(): corrupt slot store (expected " + physLen +
+                " slots, got " + (Array.isArray(store) ? store.length : String(store)) + ")");
+        }
+        if (!Number.isInteger(snap.count) || snap.count < 0) {
+            throw new Error("[lite-filter] restore(): corrupt count " + String(snap.count));
+        }
+        // Validate EVERY slot word BEFORE mutating (REJECT never truncate; null is not zero).
+        const rMask = (1 << snap.r) - 1;
+        const maxWord = ((rMask << QF_RSHIFT) | QF_META) >>> 0;
+        let occ = 0;
+        for (let i = 0; i < store.length; i++) {
+            const w = store[i];
+            if (!Number.isInteger(w) || w < 0 || w > maxWord) {
+                throw new Error(
+                    "[lite-filter] restore(): corrupt slot word at index " + i + " (" + String(w) +
+                    "); each word must be an integer in 0.." + maxWord);
+            }
+            const meta = w & QF_META;
+            if (meta === 0) {
+                // An empty slot (metadata 0) must carry a 0 remainder -- a remainder with no
+                // metadata is unreachable garbage (emptiness is carried by metadata).
+                if ((w >>> QF_RSHIFT) !== 0) {
+                    throw new Error(
+                        "[lite-filter] restore(): slot " + i + " has a remainder but no metadata " +
+                        "(" + String(w) + "); an empty slot must be exactly 0");
+                }
+            } else {
+                occ++;
+            }
+        }
+        // The count of slots with any metadata bit set must equal the recorded size.
+        if (occ !== snap.count) {
+            throw new Error(
+                "[lite-filter] restore(): metadata-set slot count " + occ + " != count " +
+                String(snap.count));
+        }
+        // Deep structural check (REJECT never truncate): per-word ranges alone let a lone
+        // continuation or a shifted/continuation cluster start slip through -- reject a
+        // corrupt-but-in-range snapshot BEFORE any instance is mutated (decisions/0016).
+        const structErr = _qfStructureError(store, store.length);
+        if (structErr !== null) {
+            throw new Error("[lite-filter] restore(): corrupt slot structure -- " + structErr);
+        }
+        // Repoint geometry to the snapshot's (a resized filter differs from the cap default).
+        if (inst._len !== physLen) {
+            inst._store = inst._store.BYTES_PER_ELEMENT === 1
+                ? new Uint8Array(physLen) : new Uint16Array(physLen);
+            inst._scratchHome = new Uint32Array(physLen);
+            inst._scratchRem = new Uint32Array(physLen);
+            inst._q = snap.q;
+            inst._nslots = snap.nslots;
+            inst._qMask = snap.nslots - 1;
+            inst._guard = guard;
+            inst._len = physLen;
+            inst._maxLoad = Math.floor(QF_LOAD * snap.nslots);
+        }
+        inst._p = snap.p;
+        inst._pMask = snap.p >= 32 ? 0xffffffff : (((1 << snap.p) >>> 0) - 1) >>> 0;
+        for (let i = 0; i < store.length; i++) inst._store[i] = store[i];
         inst._count = snap.count;
         return inst;
     }

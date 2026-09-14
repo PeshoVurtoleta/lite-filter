@@ -141,3 +141,63 @@ export function differentialChurnInt(Ctor, opts) {
         filterSize: filter.size,
     };
 }
+
+/**
+ * The RESIZE differential (Quotient): add `n` distinct int keys, `resize()` to a different
+ * capacity, then requery -- membership MUST be preserved (0 false negatives) and the size
+ * MUST be unchanged (resize re-inserts every stored fingerprint without the original keys).
+ * `opts.factor` scales the resize target relative to n (e.g. 4 = grow, 0.4 = shrink but
+ * still >= the current occupancy). Seeded + deterministic.
+ *
+ * @param {Function} Ctor  a resizable member constructor (e.g. Quotient)
+ * @param {{ n:number, fpp:number, seed:number, factor:number }} opts
+ * @returns {{ falseNegatives:number, sizeBefore:number, sizeAfter:number }}
+ */
+export function differentialResizeInt(Ctor, opts) {
+    const rng = makePrng(opts.seed >>> 0);
+    const filter = new Ctor(opts.n, { fpp: opts.fpp, keys: "int" });
+    const truth = new Set();
+    while (truth.size < opts.n) {
+        const key = (rng() >>> 1);
+        if (!truth.has(key)) { truth.add(key); filter.add(key); }
+    }
+    const sizeBefore = filter.size;
+    filter.resize(Math.max(1, Math.floor(opts.n * opts.factor)));
+    let falseNegatives = 0;
+    for (const key of truth) if (!filter.mightContain(key)) falseNegatives++;
+    return { falseNegatives: falseNegatives, sizeBefore: sizeBefore, sizeAfter: filter.size };
+}
+
+/**
+ * The MERGE differential (Quotient): fill two identically-configured filters with DISJOINT
+ * int key sets (A in the low quarter, B in the high quarter of the non-negative half),
+ * `A.merge(B)`, then requery both sets -- membership MUST be preserved (0 false negatives)
+ * and the merged size MUST equal `A.size + B.size` exactly (disjoint -> the additive union).
+ * Seeded + deterministic.
+ *
+ * @param {Function} Ctor  a mergeable member constructor (e.g. Quotient)
+ * @param {{ n:number, fpp:number, seed:number }} opts
+ * @returns {{ falseNegatives:number, expectedSize:number, mergedSize:number }}
+ */
+export function differentialMergeInt(Ctor, opts) {
+    const rng = makePrng(opts.seed >>> 0);
+    const A = new Ctor(opts.n * 3, { fpp: opts.fpp, keys: "int" });
+    const B = new Ctor(opts.n * 3, { fpp: opts.fpp, keys: "int" });
+    const aKeys = new Set();
+    const bKeys = new Set();
+    // A: keys in [0, 2^30); B: keys in [2^30, 2^31) -- DISJOINT by construction.
+    while (aKeys.size < opts.n) {
+        const key = (rng() >>> 2);              // [0, 2^30)
+        if (!aKeys.has(key)) { aKeys.add(key); A.add(key); }
+    }
+    while (bKeys.size < opts.n) {
+        const key = (rng() >>> 2) + 0x40000000; // [2^30, 2^31)
+        if (!bKeys.has(key)) { bKeys.add(key); B.add(key); }
+    }
+    const expectedSize = A.size + B.size;
+    A.merge(B);
+    let falseNegatives = 0;
+    for (const key of aKeys) if (!A.mightContain(key)) falseNegatives++;
+    for (const key of bKeys) if (!A.mightContain(key)) falseNegatives++;
+    return { falseNegatives: falseNegatives, expectedSize: expectedSize, mergedSize: A.size };
+}

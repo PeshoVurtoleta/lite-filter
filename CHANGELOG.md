@@ -7,6 +7,74 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The `VERSION` constant, `package.json` `version`, and `llms.txt` are bumped
 together (three-place version sync) at release.
 
+## [0.5.0] - 2026-09-14
+
+The 5th member -- `Quotient`, the mergeable + resizable one (deletable, fail-closed at the load ceiling).
+
+### Added
+
+- **`Quotient` -- the quotient-filter member** (Bender, Farach-Colton, Johnson, Kraner,
+  Kuszmaul, Medjedovic, Montes, Shetty, Spillane & Zadok, VLDB 2012; decisions/0016, 0017).
+  A new class IN `Filter.js` implementing the same uniform `LiteFilter<K>` surface as `Bloom`,
+  so it is a one-line constructor swap. It DELETES via a real `remove(key) -> boolean`
+  (returns false, mutates nothing, on a run-scan miss) and ADDS `merge()` + `resize()`.
+  - ONE open-addressed LINEAR slot array. A key's 32-bit hash splits into a QUOTIENT (home
+    slot index, high bits) and a REMAINDER (stored, low `r` bits); same-home keys form a RUN,
+    adjacent runs a CLUSTER under linear probing. Three METADATA bits per slot -- `is_occupied`
+    (bit0), `is_continuation` (bit1), `is_shifted` (bit2) -- packed in the low 3 bits of each
+    byte-aligned word, remainder in the high bits (`word = (remainder << 3) | metadata`). A
+    slot is EMPTY iff all three metadata bits are 0 (remainder 0 is a legal remainder).
+  - **Remainder width `r = ceil(log2(1/fpp))`, byte-aligned slot word** (decisions/0016): the
+    word is `r + 3` bits -> `Uint8Array` (r <= 5) or `Uint16Array` (r 6..13); `r + 3 > 16`
+    (`fpp < 1/2^13 ~ 0.000122`) throws a `[lite-filter]` RangeError at construction. Slot
+    count is a power of two `2^q >= ceil(capacity / 0.90)` (LOAD = 0.90); `q + r` must fit one
+    32-bit hash or construction throws; a too-large door caps the count before the doubling
+    loop. At `fpp = 0.01`: `r = 7`, delivered FPR `load * 2^-r` -- BELOW the configured target
+    (measured ~0.0059 at ~0.55 load in the bench). `fpp()` reports that remainder-quantized
+    rate once non-empty; bits/item ~23 at ~0.76 load (16-bit words + guard) vs Bloom's ~9.6.
+  - **Fail-closed at the load ceiling** (decisions/0016): `add` THROWS a `[lite-filter]` Error
+    when occupancy would exceed `floor(0.90 * nslots)` OR the linear cluster shift would run
+    off the end of the physical array; both are checked BEFORE any write, so a thrown `add` is
+    a BYTE-IDENTICAL no-op (no already-added key is dropped). A Quotient stores MULTIPLICITY
+    (it does not dedup, like Cuckoo). The array carries GUARD spillover slots
+    (`max(1024, nslots >> 3)`) so ordinary-load clusters near the top shift without throwing.
+  - **`remove` repairs metadata by REBUILDING the affected cluster** through the verified
+    insert path (identify the maximal non-empty run around the deleted slot, collect surviving
+    `(home, remainder)` pairs, clear, re-insert) -- so the shift-back repair is correct by
+    construction. The cluster scratch is preallocated, so `remove` is zero-allocation.
+  - **`merge()` + `resize()` -- cold paths that preserve membership without the original
+    keys** (decisions/0016). Each element's identity is reconstructed as
+    `(quotient << r) | remainder` and re-split under the new slot count; the fingerprint bit
+    budget `p = q0 + r` is FIXED for the filter's lifetime so both grow and shrink preserve
+    membership (0 false negatives) and exact size. `resize(newCapacity)` sizes for
+    `max(newCapacity, count)` (never loses data). `merge(other)` REJECTS fail-closed unless
+    `other` is an identically-configured `Quotient` (same `seed`, `r`, `p`, keys mode), then
+    grows to hold both and re-inserts every pair (exact additive size on disjoint inputs).
+  - **Delete caveat** (decisions/0017): removing a NEVER-INSERTED key whose `(quotient,
+    remainder)` collides with a real key clears that other key's slot -> a later false negative
+    for it (a constructed non-vacuous example is recorded in decisions/0017). Only remove keys
+    you inserted (documented in the docstring, `Filter.d.ts`, README, llms.txt).
+  - Hot path `add` / `mightContain` / `has` / `remove` are strictly zero-alloc on `keys:'int'`
+    (linear-probe split + shift, preallocated cluster scratch on remove): 0 scavenges at
+    N=200000 and 8N on add-churn / query-hit / remove-churn under the pinned 4MB semi-space
+    (perf-gate). `clear()` zeroes the store in place (same ArrayBuffer identity).
+  - `dump()` / static `Quotient.restore(snap, opts?)` with a `{ f, mem:"Quotient", r, q, p,
+    nslots, load, cap, fpp, seed, keys, count, store }` tag (`q`/`nslots` track a resize, `p`
+    is the fixed budget) that revalidates every field and every slot word BEFORE building any
+    instance (store length `nslots + guard`, each word fits `r + 3` bits, an empty slot carries
+    a 0 remainder, metadata-set-slot count == size), and REJECTS any corruption -- never truncates.
+- **`Filter.d.ts`** -- `Quotient<K> implements LiteFilter<K>` with a real `remove(key): boolean`,
+  `resize(n): Quotient<K>`, and `merge(other): Quotient<K>`; `FilterSnapshot` extended with
+  optional `r` / `q` / `p` / `nslots` / `load` / `store` fields.
+- **Gates extended** -- the conservation + structure invariant `validateQuotient` (store length
+  `nslots + guard`; every remainder in range; empty slot == 0; metadata-set-slot count == size;
+  slot 0 never shifted; per-cluster #occupied-homes == #runs; sorted runs); `differentialResizeInt`
+  and `differentialMergeInt` Set-oracle differentials; a `test/Quotient.test.js` boundary suite;
+  `qfAdd` / `qfQueryHit` / `qfRemoveChurn` perf-gate scenarios; a `measureQuotient` bench column
+  (Bloom vs Quotient, measured-vs-theory FPR, add ns rising toward the ceiling); the torture GATE
+  line grows `qf` terms (`fn=0`, `fpr`, `churnFn`/`present`/`size`, `resizeFn=0`, `mergeFn=0`,
+  `mergeSize`, `ceilingThrew=true`, `ceilingNoop=true`).
+
 ## [0.4.0] - 2026-09-14
 
 The 4th member -- `Cuckoo`, the fingerprint one (deletable, fail-closed at capacity).

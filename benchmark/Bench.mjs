@@ -27,7 +27,7 @@
  * @license MIT
  */
 
-import { Bloom, CountingBloom, BlockedBloom, Cuckoo, VERSION } from "../Filter.js";
+import { Bloom, CountingBloom, BlockedBloom, Cuckoo, Quotient, VERSION } from "../Filter.js";
 
 /** Seeded xorshift32 -- byte-reproducible from its seed. */
 export function makePrng(seed) {
@@ -292,6 +292,61 @@ export function measureCuckoo(name, gen, cap, fpp, seed) {
 }
 
 /**
+ * Measure one workload against a fresh Quotient sized (cap, fpp). Same row shape as
+ * `measure` so it prints into the same side-by-side table. A Quotient's FPR is remainder-
+ * quantized to `load * 2^-r`, so `theoretical` is that load-scaled closed form (NOT Bloom's
+ * fill-derived one), and bits/item is the ACTUAL store (nslots + guard words, byte-aligned
+ * to the r+3 slot width). add() is FAIL-CLOSED at the 0.90 load ceiling / off the linear end
+ * (decisions/0016): if a workload oversizes past the ceiling the excess adds THROW, so we
+ * stop at the first overflow and measure over the keys that actually landed.
+ */
+export function measureQuotient(name, gen, cap, fpp, seed) {
+    const { keys, probes } = gen(cap, Math.max(cap * 10, 100000), seed);
+    const filter = new Quotient(cap, { fpp, keys: "int" });
+    const truth = new Set();
+
+    const t0 = performance.now();
+    let added = 0;
+    let overflowed = false;
+    for (let i = 0; i < keys.length; i++) {
+        try { filter.add(keys[i]); } catch (e) { overflowed = true; break; }
+        added++;
+    }
+    const addNs = added === 0 ? 0 : ((performance.now() - t0) * 1e6) / added;
+    for (let i = 0; i < added; i++) truth.add(keys[i]);
+
+    let falseNeg = 0;
+    for (const key of truth) if (!filter.mightContain(key)) falseNeg++;
+
+    const t1 = performance.now();
+    let acc = 0;
+    for (let i = 0; i < probes.length; i++) acc += filter.mightContain(probes[i]) ? 1 : 0;
+    const queryNs = ((performance.now() - t1) * 1e6) / probes.length;
+    if (acc === -1) process.stdout.write(""); // keep acc observable
+    let falsePos = 0, probed = 0;
+    for (let i = 0; i < probes.length; i++) {
+        if (truth.has(probes[i])) continue;
+        probed++;
+        if (filter.mightContain(probes[i])) falsePos++;
+    }
+
+    const distinct = truth.size;
+    // The remainder width r is the row's "k" column (a Quotient has no k probes).
+    const k = filter._r;
+    const measuredFpr = probed === 0 ? 0 : falsePos / probed;
+    // Quotient FPR is remainder-quantized: load * 2^-r.
+    const theoretical = (filter.size / filter._nslots) * Math.pow(2, -filter._r);
+    const overPct = theoretical === 0 ? 0 : ((measuredFpr - theoretical) / theoretical) * 100;
+    // ACTUAL store: (nslots + guard) slots byte-aligned to the r+3 slot word width.
+    const bitsPerItem = distinct === 0 ? 0 : (filter._store.byteLength * 8) / distinct;
+
+    return {
+        name, added, distinct, bitsPerItem, k,
+        measuredFpr, theoretical, overPct, addNs, queryNs, falseNeg, overflowed,
+    };
+}
+
+/**
  * The remove/churn workload (CountingBloom only): add N distinct keys, remove HALF,
  * then requery -- the still-present half MUST show 0 false negatives, and the removed
  * half should mostly read absent. Reports remove ns/op and the two counts. This is the
@@ -378,6 +433,20 @@ export function runBenchCuckoo(opts) {
     rows.push(measureCuckoo("zipfian", zipfian, cap, fpp, seed ^ 0x11));
     rows.push(measureCuckoo("sequential", sequential, cap, fpp, seed ^ 0x22));
     rows.push(measureCuckoo("adversarial", (n, p, s) => adversarial(Math.floor(cap * 1.5), p, s),
+        cap, fpp, seed ^ 0x33));
+    return rows;
+}
+
+/** Run the Quotient workload matrix (FPR-vs-theory across the 4 workloads). */
+export function runBenchQuotient(opts) {
+    const cap = (opts && opts.cap) || 100000;
+    const fpp = (opts && opts.fpp) || 0.01;
+    const seed = (opts && opts.seed) || 0xC0FFEE;
+    const rows = [];
+    rows.push(measureQuotient("uniform", uniform, cap, fpp, seed));
+    rows.push(measureQuotient("zipfian", zipfian, cap, fpp, seed ^ 0x11));
+    rows.push(measureQuotient("sequential", sequential, cap, fpp, seed ^ 0x22));
+    rows.push(measureQuotient("adversarial", (n, p, s) => adversarial(Math.floor(cap * 1.5), p, s),
         cap, fpp, seed ^ 0x33));
     return rows;
 }
@@ -511,6 +580,46 @@ function printCuckooTable(bloomRows, cuckooRows, cap, fpp) {
         "by the byte-aligned fingerprint width -- MEASURE your own keys.\n\n");
 }
 
+/**
+ * Bloom vs Quotient SIDE BY SIDE across the four workloads: bits/item (a Quotient carries
+ * metadata + shift + guard overhead on top of r bits/item, so it runs WIDER than Bloom),
+ * measured FPR and its THEORETICAL closed form (Bloom's fill-derived `(1-e^(-kn/m))^k` vs
+ * the Quotient's remainder-quantized `load * 2^-r`). The Quotient measured FPR typically
+ * lands BELOW its configured target because r is byte-aligned UP -- the measure-vs-
+ * configured honesty hook. The `k` column is Bloom's hash count / the Quotient's remainder
+ * width r. `add ns` rises toward the 0.90 load ceiling as clusters lengthen.
+ */
+function printQuotientTable(bloomRows, qfRows, cap, fpp) {
+    process.stdout.write(
+        "@zakkster/lite-filter v" + VERSION + " -- Bloom vs Quotient (cap=" + cap +
+        ", target fpp=" + fpp + ")\n" +
+        "A Quotient stores a remainder + 3 metadata bits per slot (linear probing); its FPR\n" +
+        "is remainder-quantized to load*2^-r, typically UNDER target. It DELETES, MERGES and\n" +
+        "RESIZES; add() is fail-closed at the 0.90 load ceiling (decisions/0016).\n\n");
+    process.stdout.write(
+        pad("workload", 12) + pad("Bl b/item", 11) + pad("Qf b/item", 11) +
+        pad("Bloom FPR", 12) + pad("Qtnt FPR", 12) + pad("Qf theoFPR", 12) +
+        pad("Bl add", 9) + pad("Qf add", 9) + pad("added", 9) + "\n");
+    for (let i = 0; i < bloomRows.length; i++) {
+        const bl = bloomRows[i];
+        const qf = qfRows[i];
+        process.stdout.write(
+            pad(bl.name, 12) +
+            pad(bl.bitsPerItem.toFixed(2), 11) +
+            pad(qf.bitsPerItem.toFixed(2), 11) +
+            pad(bl.measuredFpr.toFixed(5), 12) +
+            pad(qf.measuredFpr.toFixed(5), 12) +
+            pad(qf.theoretical.toFixed(5), 12) +
+            pad(bl.addNs.toFixed(1), 9) +
+            pad(qf.addNs.toFixed(1), 9) +
+            pad(qf.added + (qf.overflowed ? "*" : ""), 9) + "\n");
+    }
+    process.stdout.write(
+        "\n* = add() hit the fail-closed 0.90 load ceiling (decisions/0016); metrics are over\n" +
+        "the keys that landed. The Quotient deletes (remove -> boolean), merges and resizes;\n" +
+        "its FPR is remainder-quantized by the byte-aligned width -- MEASURE your own keys.\n\n");
+}
+
 // Runnable entry: `node benchmark/Bench.mjs`.
 if (import.meta.url === "file://" + process.argv[1] ||
     import.meta.url === new URL("file://" + process.argv[1]).href) {
@@ -521,4 +630,5 @@ if (import.meta.url === "file://" + process.argv[1] ||
     printCountingTable(runBenchCounting({ cap, fpp }), measureRemove(cap, fpp, 0xC0FFEE ^ 0x44), cap, fpp);
     printBlockedTable(bloomRows, runBenchBlocked({ cap, fpp }), cap, fpp);
     printCuckooTable(bloomRows, runBenchCuckoo({ cap, fpp }), cap, fpp);
+    printQuotientTable(bloomRows, runBenchQuotient({ cap, fpp }), cap, fpp);
 }

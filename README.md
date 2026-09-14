@@ -1,6 +1,6 @@
 # @zakkster/lite-filter
 
-> A zero-GC approximate-membership filter FAMILY under one `LiteFilter<K>` surface: `Bloom` (the add-only reference), `CountingBloom` (deletable, ~4x space), `BlockedBloom` (one cache miss per query, at a higher measured FPR), and `Cuckoo` (deletable, fingerprint-based, fail-closed at capacity) ship today, with the space-optimal and mergeable static members (Quotient, XOR, Binary Fuse) to come -- one-line swappable, tree-shakeable to a single filter, with a shipped bench that measures ACTUAL vs THEORETICAL false-positive rate on your own keys instead of trusting a formula.
+> A zero-GC approximate-membership filter FAMILY under one `LiteFilter<K>` surface: `Bloom` (the add-only reference), `CountingBloom` (deletable, ~4x space), `BlockedBloom` (one cache miss per query, at a higher measured FPR), `Cuckoo` (deletable, fingerprint-based, fail-closed at capacity), and `Quotient` (deletable, mergeable + resizable, fail-closed at the load ceiling) ship today, with the space-optimal static members (XOR, Binary Fuse) to come -- one-line swappable, tree-shakeable to a single filter, with a shipped bench that measures ACTUAL vs THEORETICAL false-positive rate on your own keys instead of trusting a formula.
 
 [![npm version](https://img.shields.io/npm/v/@zakkster/lite-filter.svg?style=for-the-badge&color=latest)](https://www.npmjs.com/package/@zakkster/lite-filter)
 [![sponsor](https://img.shields.io/badge/sponsor-PeshoVurtoleta-ea4aaa.svg?logo=github)](https://github.com/sponsors/PeshoVurtoleta)
@@ -38,7 +38,7 @@ seen.size;                      // 2     -- adds recorded
 seen.fpp();                     // the fill-derived FPR estimate (a formula, not a measurement)
 ```
 
-One `LiteFilter<K>` surface, `add`/`mightContain`/`has`/`size`/`capacity`/`fpp`/`clear`, zero allocation on every hot path after construction. Integer keys opt into a strict-zero-alloc backing. `Bloom`, `CountingBloom`, `BlockedBloom`, and `Cuckoo` are shipped named exports today; the remaining static members (Quotient, XOR, Binary Fuse) ship as further named exports (`sideEffects: false` drops whichever you do not import).
+One `LiteFilter<K>` surface, `add`/`mightContain`/`has`/`size`/`capacity`/`fpp`/`clear`, zero allocation on every hot path after construction. Integer keys opt into a strict-zero-alloc backing. `Bloom`, `CountingBloom`, `BlockedBloom`, `Cuckoo`, and `Quotient` are shipped named exports today; the remaining static members (XOR, Binary Fuse) ship as further named exports (`sideEffects: false` drops whichever you do not import).
 
 Then measure, do not guess:
 
@@ -57,6 +57,7 @@ npm run bench     # measured vs theoretical FPR (% over), bits/item, add/query n
   - [CountingBloom -- the deletable member](#the-members)
   - [BlockedBloom -- the cache-local member](#the-members)
   - [Cuckoo -- the fingerprint member](#the-members)
+  - [Quotient -- the mergeable + resizable member](#the-members)
 - [API reference](#api-reference)
   - [Construction](#construction)
   - [The surface](#the-surface)
@@ -143,9 +144,11 @@ so `remove()` throws (use `CountingBloom` when you need deletes).
 | `CountingBloom` | **yes** (`remove -> boolean`) | ~4x Bloom (4-bit counters) | SHIPPED (v0.2.0) | `import { CountingBloom } from '@zakkster/lite-filter'` |
 | `BlockedBloom` | no (`remove` throws) | 1x Bloom (one 512-bit cache line per key) | SHIPPED (v0.3.0) | `import { BlockedBloom } from '@zakkster/lite-filter'` |
 | `Cuckoo` | **yes** (`remove -> boolean`) | ~2x Bloom at fpp 0.01 (byte-aligned fingerprints) | SHIPPED (v0.4.0) | `import { Cuckoo } from '@zakkster/lite-filter'` |
+| `Quotient` | **yes** (`remove -> boolean`; also `merge` + `resize`) | ~23 bits/item at fpp 0.01 (byte-aligned slot words + guard) | SHIPPED (v0.5.0) | `import { Quotient } from '@zakkster/lite-filter'` |
 
-All four implement the same `LiteFilter<K>` surface, so a member is a one-line
-constructor swap; the only surface difference is `remove` (member-specific).
+All five implement the same `LiteFilter<K>` surface, so a member is a one-line
+constructor swap; the only surface differences are `remove` (member-specific) and
+`Quotient`'s extra `merge` / `resize` cold paths.
 
 <details>
 <summary>CountingBloom -- the deletable member (and its two honest caveats)</summary>
@@ -251,6 +254,64 @@ bench` prints Bloom vs Cuckoo side by side so the byte-align quantization is vis
 
 </details>
 
+<details>
+<summary>Quotient -- the mergeable + resizable member (deletable, fail-closed at the load ceiling)</summary>
+
+`Quotient` (Bender et al., VLDB 2012) is ONE open-addressed LINEAR slot array
+(decisions/0016). A key's 32-bit hash splits into a QUOTIENT (the home slot index, high
+bits) and a REMAINDER (stored, low `r` bits); same-home keys form a RUN, adjacent runs a
+CLUSTER under linear probing, encoded by 3 METADATA bits per slot -- `is_occupied`,
+`is_continuation`, `is_shifted` -- packed in the low 3 bits of each byte-aligned word
+(remainder in the high bits: `word = (remainder << 3) | metadata`). A slot is EMPTY iff all
+three metadata bits are 0 (remainder 0 is a legal remainder). It DELETES via a real
+`remove(key): boolean`, and -- uniquely in the family so far -- MERGES and RESIZES.
+
+```js
+import { Quotient } from '@zakkster/lite-filter';
+
+const f = new Quotient(100000, { fpp: 0.01, keys: 'int' });
+f.add(42);
+f.remove(42);            // true  -- a real delete; false if the key is absent
+f.resize(400000);        // grow (or shrink); membership + size preserved, no keys needed
+f.merge(other);          // union with an identically-configured Quotient (exact additive size)
+```
+
+`remove` repairs the metadata by REBUILDING the affected cluster through the verified insert
+path (collect the surviving `(home, remainder)` pairs, clear, re-insert), so the shift-back
+repair is correct by construction -- not a bespoke bit fixup. The cluster scratch is
+preallocated, so `remove` is zero-allocation.
+
+`merge` and `resize` are COLD paths (they may allocate; the hot paths stay zero-alloc). Both
+reconstruct each element's identity as `(quotient << r) | remainder` -- WITHOUT the original
+keys -- because the fingerprint bit budget `p = q0 + r` is FIXED for the filter's lifetime.
+Both grow and shrink preserve membership (0 false negatives) and exact size. The honest
+limit: the discarded high hash bits cannot be recovered, so a quotient never carries more
+than `q0` bits of entropy -- resizing LARGER adds empty headroom (lower load) but not new
+quotient entropy. `merge` rejects fail-closed unless the other filter's `seed`, `r`, `p`, and
+keys mode all match.
+
+Two honest edges, both surfaced, never hidden:
+
+- **Fail-closed at the load ceiling** (decisions/0016). `add` THROWS a `[lite-filter]` Error
+  when occupancy would exceed `floor(0.90 * nslots)` OR the linear cluster shift would run
+  off the end -- both checked BEFORE any write, so a thrown `add` is a BYTE-IDENTICAL no-op
+  (no already-added key is dropped). A Quotient stores MULTIPLICITY (it does not dedup, like
+  Cuckoo), so a duplicate-heavy stream fills toward the ceiling and fails closed, never a
+  silent drop. Headroom is observable via `size` vs `capacity`.
+- **Only remove keys you inserted** (decisions/0017). Deleting a NEVER-INSERTED key whose
+  `(quotient, remainder)` collides with a real key clears that other key's slot -> a later
+  **false negative** for it (a constructed non-vacuous example is in decisions/0017).
+
+**The measure-vs-configured hook.** The remainder width is `r = ceil(log2(1/fpp))`, and the
+slot word is `r + 3` bits byte-aligned to a `Uint8Array` (r <= 5) or `Uint16Array` (r 6..13).
+At `fpp = 0.01`, `r = 7`, so the delivered FPR is the remainder-quantized `load * 2^-r` --
+BELOW the configured 0.01 (measured ~0.0060 at ~0.55 load), at ~23 bits/item (16-bit slot
+words + guard). `fpp()` reports that quantized rate once non-empty; `npm run bench` prints
+Bloom vs Quotient side by side. Below `fpp = 1/2^13 (~0.000122)` the slot word would exceed
+16 bits and construction throws; a `q + r` budget past the 32-bit base hash also throws.
+
+</details>
+
 ## API reference
 
 ### Construction
@@ -276,7 +337,8 @@ a bit count that would overflow a safe typed-array length; an unknown `keys` or
 | `add(key)` | `void` | Record a key. Zero-alloc on int + string keys. |
 | `mightContain(key)` | `boolean` | The query. NO false negatives; false positives bounded by `fpp`. |
 | `has(key)` | `boolean` | The sole alias of `mightContain`, same semantics. |
-| `remove(key)` | `never` / `boolean` | **Bloom** + **BlockedBloom**: add-only, **throw** `[lite-filter]`. **CountingBloom** + **Cuckoo**: a real delete, returns `boolean` (member-specific). |
+| `remove(key)` | `never` / `boolean` | **Bloom** + **BlockedBloom**: add-only, **throw** `[lite-filter]`. **CountingBloom** + **Cuckoo** + **Quotient**: a real delete, returns `boolean` (member-specific). |
+| `resize(n)` / `merge(other)` | `Quotient` | **Quotient only**: cold-path rebuild (grow/shrink) and union with an identical filter; preserve membership. |
 | `size` / `count` | `number` | Adds recorded (a plain counter, not a distinct-key count). |
 | `capacity` | `number` | The item count the filter was sized for. |
 | `fpp()` | `number` | Configured target while empty, else the fill-derived estimate. |
@@ -335,11 +397,12 @@ const rows = runBench({ cap: 100000, fpp: 0.01 });
 
 | Export | Meaning |
 | --- | --- |
-| `VERSION` | the package version string (`"0.4.0"`) |
+| `VERSION` | the package version string (`"0.5.0"`) |
 | `Bloom` | the reference member (also the default export) |
 | `CountingBloom` | the deletable member (4-bit saturating counters; a real `remove`) |
 | `BlockedBloom` | the cache-local member (one 512-bit block per key; one cache miss per query, at a higher measured FPR) |
 | `Cuckoo` | the fingerprint member (b=4 buckets; deletable, fail-closed at capacity; FPR width-quantized to `2b/2^f`) |
+| `Quotient` | the mergeable + resizable member (linear quotient filter; deletable, fail-closed at the 0.90 load ceiling; FPR remainder-quantized to `load * 2^-r`) |
 
 ## Composability
 
@@ -405,8 +468,13 @@ honest ceiling (**<= 0.0175**) that is PROVEN to run OVER the plain-Bloom theory
 (decisions/0013). Cuckoo `add` / `mightContain` / `remove` on `keys:'int'` are also
 **0 scavenges** at N and 8N (two-bucket b=4 scan, a single scalar victim register on kicks,
 no scratch array), with a width-quantized measured FPR **<= 0.0090** (~0.0061, under the
-configured 0.01 -- decisions/0014) and a PROVEN fail-closed overload throw. ns/op figures
-are machine-local -- run `npm run bench`.
+configured 0.01 -- decisions/0014) and a PROVEN fail-closed overload throw. Quotient `add` /
+`mightContain` / `remove` on `keys:'int'` are also **0 scavenges** at N and 8N (linear-probe
+split + shift, preallocated cluster scratch on remove), with a remainder-quantized measured
+FPR **<= 0.0090** (~0.0060, under the configured 0.01 -- decisions/0016), resize + merge
+round-trips at **0 false negatives** with preserved/additive size, and a PROVEN fail-closed
+load-ceiling throw that is a byte-identical no-op. ns/op figures are machine-local -- run
+`npm run bench`.
 
 </details>
 
@@ -451,6 +519,17 @@ are machine-local -- run `npm run bench`.
 - **Cuckoo delete has a sharp caveat** (decisions/0015): removing a NEVER-INSERTED key
   whose fingerprint collides with a real key clears that other key's slot -> a false
   negative for it. Only remove keys you inserted.
+- **Quotient is a LINEAR quotient filter with a fixed bit budget** (decisions/0016):
+  `r = ceil(log2(1/fpp))` remainder bits + 3 metadata bits per byte-aligned slot word,
+  `2^q >= ceil(capacity/0.90)` slots plus GUARD spillover, quotient high / remainder low.
+  `add` is fail-closed at the 0.90 load ceiling (or off the linear end) and is a byte-
+  identical no-op on throw; `remove` rebuilds the affected cluster through the insert path
+  (metadata repair correct by construction); `merge`/`resize` re-split each stored
+  `(quotient, remainder)` under the fixed budget `p = q0 + r` WITHOUT the keys. `fpp()`
+  reports the remainder-quantized `load * 2^-r` -- typically UNDER target.
+- **Quotient delete has the same never-added caveat** (decisions/0017): removing a
+  NEVER-INSERTED key whose `(quotient, remainder)` collides with a real key clears that
+  other key's slot -> a false negative for it. Only remove keys you inserted.
 
 ## Testing
 
@@ -459,19 +538,24 @@ are machine-local -- run `npm run bench`.
 - `npm test` -- the boundary suite: every method, every one-sided law, every
   fail-closed door, plus an ASCII-source guard.
 - `npm run test:types` -- `tsc --noEmit` proves `Bloom`, `CountingBloom`,
-  `BlockedBloom`, and `Cuckoo` satisfy `LiteFilter<K>`, that `CountingBloom.remove` and
-  `Cuckoo.remove` are a real `boolean`, and that `Bloom`/`BlockedBloom` `remove` is `never`.
+  `BlockedBloom`, `Cuckoo`, and `Quotient` satisfy `LiteFilter<K>`, that `CountingBloom`,
+  `Cuckoo`, and `Quotient` `remove` are a real `boolean` (and `Quotient.resize`/`merge`
+  return the filter), and that `Bloom`/`BlockedBloom` `remove` is `never`.
 - `npm run torture` -- `node --expose-gc`: the leak tracker (retention returns to 0)
   + the GC profiler (maxMajor 0) + the Set-differential oracle (no false negatives,
   bounded FPR) + a CountingBloom add/remove churn oracle + a BlockedBloom oracle (0
   false negatives; measured FPR within its honest ceiling AND proven OVER plain-Bloom
   theory) + a Cuckoo oracle (0 false negatives, delete-churn, and a PROVEN fail-closed
-  overload throw) + the `clear()` ArrayBuffer-identity check for all four members.
+  overload throw) + a Quotient oracle (0 false negatives; delete-churn with size==present;
+  resize + merge round-trips; a PROVEN byte-identical fail-closed ceiling throw; and
+  `validateQuotient` structure after churn) + the `clear()` ArrayBuffer-identity check for
+  all five members.
 - `npm run torture:controls` -- the must-fail proof: a broken build MUST fail.
 - `npm run test:perf` -- the `@zakkster/lite-perf-gate` zero-alloc scenarios on
   `keys:'int'` (Bloom add-churn + query-hit; CountingBloom add-churn + query-hit +
   remove-churn; BlockedBloom add-churn + query-hit; Cuckoo add-churn + query-hit +
-  remove-churn), with an allocating mustFail for teeth.
+  remove-churn; Quotient add-churn + query-hit + remove-churn), with an allocating
+  mustFail for teeth.
 - `npm run bench` -- the measurement tool.
 
 ## What this is not

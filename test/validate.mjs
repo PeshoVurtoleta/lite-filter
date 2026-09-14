@@ -261,3 +261,115 @@ export function validateCuckoo(filter) {
             "[validate] Cuckoo nonzero-slot count " + nonzero + " != size " + count);
     }
 }
+
+/**
+ * Assert the CONSERVATION + STRUCTURE invariant for a Quotient filter (test/debug only,
+ * O(nslots)). This is the teeth for the metadata repair the planner flagged as the one
+ * place a subtle bug passes the false-negative tests but breaks structure:
+ *
+ *   store.length === nslots === 2^q                 (the store matches the sizing)
+ *   1 <= r, r + 3 <= 16, every slot word in range   (a valid, byte-aligned layout)
+ *   every remainder <= (1<<r)-1                      (the remainder fits its field)
+ *   an EMPTY slot (metadata 0) carries a 0 remainder (emptiness is carried by metadata)
+ *   (count of slots with any metadata bit set) === size   (each stored element = one slot)
+ *   slot 0 is never is_shifted                       (nothing can be shifted left of 0)
+ *   a cluster's first slot is neither continuation nor shifted (it is a run head at home)
+ *   per cluster: #occupied homes === #runs          (each run maps to exactly one home)
+ *   each run's remainders are non-decreasing         (runs are kept sorted on insert)
+ *
+ * The metadata-set-count === size and the per-cluster #homes === #runs checks are the
+ * ones a shift-back repair bug trips immediately. Throws an Error naming the first
+ * violation, or returns void.
+ */
+export function validateQuotient(filter) {
+    const r = filter._r;
+    const q = filter._q;
+    const nslots = filter._nslots;
+    const len = filter._len;
+    const store = filter._store;
+    const count = filter._count;
+    const rMask = (1 << r) - 1;
+    const OCC = 1, CONT = 2, SHIFT = 4, META = 7;
+
+    if (!(r >= 1) || !(r + 3 <= 16)) {
+        throw new Error("[validate] Quotient remainder width r=" + r + " out of 1..13");
+    }
+    if (!(nslots >= 2) || (nslots & (nslots - 1)) !== 0) {
+        throw new Error("[validate] Quotient nslots=" + nslots + " is not a power of two >= 2");
+    }
+    if (nslots !== Math.pow(2, q)) {
+        throw new Error("[validate] Quotient nslots=" + nslots + " != 2^q=" + Math.pow(2, q));
+    }
+    // The physical store carries GUARD spillover slots beyond nslots (a linear filter,
+    // decisions/0016), so its length is nslots + guard, never just nslots.
+    if (!(len > nslots) || store.length !== len) {
+        throw new Error(
+            "[validate] Quotient store length " + store.length + " != _len=" + len +
+            " (nslots=" + nslots + " + guard)");
+    }
+
+    let metaSet = 0;
+    for (let i = 0; i < len; i++) {
+        const w = store[i];
+        const meta = w & META;
+        const rem = w >>> 3;
+        if (rem < 0 || rem > rMask) {
+            throw new Error("[validate] Quotient slot " + i + " remainder " + rem + " > " + rMask);
+        }
+        if (meta === 0) {
+            if (rem !== 0) {
+                throw new Error(
+                    "[validate] Quotient empty slot " + i + " carries remainder " + rem +
+                    " (an empty slot must be exactly 0)");
+            }
+        } else {
+            metaSet++;
+        }
+    }
+    if (metaSet !== count) {
+        throw new Error(
+            "[validate] Quotient metadata-set slot count " + metaSet + " != size " + count);
+    }
+    if ((store[0] & SHIFT) !== 0) {
+        throw new Error("[validate] Quotient slot 0 is is_shifted (nothing lies left of 0)");
+    }
+
+    // Walk clusters: a cluster is a maximal run of non-empty slots. Its first slot must be a
+    // run head at its home (no continuation, no shifted). Within it, #runs must equal
+    // #occupied homes, and each run's remainders must be non-decreasing.
+    let p = 0;
+    while (p < len) {
+        if ((store[p] & META) === 0) { p++; continue; }
+        const cs = p;
+        let ce = p;
+        while (ce < len && (store[ce] & META) !== 0) ce++;
+        if ((store[cs] & CONT) !== 0) {
+            throw new Error("[validate] Quotient cluster start " + cs + " is a continuation");
+        }
+        if ((store[cs] & SHIFT) !== 0) {
+            throw new Error("[validate] Quotient cluster start " + cs + " is is_shifted");
+        }
+        let homes = 0, runs = 0;
+        let prevRem = -1;
+        for (let i = cs; i < ce; i++) {
+            if (store[i] & OCC) homes++;
+            const isRunStart = (i === cs) || !(store[i] & CONT);
+            if (isRunStart) { runs++; prevRem = store[i] >>> 3; }
+            else {
+                const rem = store[i] >>> 3;
+                if (rem < prevRem) {
+                    throw new Error(
+                        "[validate] Quotient run not sorted at slot " + i + " (" + rem +
+                        " < " + prevRem + ")");
+                }
+                prevRem = rem;
+            }
+        }
+        if (homes !== runs) {
+            throw new Error(
+                "[validate] Quotient cluster [" + cs + "," + ce + ") has " + homes +
+                " occupied homes but " + runs + " runs");
+        }
+        p = ce;
+    }
+}

@@ -52,9 +52,11 @@ async function main() {
         createOwnerCascadeOrphanKernel,
     } = await import("@zakkster/lite-leak");
     const { createRoot, effect, dispose } = await import("@zakkster/lite-signal");
-    const { Bloom, CountingBloom, BlockedBloom, Cuckoo } = await import("../Filter.js");
-    const { validate, validateCounting, validateBlocked, validateCuckoo } = await import("./validate.mjs");
-    const { differentialInt, differentialChurnInt } = await import("./torture/oracle.mjs");
+    const { Bloom, CountingBloom, BlockedBloom, Cuckoo, Quotient } = await import("../Filter.js");
+    const { validate, validateCounting, validateBlocked, validateCuckoo, validateQuotient } =
+        await import("./validate.mjs");
+    const { differentialInt, differentialChurnInt, differentialResizeInt, differentialMergeInt } =
+        await import("./torture/oracle.mjs");
 
     const SEED = (process.env.TORTURE_SEED >>> 0) || 0x1f2e3d4c;
     const BREAK = process.env.LFILTER_TORTURE_BREAK === "1";
@@ -104,6 +106,13 @@ async function main() {
                 c.mightContain(i | 0);
                 c.remove(i | 0);
                 tracker.track(c, () => {}, "cuckoo", { audit: true });
+                // Quotient holds only a Uint8Array|Uint16Array (+ two preallocated scratch
+                // buffers) -- same retention shape. Churn it through the SAME owner scope.
+                const qf = new Quotient(1024, { keys: "int" });
+                qf.add(i | 0);
+                qf.mightContain(i | 0);
+                qf.remove(i | 0);
+                tracker.track(qf, () => {}, "quotient", { audit: true });
             });
             dispose(e); // disposing the owner untracks the filters -> collectable
         }
@@ -132,6 +141,11 @@ async function main() {
     // scratch array). add-then-remove each op keeps the table near-empty so no kick throws.
     const kinst = new Cuckoo(HOT_CAP, { keys: "int" });
     const kbufBefore = kinst._store.buffer;
+    // Quotient steady-state instance: add / mightContain / remove all on the hot path, all
+    // strictly zero-alloc (linear-probe split + shift, preallocated cluster scratch on
+    // remove). add-then-remove each op keeps occupancy near zero so no insert throws.
+    const qinst = new Quotient(HOT_CAP, { keys: "int" });
+    const qbufBefore = qinst._store.buffer;
 
     // The BREAK control: a retained sink the hot loop feeds one fresh object per op,
     // so heapUsed climbs and the major-GC / pause gate rejects the window.
@@ -156,6 +170,11 @@ async function main() {
         kinst.add(i & MASK);
         acc = (acc + (kinst.mightContain(i & MASK) ? 1 : 0)) | 0;
         kinst.remove(i & MASK);
+        // Quotient: add then query then remove the same key so occupancy stays near zero
+        // (no ceiling throw) and all three hot paths run, each zero-alloc on keys:'int'.
+        qinst.add(i & MASK);
+        acc = (acc + (qinst.mightContain(i & MASK) ? 1 : 0)) | 0;
+        qinst.remove(i & MASK);
         if (BREAK) sink.push({ i: i, acc: acc }); // retained: MUST trip the gate
         if ((i & 8191) === 0) {
             gc.sampleHeap(performance.now(), process.memoryUsage().heapUsed);
@@ -175,15 +194,24 @@ async function main() {
     cinst.clear();
     binst.clear();
     kinst.clear();
+    qinst.clear();
     const sameBuffer = inst._words.buffer === bufBefore &&
         cinst._cnts.buffer === cbufBefore &&
         binst._words.buffer === bbufBefore &&
-        kinst._store.buffer === kbufBefore;
+        kinst._store.buffer === kbufBefore &&
+        qinst._store.buffer === qbufBefore;
     validate(inst);
     validateCounting(cinst);
     validateBlocked(binst);
     validateCuckoo(kinst);
+    validateQuotient(qinst);
 
+    // allocPerOp is measured across the phase-2 HOT loop ONLY (heapBefore/heapAfter bracket
+    // that loop, before any merge/resize law runs), so it reflects the genuinely zero-alloc
+    // add/mightContain/remove hot paths. A small nonzero value (single-digit B/op) is
+    // heapUsed sampling noise, NOT cold-path amortization -- the real zero-alloc proof is the
+    // GC profiler (minor=0, major=0 above) and the lite-perf-gate 0-scavenge scenarios. If
+    // this creeps into the tens/hundreds it is a real hot-path regression, not noise.
     const allocPerOp = Math.max(0, Math.round((heapAfter - heapBefore) / HOT));
 
     // ---- phase 3: differential Set oracle ------------------------------------
@@ -270,6 +298,77 @@ async function main() {
         cfLoadOk = !threw && cfLoadFn === 0;
     }
 
+    // ---- Quotient laws (decisions/0016, 0017) --------------------------------
+    // Law 11 (Quotient): 1e6 adds -> exactly 0 false negatives (one-sided; the linear
+    // shift never drops a stored fingerprint below the load ceiling).
+    const qfLaw1 = differentialInt(Quotient, { n: 1000000, fpp: 0.01, probes: 1, seed: SEED });
+    // Law 12 (Quotient): n=1e5, fpp=0.01, 1e6 disjoint probes -> measured FPR within a
+    // ceiling BELOW the configured 0.01 target. The FPR is remainder-quantized to
+    // ~load*2^-r; r = ceil(log2(1/0.01)) = 7 (2^-7 = 0.0078), and load ~0.55 at this fill,
+    // so the measured rate lands well under target -- the measure-vs-configured honesty hook.
+    const qfLaw2 = differentialInt(Quotient, { n: 100000, fpp: 0.01, probes: 1000000, seed: SEED ^ 0x55 });
+    const QF_FPR_LIMIT = 0.0090;   // above the measured rate, below the configured 0.01
+    // Law 13 (Quotient delete): bounded-keyspace add/remove churn mirrored against a Set ->
+    // 0 false negatives for present keys, and net size tracks the present-set. The keyspace
+    // bound keeps the churn under the load ceiling so no add() throws (decisions/0016).
+    const qfChurn = differentialChurnInt(Quotient,
+        { n: 50000, fpp: 0.01, ops: 200000, seed: SEED ^ 0xa5, keyspace: 20000 });
+    // Law 14 (Quotient resize): grow AND shrink round-trips -> 0 false negatives, size
+    // preserved (resize re-inserts every stored fingerprint without the original keys).
+    const qfGrow = differentialResizeInt(Quotient, { n: 50000, fpp: 0.01, seed: SEED ^ 0x77, factor: 4 });
+    const qfShrink = differentialResizeInt(Quotient, { n: 50000, fpp: 0.01, seed: SEED ^ 0x77, factor: 0.6 });
+    const qfResizeFn = qfGrow.falseNegatives + qfShrink.falseNegatives;
+    const qfResizeOk = qfResizeFn === 0 &&
+        qfGrow.sizeAfter === qfGrow.sizeBefore && qfShrink.sizeAfter === qfShrink.sizeBefore;
+    // Law 15 (Quotient merge): disjoint-set merge round-trip -> 0 false negatives + exact
+    // additive size (decisions/0016).
+    const qfMerge = differentialMergeInt(Quotient, { n: 50000, fpp: 0.01, seed: SEED ^ 0xc3 });
+    const qfMergeOk = qfMerge.falseNegatives === 0 && qfMerge.mergedSize === qfMerge.expectedSize;
+    // Law 16 (Quotient ceiling): a small filter filled past the 0.90 ceiling MUST throw a
+    // [lite-filter] Error (fail closed, decisions/0016) -- never a silent drop -- AND the
+    // throw MUST NOT drop a previously-added key AND a thrown add MUST be a byte-identical
+    // no-op (memcmp the store before/after; size unchanged). Proven in-process.
+    let qfCeilingThrew = false;   // the overload raised a [lite-filter] Error
+    let qfCeilingFn = 0;          // false negatives among keys added BEFORE the throw
+    let qfCeilingNoop = false;    // a thrown add left the store byte-identical + size fixed
+    {
+        const full = new Quotient(64, { fpp: 0.01, keys: "int" });
+        const added = [];
+        try {
+            for (let i = 0; i < 200000; i++) { full.add(i); added.push(i); }
+        } catch (e) {
+            qfCeilingThrew = e instanceof Error && /\[lite-filter\]/.test(e.message);
+        }
+        for (let j = 0; j < added.length; j++) if (!full.mightContain(added[j])) qfCeilingFn++;
+        // A thrown add is a byte-identical no-op: memcmp the store + size across the attempt.
+        for (let t = 0; t < 200000; t++) {
+            const beforeStore = full._store.slice();
+            const beforeSize = full.size;
+            try { full.add(1000000 + t); }
+            catch (e) {
+                let identical = full._store.length === beforeStore.length && full.size === beforeSize;
+                for (let z = 0; identical && z < beforeStore.length; z++) {
+                    if (full._store[z] !== beforeStore[z]) identical = false;
+                }
+                qfCeilingNoop = identical;
+                break;
+            }
+        }
+        // Law 16b: cluster/metadata integrity survives churn -> validateQuotient passes.
+        validateQuotient(full);
+    }
+    // Law 16c: validate structure after the churn filter too (the shift-back repair proof).
+    {
+        const vq = new Quotient(20000, { fpp: 0.01, keys: "int", seed: SEED });
+        const rng = (function (seed) { let x = seed >>> 0 || 1; return function () { x ^= x << 13; x >>>= 0; x ^= x >> 17; x ^= x << 5; x >>>= 0; return x >>> 0; }; })(SEED ^ 0x1234);
+        const live = new Set();
+        for (let i = 0; i < 200000; i++) {
+            const k = rng() % 8000;
+            if (live.has(k)) { vq.remove(k); live.delete(k); } else { vq.add(k); live.add(k); }
+        }
+        validateQuotient(vq);
+    }
+
     // ---- verdict --------------------------------------------------------------
     const oracleOk =
         law1.falseNegatives === 0 &&
@@ -289,7 +388,17 @@ async function main() {
         cfOverload === true &&
         cfOverloadFn === 0 &&
         cfOverloadNoop === true &&
-        cfLoadOk === true;
+        cfLoadOk === true &&
+        qfLaw1.falseNegatives === 0 &&
+        qfLaw2.falseNegatives === 0 &&
+        qfLaw2.fpr <= QF_FPR_LIMIT &&
+        qfChurn.falseNegatives === 0 &&
+        qfChurn.present === qfChurn.filterSize &&
+        qfResizeOk === true &&
+        qfMergeOk === true &&
+        qfCeilingThrew === true &&
+        qfCeilingFn === 0 &&
+        qfCeilingNoop === true;
     const ok =
         report.ok &&
         live === 0 &&
@@ -320,6 +429,13 @@ async function main() {
         " overload=" + cfOverload + " overloadFn=" + cfOverloadFn +
         " overloadNoop=" + cfOverloadNoop +
         " load=" + cfLoadFrac.toFixed(3) + " loadOk=" + cfLoadOk +
+        " | qf fn=" + (qfLaw1.falseNegatives + qfLaw2.falseNegatives) +
+        " fpr=" + qfLaw2.fpr.toFixed(5) + " ceiling=" + QF_FPR_LIMIT.toFixed(5) +
+        " churnFn=" + qfChurn.falseNegatives +
+        " present=" + qfChurn.present + " size=" + qfChurn.filterSize +
+        " resizeFn=" + qfResizeFn + " mergeFn=" + qfMerge.falseNegatives +
+        " mergeSize=" + qfMerge.mergedSize + "/" + qfMerge.expectedSize +
+        " ceilingThrew=" + qfCeilingThrew + " ceilingNoop=" + qfCeilingNoop +
         " clearReuse=" + sameBuffer +
         " | " + (ok ? "ok" : "FAIL") + "\n");
 
@@ -351,6 +467,25 @@ async function main() {
         if (!cfLoadOk)
             process.stderr.write("  Cuckoo could not reach 90% load (fn=" + cfLoadFn + ", load=" +
                 cfLoadFrac.toFixed(3) + ") -- degraded kick-slot pick (decisions/0014)\n");
+        if (qfLaw1.falseNegatives + qfLaw2.falseNegatives + qfChurn.falseNegatives > 0)
+            process.stderr.write("  Quotient FALSE NEGATIVE -- the one-sided guarantee is void\n");
+        if (qfChurn.present !== qfChurn.filterSize)
+            process.stderr.write("  Quotient size " + qfChurn.filterSize + " != present " + qfChurn.present + "\n");
+        if (qfLaw2.fpr > QF_FPR_LIMIT)
+            process.stderr.write("  Quotient FPR " + qfLaw2.fpr.toFixed(5) + " over limit " + QF_FPR_LIMIT + "\n");
+        if (!qfResizeOk)
+            process.stderr.write("  Quotient resize round-trip broke membership/size (grow fn=" +
+                qfGrow.falseNegatives + " shrink fn=" + qfShrink.falseNegatives + ")\n");
+        if (!qfMergeOk)
+            process.stderr.write("  Quotient merge round-trip broke membership/size (fn=" +
+                qfMerge.falseNegatives + " size=" + qfMerge.mergedSize + "/" + qfMerge.expectedSize + ")\n");
+        if (!qfCeilingThrew)
+            process.stderr.write("  Quotient ceiling did NOT throw -- fail-closed door broken (decisions/0016)\n");
+        if (qfCeilingFn > 0)
+            process.stderr.write("  Quotient ceiling DROPPED " + qfCeilingFn +
+                " already-added key(s) -- FALSE NEGATIVE on overload (decisions/0016)\n");
+        if (!qfCeilingNoop)
+            process.stderr.write("  Quotient thrown add was NOT a byte-identical no-op\n");
         if (law2.fpr > FPR_LIMIT)
             process.stderr.write("  FPR " + law2.fpr.toFixed(5) + " over limit " + FPR_LIMIT + "\n");
         if (bbLaw2.fpr > BB_FPR_LIMIT)
