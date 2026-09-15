@@ -287,3 +287,101 @@ export const RENDERERS = {
 /** The members this module renders. Demo.test.mjs asserts this covers every engine
  *  member (no member silently unrendered). */
 export const RENDERED_MEMBERS = Object.keys(RENDERERS);
+
+/* ------------------------ peel / construction ---------------------------- *
+ * Session B: the CONSTRUCTION animation for the two STATIC members. This renderer
+ * consumes the FROZEN frame model produced by demo/peel.mjs (a re-derivation proven
+ * byte-for-byte against the shipped fingerprints -- see peel.mjs). It is PURE and imports
+ * nothing; peel.mjs owns the derivation + the faithfulness verification, this owns only
+ * the pixels. It surfaces the faithfulness result in-panel so the claim is never silent.
+ * -------------------------------------------------------------------------- */
+
+/** The static members this construction renderer draws (their dump() `mem` tags). */
+export const PEEL_MEMBERS = Object.freeze(['Xor', 'BinaryFuse']);
+
+const PEEL_COL = {
+    empty: '#0b1f16',    // deg 0, not yet lit
+    active: '#1f6f4b',   // deg > 1 (still in the core)
+    peelable: '#ffcf5a', // deg === 1 (about to peel)
+    lit: '#37e08a',      // assigned a fingerprint (reverse-peel)
+    cursor: '#eafff2',   // the vertex acted on this frame
+    label: '#9fe3bf',
+    dim: '#7fa591',
+    ok: '#37e08a',
+};
+
+/** Human-readable one-liner for a stage code. */
+function peelStageText(stage) {
+    if (stage === 'graph') return 'build the 3-uniform hypergraph (edge = key, 3 slots)';
+    if (stage === 'peel') return 'peel: remove a degree-1 vertex onto the stack';
+    if (stage === 'assign') return 'reverse-assign: light each slot so its edge XORs to its fingerprint';
+    return String(stage);
+}
+
+/**
+ * Draw ONE construction frame of `model.frames[frameIdx]` into `geom` ({x,y,w,h}). Cells
+ * are the store slots (vertices), laid out in `model.layout` rows x cols. A cell is tinted
+ * by its role in this frame: empty / active (in the core) / peelable (degree 1) / lit
+ * (assigned). The vertex acted on this frame is outlined. A header reports the stage, the
+ * stack progress, the reseed attempt, and the LIVE faithfulness verdict. Occupancy of the
+ * derived structure only -- the derivation itself is proven in peel.mjs. Browser-only
+ * (needs a CanvasRenderingContext2D).
+ */
+export function drawPeel(g, model, frameIdx, geom) {
+    // Fail closed on a missing / malformed model (caller shows the "building..." fallback).
+    if (model === null || typeof model !== 'object' || !Array.isArray(model.frames) || model.frames.length === 0) {
+        g.fillStyle = PEEL_COL.dim;
+        g.font = '13px ui-monospace, monospace';
+        g.fillText('construction data unavailable', geom.x, geom.y + 28);
+        return;
+    }
+    const nFrames = model.frames.length;
+    let idx = frameIdx | 0;
+    if (idx < 0) idx = 0;
+    if (idx >= nFrames) idx = nFrames - 1;
+    const frame = model.frames[idx];
+
+    const rows = model.layout.rows, cols = model.layout.cols;
+    const deg = frame.deg, lit = frame.lit;
+
+    // Header lines.
+    g.fillStyle = PEEL_COL.label;
+    g.font = '12px ui-monospace, monospace';
+    g.fillText(model.member + '  ' + peelStageText(frame.stage), geom.x, geom.y + 12);
+    g.fillStyle = PEEL_COL.dim;
+    g.fillText('stack ' + frame.stackTop + ' / ' + model.n +
+        '  reseed attempt ' + frame.attempt +
+        '  frame ' + (idx + 1) + ' / ' + nFrames, geom.x, geom.y + 28);
+    g.fillStyle = model.verified ? PEEL_COL.ok : '#ff6a6a';
+    g.fillText(model.verified
+        ? 'verified: reproduces the exact fingerprints'
+        : 'UNVERIFIED', geom.x, geom.y + 44);
+
+    // Slot grid.
+    const gridY = geom.y + 54;
+    const gridH = geom.h - 64;
+    const cw = geom.w / cols;
+    const ch = gridH / rows;
+    for (let v = 0; v < rows * cols; v++) {
+        const r = (v / cols) | 0;
+        const c = v % cols;
+        const cx = geom.x + c * cw;
+        const cy = gridY + r * ch;
+        let col;
+        if (lit[v]) col = PEEL_COL.lit;
+        else if (deg[v] === 1) col = PEEL_COL.peelable;
+        else if (deg[v] > 1) col = PEEL_COL.active;
+        else col = PEEL_COL.empty;
+        g.fillStyle = col;
+        g.fillRect(cx + 0.5, cy + 0.5, cw - 1, ch - 1);
+    }
+    // Outline the vertex acted on this frame.
+    if (frame.cursor !== null) {
+        const v = frame.cursor.v;
+        const r = (v / cols) | 0;
+        const c = v % cols;
+        g.strokeStyle = PEEL_COL.cursor;
+        g.lineWidth = 2;
+        g.strokeRect(geom.x + c * cw + 1, gridY + r * ch + 1, cw - 2, ch - 2);
+    }
+}

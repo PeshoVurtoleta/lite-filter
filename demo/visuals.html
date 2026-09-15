@@ -49,6 +49,7 @@
     cursor: pointer;
   }
   button.on { background: #113355; border-color: #4466ff; color: #bcd0ff; }
+  .cbtn { font-size: 0.72rem; margin-left: 0.5rem; }
   @media (hover: hover) {
     button:hover { background: #17301f; }
     button.on:hover { background: #16305a; }
@@ -133,7 +134,8 @@ import {
   createEngine, step, frameModel, renderSummary, MEMBER_NAMES, MEMBER_DEFS,
   PHASE_BUILD, fetchWorkload,
 } from './Visualize.mjs';
-import { RENDERERS } from './renderers.mjs';
+import { RENDERERS, drawPeel, PEEL_MEMBERS } from './renderers.mjs';
+import { frameModel as peelFrameModel } from './peel.mjs';
 
 // --- element refs cached once at init (lite-law: $-prefixed consts) ----------
 const $kind = document.getElementById('kind');
@@ -154,6 +156,14 @@ const CANVAS_H = 300;
 // Which members are static (drawn "building..." during the BUILD phase).
 const IS_STATIC = {};
 for (let i = 0; i < MEMBER_DEFS.length; i++) IS_STATIC[MEMBER_DEFS[i].name] = MEMBER_DEFS[i].isStatic;
+
+// The two static members can also show the peel/construction animation (Session B). A
+// per-panel "construct" toggle flips a panel into peel mode; the peel loop then animates
+// that panel independently, in place of the live dump render.
+const CAN_PEEL = {};
+for (let i = 0; i < PEEL_MEMBERS.length; i++) CAN_PEEL[PEEL_MEMBERS[i]] = true;
+const PEEL_HOLD = 4;          // hold each frame ~4 rAFs (~15 steps/s at 60Hz)
+const peelState = {};         // name -> { on, idx, hold, model, raf }
 
 // --- initial control values (not hardcoded in HTML) --------------------------
 const DEFAULTS = { kind: 'uniform', seed: 1, n: 5000, fpp: 0.01, speed: 200 };
@@ -180,6 +190,20 @@ for (let i = 0; i < MEMBER_NAMES.length; i++) {
   kd.textContent = IS_STATIC[name] ? 'static (built once)' : 'mutable (incremental add)';
   head.appendChild(nm);
   head.appendChild(kd);
+
+  // Construction toggle for the two static members (Session B peel animation).
+  if (CAN_PEEL[name]) {
+    const cbtn = document.createElement('button');
+    cbtn.className = 'cbtn';
+    cbtn.textContent = 'construct';
+    kd.appendChild(cbtn);
+    // The rAF callback is created ONCE here (a stable ref), not per-frame -- rescheduling
+    // with `requestAnimationFrame(st.tick)` allocates nothing (mirrors loop()).
+    const st = { on: false, idx: 0, hold: 0, model: null, raf: 0, tick: null };
+    st.tick = () => peelTick(name);
+    peelState[name] = st;
+    cbtn.addEventListener('click', () => togglePeel(name, cbtn));
+  }
 
   const cv = document.createElement('canvas');
   cv.width = CANVAS_W;
@@ -229,6 +253,8 @@ function draw() {
 
   for (let i = 0; i < MEMBER_NAMES.length; i++) {
     const name = MEMBER_NAMES[i];
+    // A panel in peel/construction mode is driven by its own loop -- do not clobber it.
+    if (peelState[name] && peelState[name].on) continue;
     const p = panels[name];
     const g = p.ctx;
     g.clearRect(0, 0, CANVAS_W, CANVAS_H);
@@ -263,6 +289,61 @@ function stepMany() {
   let more = true;
   for (let i = 0; i < speed && more; i++) more = step(engine);
   return more;
+}
+
+// --- peel / construction animation (static members) --------------------------
+const PEEL_GEOM = { x: 14, y: 10, w: CANVAS_W - 28, h: CANVAS_H - 20 };
+
+function togglePeel(name, btn) {
+  const st = peelState[name];
+  if (!st.on) {
+    if (st.model === null) {
+      // Fail CLOSED: if the re-derivation cannot be built + verified, stay in live mode.
+      try {
+        st.model = peelFrameModel({ member: name });
+      } catch (err) {
+        $status.textContent = 'construction unavailable for ' + name + ': ' +
+          (err && err.message ? err.message : String(err));
+        return;
+      }
+    }
+    st.on = true; st.idx = 0; st.hold = 0;
+    btn.textContent = 'live';
+    btn.classList.add('on');
+    peelPaint(name);                     // paint frame 0 immediately
+    st.raf = requestAnimationFrame(st.tick);
+  } else {
+    st.on = false;
+    if (st.raf) cancelAnimationFrame(st.raf);
+    st.raf = 0;
+    btn.textContent = 'construct';
+    btn.classList.remove('on');
+    if (engine) draw(); // revert this panel to the live dump render
+  }
+}
+
+// Repaint one static panel's current peel frame. Called ONLY when the frame index actually
+// advances (or on toggle-on) -- never once per rAF, so no canvas repaint or header-string
+// allocation happens while the shown frame is unchanged.
+function peelPaint(name) {
+  const st = peelState[name];
+  const g = panels[name].ctx;
+  g.clearRect(0, 0, CANVAS_W, CANVAS_H);
+  g.fillStyle = '#04120c';
+  g.fillRect(0, 0, CANVAS_W, CANVAS_H);
+  drawPeel(g, st.model, st.idx, PEEL_GEOM);
+}
+
+function peelTick(name) {
+  const st = peelState[name];
+  if (!st.on) return;
+  st.hold++;
+  if (st.hold >= PEEL_HOLD) {
+    st.hold = 0;
+    st.idx = (st.idx + 1) % st.model.frames.length;
+    peelPaint(name);                     // repaint ONLY on a real frame advance
+  }
+  st.raf = requestAnimationFrame(st.tick); // stable ref -- zero per-frame allocation
 }
 
 function loop(now) {

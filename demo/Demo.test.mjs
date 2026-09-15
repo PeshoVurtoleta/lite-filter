@@ -15,13 +15,18 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
 import { uniform, zipfian, sequential, adversarial } from '../benchmark/Bench.mjs';
+import { XorFilter, BinaryFuse } from '../Filter.js';
 import {
     createEngine, step, runToEnd, frameModel, summary, renderSummary, memBits,
     MEMBER_NAMES, MEMBER_DEFS, MUTABLE_COUNT, PHASE_BUILD, PHASE_PROBE,
     fetchWorkload, WORKLOAD_SERVER_HINT,
 } from './Visualize.mjs';
-import { RENDERERS, RENDERED_MEMBERS, BASE_FIELDS } from './renderers.mjs';
+import { RENDERERS, RENDERED_MEMBERS, BASE_FIELDS, drawPeel, PEEL_MEMBERS } from './renderers.mjs';
 import { serveWorkload, handle, DEFAULT_PORT } from './serve.mjs';
+import {
+    derivePeel, frameModel as peelFrameModel, peelCore, shippedFp,
+    GEOM_XOR, GEOM_BF, demoKeys, PEEL_N, PEEL_SEED, PEEL_FPP,
+} from './peel.mjs';
 
 // Dev-only peers (already devDependencies of this package -- the torture-harness
 // skill's own tools). Used ONLY by the gated assertion-4c/5c tests below; both skip
@@ -727,4 +732,268 @@ test('WORKLOAD_SERVER_HINT is ASCII-only and names the command, the URL (8017), 
     assert.match(WORKLOAD_SERVER_HINT, /npm run demo:serve/);
     assert.match(WORKLOAD_SERVER_HINT, /http:\/\/localhost:8017\//);
     assert.match(WORKLOAD_SERVER_HINT, /dynamic route/);
+});
+
+/* ==========================================================================
+ * Session B -- the peel / construction animation for the two STATIC members.
+ * The animation RE-DERIVES the shipped construction (peel.mjs) because the real
+ * peel stack is local + discarded and the hash primitives are unexported. These
+ * tests are the honesty teeth: they prove the re-derivation reproduces the
+ * shipped fingerprints EXACTLY, that the peel invariants hold, that it is
+ * deterministic, and that it fails CLOSED on an unpeelable set.
+ * ========================================================================== */
+
+// The reseed rule, mirrored from peel.mjs / Filter.js: seed ^ (attempt * 0x9e3779b1).
+function attemptSeed(baseSeed, attempt) {
+    return (baseSeed ^ Math.imul(attempt, 0x9e3779b1)) >>> 0;
+}
+
+// The shipped chosen seed for (keys, fpp, seed, member) -- dump().seed reveals which
+// reseed attempt Filter.js actually landed on.
+function shippedSeed(keys, fpp, seed, member) {
+    const opts = { fpp, seed: seed >>> 0, keys: 'int', stats: true };
+    const inst = member === 'Xor' ? XorFilter.from(keys, opts) : BinaryFuse.from(keys, opts);
+    return inst.dump().seed;
+}
+
+test('Session B assertion 1: re-derived peel reproduces the shipped fp EXACTLY (4/4: {Xor,BinaryFuse} x {48,2000}) and picks the SAME attempt', () => {
+    let exact = 0;
+    for (const member of PEEL_MEMBERS) {
+        for (const n of [48, 2000]) {
+            const keys = demoKeys(n);
+            const derived = derivePeel({ keys, fpp: PEEL_FPP, seed: PEEL_SEED, member, withFrames: false });
+            const shipped = shippedFp(keys, PEEL_FPP, PEEL_SEED, member);
+            // (a) SAME successful reseed attempt: the derived attempt-seed must equal the
+            // seed the shipped filter actually built with.
+            const wantSeed = shippedSeed(keys, PEEL_FPP, PEEL_SEED, member);
+            assert.equal(attemptSeed(PEEL_SEED, derived.attempt), wantSeed,
+                member + ' n=' + n + ' must pick the SAME reseed attempt as the shipped build');
+            // (b) byte-exact fingerprint array.
+            assert.deepStrictEqual(derived.fp, shipped,
+                member + ' n=' + n + ' re-derived fp must deep-equal the shipped dump().fp');
+            exact++;
+        }
+    }
+    assert.equal(exact, 4, 'all 4 (member x n) faithfulness cases must pass');
+});
+
+test('Session B: frameModel VERIFIES live (returns verified:true), is frozen, and layout tiles the store', () => {
+    for (const member of PEEL_MEMBERS) {
+        const model = peelFrameModel({ member });
+        assert.equal(model.verified, true, member + ' frameModel must be live-verified');
+        assert.equal(model.member, member);
+        assert.equal(model.n, PEEL_N);
+        assert.ok(Object.isFrozen(model), member + ' model must be frozen');
+        assert.ok(Object.isFrozen(model.frames), member + ' frames must be frozen');
+        assert.equal(model.layout.rows * model.layout.cols, model.m,
+            member + ' layout rows*cols must equal the store size m');
+    }
+});
+
+test('Session B assertion 2: peel invariants -- sp === n, 3n incidences, every vertex lit exactly once', () => {
+    for (const member of PEEL_MEMBERS) {
+        const n = PEEL_N;
+        const model = peelFrameModel({ member });
+        const frames = model.frames;
+
+        const graph = frames.find((f) => f.stage === 'graph');
+        const peel = frames.filter((f) => f.stage === 'peel');
+        const assign = frames.filter((f) => f.stage === 'assign');
+
+        // A complete peel: exactly n peel steps and n assign steps (sp === n).
+        assert.equal(peel.length, n, member + ' must have exactly n peel frames (complete peel, sp === n)');
+        assert.equal(assign.length, n, member + ' must have exactly n assign frames');
+        assert.equal(frames.length, 1 + 2 * n, member + ' frame count = 1 graph + n peel + n assign');
+
+        // 3n incidences: the initial degree sum over all vertices is 3 per edge.
+        let degSum = 0;
+        for (let v = 0; v < graph.deg.length; v++) degSum += graph.deg[v];
+        assert.equal(degSum, 3 * n, member + ' initial incidence count must be 3n');
+
+        // Every vertex lit EXACTLY once: each assign frame lights exactly one new slot, and
+        // the final lit vector has exactly n ones (n distinct owned slots).
+        let prevOnes = 0;
+        for (let i = 0; i < assign.length; i++) {
+            let ones = 0;
+            const lit = assign[i].lit;
+            for (let v = 0; v < lit.length; v++) ones += lit[v] ? 1 : 0;
+            assert.equal(ones, prevOnes + 1, member + ' assign frame ' + i + ' must light exactly one new slot');
+            // The slot lit this frame is the cursor vertex, and it was NOT lit before.
+            const cur = assign[i].cursor;
+            assert.ok(cur !== null, member + ' assign frame must name the slot it lit');
+            assert.equal(lit[cur.v], 1, member + ' the cursor slot must be lit this frame');
+            prevOnes = ones;
+        }
+        assert.equal(prevOnes, n, member + ' exactly n slots must be lit in total');
+    }
+});
+
+test('Session B assertion 3: determinism -- two frameModel runs produce byte-identical frames', () => {
+    for (const member of PEEL_MEMBERS) {
+        const a = peelFrameModel({ member });
+        const b = peelFrameModel({ member });
+        assert.deepStrictEqual(a.frames, b.frames, member + ' frames must be byte-identical across runs');
+        assert.equal(a.attempt, b.attempt, member + ' attempt must be deterministic');
+        // derivePeel (frameless) is deterministic too.
+        const da = derivePeel({ keys: demoKeys(64), fpp: PEEL_FPP, seed: PEEL_SEED, member, withFrames: false });
+        const db = derivePeel({ keys: demoKeys(64), fpp: PEEL_FPP, seed: PEEL_SEED, member, withFrames: false });
+        assert.deepStrictEqual(da.fp, db.fp, member + ' frameless fp must be deterministic');
+    }
+});
+
+test('Session B: peelCore returns null on a partial peel (fail-OPEN guard, never assigns from a short stack)', () => {
+    // A pathological geometry that maps EVERY edge to the same 3 slots: with n >= 2 edges
+    // no vertex ever reaches degree 1, so the peel stalls at sp === 0 (a 2-core survives).
+    // peelCore must return null, NOT a fingerprint array -- that guard is the only thing
+    // between a partial peel and a fail-OPEN filter with silent false negatives.
+    const collapse = {
+        name: 'Xor',
+        dims() { return { m: 3 }; },
+        layout() { return { rows: 1, cols: 3 }; },
+        slots() { return [0, 1, 2]; },
+    };
+    const keys = demoKeys(8);
+    const dims = { m: 3, seed: PEEL_SEED, seed2: 0, fw: 8, attempt: 0, withFrames: false };
+    const built = peelCore(keys, collapse, dims);
+    assert.equal(built, null, 'peelCore must return null on an incomplete peel');
+});
+
+test('Session B assertion 4: derivePeel FAILS CLOSED (throws [demo]) when a set cannot peel in 100 attempts', () => {
+    // The same collapse geometry, driven through derivePeel: every one of the 100 reseeds
+    // yields the same unpeelable structure, so the loop exhausts and throws -- never a
+    // partial build.
+    const collapse = {
+        name: 'Xor',
+        dims() { return { m: 3 }; },
+        layout() { return { rows: 1, cols: 3 }; },
+        slots() { return [0, 1, 2]; },
+    };
+    assert.throws(
+        () => derivePeel({ keys: demoKeys(8), fpp: PEEL_FPP, seed: PEEL_SEED, member: 'Xor', geom: collapse }),
+        (err) => err instanceof Error && /^\[demo\]/.test(err.message) && /exhausted/.test(err.message),
+        'derivePeel must throw an actionable [demo] exhaustion error, never return a partial build');
+});
+
+test('Session B: derivePeel / frameModel fail closed on an unknown member and an empty key set', () => {
+    assert.throws(() => derivePeel({ keys: demoKeys(4), member: 'Nope' }), /unknown member/);
+    assert.throws(() => peelFrameModel({ member: 'Nope' }), /unknown member/);
+    assert.throws(() => derivePeel({ keys: [], member: 'Xor' }), /non-empty/);
+});
+
+test('Session B: derivePeel / frameModel boundary matrix -- opts null/undefined, keys null/undefined, n=1', () => {
+    // opts itself missing or the wrong shape.
+    assert.throws(() => derivePeel(null), /opts must be an object/);
+    assert.throws(() => derivePeel(undefined), /opts must be an object/);
+    assert.throws(() => derivePeel({ keys: null, member: 'Xor' }), /array of int keys/);
+    assert.throws(() => derivePeel({ member: 'Xor' }), /array of int keys/, 'keys undefined must fail closed');
+    // n=1: the smallest legal static filter (one key, one edge, three slots, always peels
+    // in one step since all three slots start at degree 1... unless two of the three slot
+    // triples collide, which the reseed loop then handles). Must not throw and must still
+    // verify against the shipped build.
+    for (const member of PEEL_MEMBERS) {
+        const model = peelFrameModel({ member, n: 1 });
+        assert.equal(model.verified, true, member + ' n=1 must still verify against the shipped fp');
+        assert.equal(model.n, 1);
+    }
+});
+
+test('Session B assertion 5: a NaN int key is REJECTED by the production entry point (frameModel), even though derivePeel alone silently coerces it -- the live faithfulness check is the actual fail-closed backstop; -0 is legitimate (Number.isInteger(-0) is true, same slot as 0) and must NOT be rejected', () => {
+    // peelCore mirrors Filter.js's int-key mixing (`key | 0`) but, unlike Filter.js's own
+    // `add()`/`from()` (which gate on `Number.isInteger(key)` BEFORE mixing), it does not
+    // itself validate the key. `NaN | 0` silently becomes the valid slot index 0, so
+    // derivePeel() called STANDALONE (withFrames only, no verification) does NOT reject a
+    // NaN key -- prove that first, non-vacuously.
+    assert.doesNotThrow(() => derivePeel({ keys: [1, 2, NaN, 4], member: 'Xor', withFrames: false }),
+        'documents the current gap: derivePeel alone does not itself reject a NaN key');
+    // But the actual production surface the renderer calls -- frameModel, which ALWAYS
+    // runs verifyAgainstShipped -- must still fail closed, because Filter.js's own from()
+    // rejects the NaN key with an actionable message (Number.isInteger(NaN) is false),
+    // and that rejection propagates.
+    assert.throws(() => peelFrameModel({ keys: [1, 2, NaN, 4], member: 'Xor' }),
+        /requires a 32-bit signed integer key/,
+        'frameModel must fail closed on a NaN key via the live shipped-fp comparison');
+    // -0, by contrast, IS a legitimate int key (Number.isInteger(-0) === true, and -0|0 ===
+    // 0 === 0|0): Filter.js accepts it as plain 0, so frameModel must NOT reject it, and
+    // the re-derivation must still verify byte-exact against the shipped build.
+    const m0 = peelFrameModel({ keys: [1, 2, -0, 4], member: 'BinaryFuse' });
+    assert.equal(m0.verified, true, '-0 is a legitimate key (same as 0) and must still verify');
+});
+
+test('Session B assertion 5: Symbol/BigInt seed and key inputs must fail closed with a clean, actionable rejection -- never a raw coercion TypeError (the family lesson)', () => {
+    // Filter.js validates its own seed/int-key inputs BEFORE any arithmetic touches them
+    // (`typeof seed !== "number"`, `Number.isInteger(key)`), so a Symbol or BigInt never
+    // reaches a coercing operator and always gets an actionable "[lite-filter] ..." message.
+    // peel.mjs entry points that take keys/options must hold to the same discipline: a
+    // Symbol or BigInt must be rejected with an actionable "[demo] ..." message, not left
+    // to fall through into `>>> 0` / `| 0`, which throw a raw, non-actionable
+    // "Cannot convert a Symbol value to a number" / "Cannot mix BigInt and other types".
+    const ACTIONABLE = (err) => err instanceof Error && /^\[demo\]/.test(err.message);
+    for (const bad of [Symbol('x'), 10n]) {
+        assert.throws(() => derivePeel({ keys: demoKeys(4), member: 'Xor', seed: bad }), ACTIONABLE,
+            'derivePeel({ seed: ' + String(bad) + ' }) must throw an actionable [demo] message');
+        assert.throws(() => derivePeel({ keys: [bad, 1, 2, 3], member: 'Xor' }), ACTIONABLE,
+            'derivePeel({ keys: [' + String(bad) + ', ...] }) must throw an actionable [demo] message');
+        assert.throws(() => peelFrameModel({ member: 'Xor', seed: bad }), ACTIONABLE,
+            'frameModel({ seed: ' + String(bad) + ' }) must throw an actionable [demo] message');
+    }
+});
+
+test('Session B: renderers.mjs (the peel/construction renderer host) has zero imports -- a pure frame consumer, no module dependencies', () => {
+    const src = readFileSync(join(DEMO_DIR, 'renderers.mjs'), 'utf8');
+    assert.ok(src.length > 100, 'renderers.mjs must be nonempty (scan would be vacuous)');
+    assert.ok(!/^\s*import\b/m.test(src), 'renderers.mjs must not import anything (drawPeel consumes a plain frozen model only)');
+});
+
+test('Session B: GEOM slot triples land in-range and in DISTINCT slots (no self-collision)', () => {
+    // XOR: three disjoint segments h0 < bl <= h1 < 2bl <= h2 < 3bl.
+    const dx = GEOM_XOR.dims(48);
+    for (let key = 0; key < 200; key++) {
+        const h = (key * 2654435761) >>> 0, g = (key * 40503 + 7) >>> 0, t = (key ^ 0x5bd1e995) >>> 0;
+        const s = GEOM_XOR.slots(h, g, t, dx);
+        assert.ok(s[0] >= 0 && s[0] < dx.bl, 'xor h0 in seg0');
+        assert.ok(s[1] >= dx.bl && s[1] < 2 * dx.bl, 'xor h1 in seg1');
+        assert.ok(s[2] >= 2 * dx.bl && s[2] < 3 * dx.bl, 'xor h2 in seg2');
+        assert.equal(new Set(s).size, 3, 'xor slots must be distinct');
+    }
+    // BinaryFuse: h0 in [0, scl), h1 one segment up, h2 two -- always in range and distinct.
+    const db = GEOM_BF.dims(48);
+    for (let key = 0; key < 200; key++) {
+        const h = (key * 2654435761) >>> 0, g = (key * 40503 + 7) >>> 0, t = (key ^ 0x5bd1e995) >>> 0;
+        const s = GEOM_BF.slots(h, g, t, db);
+        for (let j = 0; j < 3; j++) assert.ok(s[j] >= 0 && s[j] < db.m, 'bf slot ' + j + ' in range');
+        assert.equal(new Set(s).size, 3, 'bf slots must be distinct');
+    }
+});
+
+test('Session B: drawPeel fails closed (no throw) on a missing/malformed model', () => {
+    // A minimal CanvasRenderingContext2D stub -- drawPeel must never throw, even with no
+    // frames (the panel shows an "unavailable" message and stays in a safe state).
+    const g = {
+        fillStyle: '', font: '', strokeStyle: '', lineWidth: 0,
+        fillText() {}, fillRect() {}, strokeRect() {}, clearRect() {},
+    };
+    const geom = { x: 14, y: 10, w: 872, h: 280 };
+    assert.doesNotThrow(() => drawPeel(g, null, 0, geom));
+    assert.doesNotThrow(() => drawPeel(g, { frames: [] }, 0, geom));
+    // A real model draws without throwing at every frame index (clamped).
+    const model = peelFrameModel({ member: 'Xor' });
+    assert.doesNotThrow(() => drawPeel(g, model, -5, geom));
+    assert.doesNotThrow(() => drawPeel(g, model, 0, geom));
+    assert.doesNotThrow(() => drawPeel(g, model, model.frames.length + 99, geom));
+});
+
+test('Session B: peel.mjs never writes the shipped surface and imports only ../Filter.js', () => {
+    const src = readFileSync(join(DEMO_DIR, 'peel.mjs'), 'utf8');
+    assert.ok(src.length > 100, 'peel.mjs must be nonempty');
+    // No writes at all in this file.
+    assert.ok(!/writeFile|createWriteStream|appendFile/.test(src), 'peel.mjs must not write any file');
+    // The only bare-specifier / relative import of the shipped surface is ../Filter.js.
+    const imports = [...src.matchAll(/from\s+'([^']+)'/g)].map((m) => m[1]);
+    for (const spec of imports) {
+        const ok = spec === '../Filter.js' || spec.startsWith('node:');
+        assert.ok(ok, 'peel.mjs may import only ../Filter.js (or node: in the guarded main), got ' + spec);
+    }
+    // ASCII-only source (suite law).
+    // eslint-disable-next-line no-control-regex
+    assert.ok(/^[\x00-\x7F]*$/.test(src), 'peel.mjs must be ASCII-only');
 });
