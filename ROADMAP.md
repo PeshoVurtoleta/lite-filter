@@ -1,13 +1,14 @@
 # LiteFilter -- roadmap and charter
 
-> PRE-IMPLEMENTATION SCAFFOLD. This directory currently holds only a
-> `package.json` shell (version `0.0.0`) and this roadmap. There is NO
-> `Filter.js`, no tests, no `README.md`, no `llms.txt`, no `CHANGELOG.md` yet.
-> This file is the charter the planner -> coder -> reviewer -> qa pipeline builds
-> against; nothing here is a shipped claim. Every number below is either a
-> target to be proven by the shipped bench in this repo, or a citation to a
-> paper -- and until a seeded bench in THIS repo prints it, it is a hypothesis,
-> not a result.
+> COMPLETE (v1.0.0, status stable). All SEVEN members ship under one
+> `LiteFilter<K>` surface -- Bloom, CountingBloom, BlockedBloom, Cuckoo,
+> Quotient, XorFilter, BinaryFuse -- with `Filter.js`, `Filter.d.ts`, the full
+> boundary suite, the torture + controls + perf gates, the shipped bench,
+> `README.md`, `llms.txt`, and `CHANGELOG.md`. This file remains the CHARTER the
+> planner -> coder -> reviewer -> qa pipeline built against; the design rulings it
+> proposed are now recorded in `decisions/0001..0023`. Every number below was
+> either proven by the shipped seeded bench in this repo or is a paper citation --
+> read `decisions/` and the bench for the shipped values, not this charter's targets.
 
 ASCII-only (`->`, `<=`, `>=`, `x`, "1.23x", never Unicode arrows or the
 multiplication sign). Suite law from `../CLAUDE.md` applies verbatim: npm scope
@@ -23,7 +24,7 @@ not zero).
 
 A zero-GC, single-file, tree-shakeable ESM library of the famous
 **approximate-membership** filters -- Bloom and its descendants -- under ONE
-uniform `LiteFilter<K>` surface, exactly as `@zakkster/lite-lru` puts twelve
+uniform `LiteFilter<K>` surface, exactly as `@zakkster/lite-lru` puts its many
 eviction policies under one `LiteCache<K,V>` surface. The filter is a one-line
 constructor swap; the surface, the tests, and the bench stay identical.
 
@@ -76,9 +77,9 @@ Hot path (zero allocation, all members):
 
 Decision aliases and inspection (cold or O(1), never allocate on the hot path):
 
-- `has(key)` / `contains(key)` -- aliases of `mightContain` for readability; the
-  same one-sided semantics. (Naming decision deferred to planning: ship one
-  canonical name plus at most one alias, not three.)
+- `has(key)` -- the SOLE alias of `mightContain` (decisions/0003), same one-sided
+  semantics. The deferred naming ruling shipped `has` as the one canonical alias;
+  `contains` was NOT added (one canonical name plus at most one alias, not three).
 - `remove(key) -> boolean` -- ONLY on deletable members (Counting Bloom, Cuckoo,
   Quotient). Static and plain-Bloom members throw a `[lite-filter]` Error
   (fail closed) rather than silently no-op'ing.
@@ -106,7 +107,7 @@ libraries feel identical:
   lite-lru D19. `stats()` / `resetStats()` fail closed on a non-stats instance.
 - **`dump()` / `restore()` snapshot** -- the typed-array bit/fingerprint store IS
   the serial form. `dump()` emits a plain, structurally-cloneable snapshot with a
-  fail-closed tag `{ f:'litefilter/1', m, cap, bits, k, keys, ... }`;
+  fail-closed tag `{ f:'litefilter/3', m, cap, bits, k, keys, ... }`;
   `Member.restore(snap, opts?)` rebuilds a fresh instance, rejecting any
   member / capacity / bit-count / seed mismatch (REJECT, never truncate). Because
   the store is already a flat typed array, the snapshot is close to a raw byte
@@ -324,7 +325,7 @@ already INSIDE it:
 - The dev-only `@zakkster/lite-perf-gate` zero-alloc `node:test` gate
   (`npm run test:perf` inside `verify`) is the per-member CI discipline:
   add-churn + query-hit scenarios on the `keys:'int'` backing, proving 0
-  scavenges per member, exactly as lite-lru gates its twelve members' 24
+  scavenges per member, exactly as lite-lru gates its members' 24
   scenarios.
 
 ---
@@ -369,7 +370,7 @@ A member that lands without all seven is incomplete by definition.
 - a `GUIDE.md` skeleton.
 
 Then ONE member per release, the `GUIDE.md` growing each time -- exactly how
-lite-lru grew from `LiteLru` to twelve members. Build order, mutable/simple
+lite-lru grew from `LiteLru` to its many members. Build order, mutable/simple
 first, static/space-optimal last, each with its one-line rationale:
 
 1. **Counting Bloom** -- smallest step past Bloom (bits -> counters); introduces
@@ -395,32 +396,31 @@ designed once the mutable members have settled the rest of the surface.
 
 ---
 
-## 11. Open design decisions (to resolve in planning, as `decisions/` rulings)
+## 11. Open design decisions (RESOLVED -- each carries its `decisions/` ruling)
 
-1. **Default hash function + arbitrary-key hashing** (section 6) -- which mixer
-   (murmur3 `fmix` / xxhash-style), the integer fast path for `keys:'int'`, and
-   the string-encoding path; validated by the bench's FPR-vs-theory number, not
-   by reputation.
-2. **The static-filter build API** -- add-then-`freeze()` (populate via `add`,
-   then a one-time `freeze()` that peels the graph and switches `mightContain`
-   on) vs a static `Member.from(iterable, opts)` constructor that consumes a
-   known set directly. Pick one; keep it uniform across XOR and Binary Fuse.
-3. **`remove()` scope + caveat** -- offered ONLY on deletable members (Counting
-   Bloom, Cuckoo, Quotient); non-deletable members throw fail-closed. The
-   "removing a never-added key can cause a later false NEGATIVE" caveat is
-   documented on the surface, not buried.
-4. **The snapshot / serialize format** -- the exact `dump()` tag fields and how
-   the typed-array store maps to the plain, structurally-cloneable graph
-   (`f:'litefilter/1'`, member, capacity, bit/counter count, k, seed, keys mode,
-   fill count); fail-closed `restore()` rejections enumerated.
-5. **How `fpp` / capacity are specified at construction** -- `(n, fpp)` ->
-   derive m and k, vs an explicit `(bits, k)`, vs both with a documented
-   precedence; and how `fpp()` reports configured-vs-estimated as the filter
-   fills.
-6. **Whether to offer an approximate `count()`** -- multiplicity estimation on
-   Counting Bloom (and any member that can support it), or presence-only across
-   the board with `count()` deferred. If offered, it is opt-in and clearly an
-   ESTIMATE, never exact.
+All six charter questions are now settled; the pointer after each is the shipped ruling.
+
+1. **Default hash function + arbitrary-key hashing** (section 6) -- RESOLVED
+   (decisions/0001, 0023): murmur3 `fmix32` finalizer; a direct integer mix for
+   `keys:'int'`; strings hashed over their UTF-16 code units (alloc-free). The XOR /
+   Binary Fuse string path draws a SECOND independent `hashStr(s, seed2)` for its edge
+   hash (decisions/0023). Validated by the bench's FPR-vs-theory number, not reputation.
+2. **The static-filter build API** -- RESOLVED (decisions/0006, 0018, 0022): a static
+   `Member.from(iterable, opts)` / `.build` factory (NOT add-then-freeze), uniform across
+   XorFilter and BinaryFuse; `add`/`remove`/`clear` on a static instance throw fail-closed.
+3. **`remove()` scope + caveat** -- RESOLVED (decisions/0003, 0009, 0015, 0017): `remove ->
+   boolean` on the deletable members (CountingBloom, Cuckoo, Quotient) only; add-only and
+   static members throw. The never-added-remove false-negative caveat is on the surface.
+4. **The snapshot / serialize format** -- RESOLVED (decisions/0005, 0021, 0023): `dump()`
+   emits the tagged plain-array snapshot (`f:'litefilter/3'`, member, sizing/width fields,
+   seed, keys mode, count) plus a 32-bit integrity `chk`; `restore()` rejections are
+   enumerated and REJECT-never-truncate. The tag advanced to `litefilter/3` (decisions/0023).
+5. **How `fpp` / capacity are specified at construction** -- RESOLVED (decisions/0002):
+   `(n, fpp)` derives `m` and `k` (Bloom) / the member's width + geometry; `fpp()` reports
+   the CONFIGURED target (or the width-quantized closed form for the fingerprint members).
+6. **Whether to offer an approximate `count()`** -- RESOLVED (decisions/0010): presence-only;
+   `size`/`count` is the EXACT net count of adds/removes, not a multiplicity estimate. A
+   estimated `count()` stays deferred (it would be opt-in and clearly an estimate if added).
 
 ---
 

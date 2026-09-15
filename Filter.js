@@ -95,13 +95,13 @@
  * snapshot; 0012 block size; 0013 FPR locality; 0014 Cuckoo sizing/overload; 0015
  * Cuckoo delete caveat; 0016 Quotient sizing/split/storage/ceiling/resize; 0017
  * Quotient delete caveat; 0018 XOR static build; 0019 XOR surface; 0020 XOR width;
- * 0021 snapshot integrity checksum; 0022 Binary Fuse sizing) and are summarized in
- * ROADMAP.md.
+ * 0021 snapshot integrity checksum; 0022 Binary Fuse sizing; 0023 XOR/Binary Fuse
+ * string-edge entropy + the litefilter/3 tag) and are summarized in ROADMAP.md.
  *
  * @license MIT
  */
 
-export const VERSION = "1.0.0";
+export const VERSION = "1.1.0";
 
 /* -------------------------------------------------------------------------- *
  * Constants + fail-closed messages (built ONCE, thrown only on misuse).
@@ -133,12 +133,18 @@ const STATS_OFF_MSG =
     "[lite-filter] stats()/resetStats() require the filter to be constructed with " +
     "{ stats: true }; this instance has no stats configured";
 
-/** The snapshot format tag (decisions/0005, 0021). A `dump()` carries it; `restore()`
+/** The snapshot format tag (decisions/0005, 0021, 0023). A `dump()` carries it; `restore()`
  *  rejects any other value fail-closed. Versioned so a layout change is a clean,
- *  detectable break rather than a silent misread. Bumped to `litefilter/2` in v0.6.0:
- *  every snapshot now carries an integrity checksum (`chk`, decisions/0021), and a v1
- *  snapshot (which has none) cannot be integrity-verified -- so it is REJECTED. */
-const SNAP_TAG = "litefilter/2";
+ *  detectable break rather than a silent misread. Bumped to `litefilter/2` in v0.6.0
+ *  (every snapshot carries an integrity checksum `chk`, decisions/0021). Bumped to
+ *  `litefilter/3` in 1.1.0 (decisions/0023): the XOR / Binary Fuse string-key second
+ *  hash `g` changed from `fmix32(h ^ seed2)` to an INDEPENDENT `hashStr(s, seed2)`, so a
+ *  `litefilter/2` XOR/BF snapshot would read back false negatives on string keys. One tag
+ *  is ONE algorithm for the whole family: even members whose bytes are unchanged (Bloom,
+ *  int-mode filters) are re-tagged, so a stale snapshot is a clean detectable break rather
+ *  than a per-member guess. A `litefilter/2` (or earlier) snapshot is REJECTED -- re-dump()
+ *  the source filter under 1.1.0 to produce a `litefilter/3` snapshot. */
+const SNAP_TAG = "litefilter/3";
 
 /** CountingBloom counter width (decisions/0007): 4 bits per counter (a nibble),
  *  two counters packed per byte. The saturation ceiling is MAX_COUNT = 15 -- a
@@ -335,14 +341,18 @@ const XOR_FPP_MSG =
     "[lite-filter] XOR fpp too small: the fingerprint width would exceed 16 bits; the " +
     "smallest supported fpp is 2^-16 (~0.0000153). Raise the fpp.";
 
-/** Fail-closed message when peeling exhausts every reseed (decisions/0018). Expected
- *  ONLY for a degenerate key set (duplicate-encoding keys -> parallel hypergraph edges
- *  no reseed can separate). Built once, thrown only on a genuinely unpeelable set. */
+/** Fail-closed message when peeling exhausts every reseed (decisions/0018, 0023). With the
+ *  two-independent-hash string derivation (`h = hashStr(s, seed)`, `g = hashStr(s, seed2)`,
+ *  decisions/0023), a set of DISTINCT strings peels regardless of size -- there is no
+ *  single-hash birthday ceiling. Exhaustion therefore means a genuinely DEGENERATE set:
+ *  keys with identical `String()` encodings, which collapse to the SAME (h, g) pair -> a
+ *  duplicate hypergraph edge no reseed can separate. Built once, thrown only on such a set. */
 const XOR_CONSTRUCT_MSG =
-    "[lite-filter] XorFilter.from() could not construct after 100 peeling attempts: the " +
-    "key set produced an unpeelable 3-uniform hypergraph under every reseed. This is " +
-    "expected only for a DEGENERATE set -- e.g. many distinct keys that encode to the same " +
-    "string (String(key) collision -> duplicate edges). Check for duplicate-encoding keys.";
+    "[lite-filter] XorFilter.from() could not construct after 100 peeling attempts. With " +
+    "two independent string hashes (decisions/0023) a set of DISTINCT keys peels at any " +
+    "size, so this means a DEGENERATE set -- multiple keys sharing one String() encoding " +
+    "(e.g. distinct plain objects, all \"[object Object]\") produce a duplicate edge no " +
+    "reseed can separate. De-duplicate by encoding, or pass keys that String()-encode distinctly.";
 
 /** Fail-closed message when the derived array would exceed the too-large cap
  *  (decisions/0020). Built once, thrown only at construction for very large key sets. */
@@ -357,7 +367,8 @@ const XOR_BUILD_TOKEN = Symbol("lite-filter/xor.build");
 
 /* -------------------------------------------------------------------------- *
  * Binary Fuse (Graf & Lemire, "Binary Fuse Filters: Fast and Smaller Than Xor
- * Filters", ACM JEA 2022) -- the SPACE-OPTIMAL static member (decisions/0022). The
+ * Filters", ACM JEA 2022) -- the SMALLEST static member (~1.13x; XOR is the space-optimal
+ * ~1.23x reference, BinaryFuse packs tighter, decisions/0022). The
  * 7th and FINAL member. It REUSES the XOR peeling substrate (3-uniform hypergraph,
  * peel + reverse-assign, deterministic reseed, snapshot v2 + chk) and swaps ONLY the
  * geometry: XOR's 3 equal DISJOINT segments become OVERLAPPING fuse segments selected
@@ -423,14 +434,17 @@ const BF_EMPTY_MSG =
     "[lite-filter] BinaryFuse.from() requires a non-empty key set; a filter over zero keys " +
     "is undefined (null is not zero).";
 
-/** Fail-closed message when peeling exhausts every reseed (decisions/0022). Expected ONLY for
- *  a degenerate key set (duplicate-encoding keys -> parallel hypergraph edges no reseed can
- *  separate). Built once, thrown only on a genuinely unpeelable set. */
+/** Fail-closed message when peeling exhausts every reseed (decisions/0022, 0023). With the
+ *  two-independent-hash string derivation (decisions/0023) a set of DISTINCT strings peels
+ *  regardless of size -- there is no single-hash birthday ceiling. Exhaustion therefore means
+ *  a genuinely DEGENERATE set: keys with identical `String()` encodings collapse to the SAME
+ *  (h, g) pair -> a duplicate edge no reseed can separate. Built once, thrown only on such a set. */
 const BF_CONSTRUCT_MSG =
-    "[lite-filter] BinaryFuse.from() could not construct after 100 peeling attempts: the key " +
-    "set produced an unpeelable 3-uniform hypergraph under every reseed. This is expected only " +
-    "for a DEGENERATE set -- e.g. many distinct keys that encode to the same string " +
-    "(String(key) collision -> duplicate edges). Check for duplicate-encoding keys.";
+    "[lite-filter] BinaryFuse.from() could not construct after 100 peeling attempts. With " +
+    "two independent string hashes (decisions/0023) a set of DISTINCT keys peels at any " +
+    "size, so this means a DEGENERATE set -- multiple keys sharing one String() encoding " +
+    "(e.g. distinct plain objects, all \"[object Object]\") produce a duplicate edge no " +
+    "reseed can separate. De-duplicate by encoding, or pass keys that String()-encode distinctly.";
 
 /** Fail-closed message when the derived array would exceed the too-large cap (decisions/0022).
  *  Built once, thrown only at construction for very large key sets. */
@@ -663,7 +677,7 @@ function quotientSizeFor(n, fpp) {
  * Deterministic from nslots so restore()/resize() re-derive the same physical length.
  */
 function _qfGuard(nslots) {
-    const g = nslots >> 3;
+    const g = nslots >>> 3;
     return g > 1024 ? g : 1024;
 }
 
@@ -930,8 +944,9 @@ function _xorTryBuild(keys, int, seed, seed2, n, bl, fw) {
             h = fmix32((key ^ seed) | 0);
             g = fmix32((Math.imul(key | 0, 0x9e3779b1) ^ seed2) | 0);
         } else {
-            h = (typeof key === "string") ? hashStr(key, seed) : hashStr(String(key), seed);
-            g = fmix32((h ^ seed2) | 0);
+            const s = (typeof key === "string") ? key : String(key);
+            h = hashStr(s, seed);
+            g = hashStr(s, seed2);
         }
         const t = fmix32((h ^ g) | 0);
         eh0[e] = h % bl;
@@ -1030,10 +1045,11 @@ function _bfTryBuild(keys, int, seed, seed2, n, dims, fw) {
     // the fingerprint. Computed with EXACTLY the math the query hot path uses, so a key in the
     // set always reads true. `mulhiU32(h, scl)` is the segment-base selector (multiply-shift,
     // zero-branch); `^ (g & segMask)` / `^ (t & segMask)` place the other two within-segment.
-    // NOTE (decisions/0022): h0 is the raw segment base with NO within-segment perturbation -- a
-    // deliberate divergence from the FastFilter reference, which also perturbs slot 0. Membership
-    // stays exact (build and query hash byte-identically); only slot 0's intra-segment spread
-    // differs, and the measured 1.1305 slots/item + peel-success gate confirm it is benign.
+    // NOTE (decisions/0022): h0 is the raw segment base with NO within-segment perturbation --
+    // this MATCHES the FastFilter reference geometry (arity 3: the first slot is the multiply-
+    // shift base in [0, scl), the second and third are one and two segments up, each perturbed
+    // within its segment). Build and query hash byte-identically, so membership is exact; the
+    // measured 1.1305 slots/item + peel-success gate confirm the geometry is sound.
     const eh0 = new Uint32Array(n);
     const eh1 = new Uint32Array(n);
     const eh2 = new Uint32Array(n);
@@ -1045,8 +1061,9 @@ function _bfTryBuild(keys, int, seed, seed2, n, dims, fw) {
             h = fmix32((key ^ seed) | 0);
             g = fmix32((Math.imul(key | 0, 0x9e3779b1) ^ seed2) | 0);
         } else {
-            h = (typeof key === "string") ? hashStr(key, seed) : hashStr(String(key), seed);
-            g = fmix32((h ^ seed2) | 0);
+            const s = (typeof key === "string") ? key : String(key);
+            h = hashStr(s, seed);
+            g = hashStr(s, seed2);
         }
         const t = fmix32((h ^ g) | 0);
         const hi = mulhiU32(h, scl);
@@ -1141,6 +1158,60 @@ function validateKeys(keys) {
         "[lite-filter] unknown keys option " + String(keys) + " (did you mean 'int'?)");
 }
 
+/** The option keys every mutable constructor / static factory understands (ported from
+ *  @zakkster/lite-lru's option door). An unknown key is a caller typo, and a typo is an
+ *  error with a did-you-mean hint -- never a silent ignore (the fail-closed law). */
+const KNOWN_OPTS = ["fpp", "seed", "keys", "stats"];
+
+/** The option keys restore(snap, opts) understands: restore re-derives every sizing
+ *  parameter from the snapshot itself, so `stats` is the ONLY caller-supplied door
+ *  (verified against what each restore() reads -- only `opts.stats`). */
+const KNOWN_RESTORE_OPTS = ["stats"];
+
+/**
+ * Suggest the closest known option key to an unknown one (cold, throw-path only). A
+ * case-insensitive exact match wins first; else the key sharing the most leading
+ * characters; else we list every valid key. Clarity over cleverness -- this only ever
+ * runs while building a fail-closed error message. Ported from lite-lru.
+ */
+function nearestOpt(key, known) {
+    const lower = String(key).toLowerCase();
+    for (const k of known) {
+        if (k.toLowerCase() === lower) return k;
+    }
+    let best = null, bestScore = 0;
+    for (const k of known) {
+        const kl = k.toLowerCase();
+        const max = Math.min(kl.length, lower.length);
+        let n = 0;
+        while (n < max && kl[n] === lower[n]) n++;
+        if (n > bestScore) { bestScore = n; best = k; }
+    }
+    return bestScore > 0 ? best : known.join(", ");
+}
+
+/**
+ * Validate the options bag itself (the fail-closed law, ported from lite-lru): reject a
+ * non-object, and reject any unknown key with a did-you-mean hint rather than silently
+ * ignoring a typo. `undefined` is fine (no options); `null` is INVALID (null is not an
+ * empty bag -- null is not zero). Cold: called once per constructor / factory / restore,
+ * right after the capacity (or snapshot) door.
+ */
+function validateOptions(options, known) {
+    if (options === undefined) return;
+    if (options === null || typeof options !== "object") {
+        throw new TypeError(
+            "[lite-filter] options must be an object, got " + String(options));
+    }
+    for (const k in options) {
+        if (!known.includes(k)) {
+            throw new TypeError(
+                "[lite-filter] unknown option " + k + " (did you mean " +
+                nearestOpt(k, known) + "?)");
+        }
+    }
+}
+
 /* -------------------------------------------------------------------------- *
  * Bloom -- the reference member (decisions/0001..0005). The differential oracle
  * and the honest floor. Implements the uniform LiteFilter<K> surface.
@@ -1153,6 +1224,7 @@ export class Bloom {
      */
     constructor(capacity, options) {
         // Cold sizing door: fail closed on every impossible request (decisions/0002).
+        void validateOptions(options, KNOWN_OPTS); // fail-closed option door (decisions/0001)
         const fpp = (options && options.fpp !== undefined) ? options.fpp : DEFAULT_FPP;
         const dims = sizeFor(capacity, fpp);
 
@@ -1357,10 +1429,15 @@ export class Bloom {
         if (snap === null || typeof snap !== "object") {
             throw new TypeError("[lite-filter] restore(snap): snapshot must be an object");
         }
+        void validateOptions(opts, KNOWN_RESTORE_OPTS); // fail-closed option door
         if (snap.f !== SNAP_TAG) {
             throw new Error(
                 "[lite-filter] restore(): bad format tag " + String(snap.f) +
-                " (expected " + SNAP_TAG + ")");
+                " (expected " + SNAP_TAG + "). Snapshots are versioned and NEVER " +
+                "auto-migrated: a prior tag (litefilter/2 or earlier) is rejected because " +
+                "the XOR/Binary Fuse string-key hash derivation changed (decisions/0023) -- " +
+                "re-dump() the source filter under 1.1.0 to produce a " + SNAP_TAG +
+                " snapshot.");
         }
         if (snap.mem !== "Bloom") {
             throw new Error(
@@ -1456,6 +1533,7 @@ export class CountingBloom {
     constructor(capacity, options) {
         // Cold sizing door: reuse Bloom's derivation (decisions/0002) verbatim, so a
         // CountingBloom and a Bloom sized for the same (n, fpp) share m and k.
+        void validateOptions(options, KNOWN_OPTS); // fail-closed option door (decisions/0001)
         const fpp = (options && options.fpp !== undefined) ? options.fpp : DEFAULT_FPP;
         const dims = sizeFor(capacity, fpp);
 
@@ -1698,10 +1776,15 @@ export class CountingBloom {
         if (snap === null || typeof snap !== "object") {
             throw new TypeError("[lite-filter] restore(snap): snapshot must be an object");
         }
+        void validateOptions(opts, KNOWN_RESTORE_OPTS); // fail-closed option door
         if (snap.f !== SNAP_TAG) {
             throw new Error(
                 "[lite-filter] restore(): bad format tag " + String(snap.f) +
-                " (expected " + SNAP_TAG + ")");
+                " (expected " + SNAP_TAG + "). Snapshots are versioned and NEVER " +
+                "auto-migrated: a prior tag (litefilter/2 or earlier) is rejected because " +
+                "the XOR/Binary Fuse string-key hash derivation changed (decisions/0023) -- " +
+                "re-dump() the source filter under 1.1.0 to produce a " + SNAP_TAG +
+                " snapshot.");
         }
         if (snap.mem !== "CountingBloom") {
             throw new Error(
@@ -1791,6 +1874,7 @@ export class BlockedBloom {
     constructor(capacity, options) {
         // Cold sizing door: reuse Bloom's (n, fpp) derivation (decisions/0002) verbatim,
         // so a BlockedBloom and a Bloom sized for the same target share m and k.
+        void validateOptions(options, KNOWN_OPTS); // fail-closed option door (decisions/0001)
         const fpp = (options && options.fpp !== undefined) ? options.fpp : DEFAULT_FPP;
         const dims = sizeFor(capacity, fpp);
 
@@ -2009,10 +2093,15 @@ export class BlockedBloom {
         if (snap === null || typeof snap !== "object") {
             throw new TypeError("[lite-filter] restore(snap): snapshot must be an object");
         }
+        void validateOptions(opts, KNOWN_RESTORE_OPTS); // fail-closed option door
         if (snap.f !== SNAP_TAG) {
             throw new Error(
                 "[lite-filter] restore(): bad format tag " + String(snap.f) +
-                " (expected " + SNAP_TAG + ")");
+                " (expected " + SNAP_TAG + "). Snapshots are versioned and NEVER " +
+                "auto-migrated: a prior tag (litefilter/2 or earlier) is rejected because " +
+                "the XOR/Binary Fuse string-key hash derivation changed (decisions/0023) -- " +
+                "re-dump() the source filter under 1.1.0 to produce a " + SNAP_TAG +
+                " snapshot.");
         }
         if (snap.mem !== "BlockedBloom") {
             throw new Error(
@@ -2109,6 +2198,7 @@ export class Cuckoo {
      */
     constructor(capacity, options) {
         // Cold sizing door: fail closed on every impossible request (decisions/0014).
+        void validateOptions(options, KNOWN_OPTS); // fail-closed option door (decisions/0001)
         const fpp = (options && options.fpp !== undefined) ? options.fpp : DEFAULT_FPP;
         const dims = cuckooSizeFor(capacity, fpp);
 
@@ -2210,7 +2300,7 @@ export class Cuckoo {
         let victim = fp;
         for (let n = 0; n < CUCKOO_KICKS; n++) {
             r ^= r << 13; r >>>= 0;
-            r ^= r >> 17;
+            r ^= r >>> 17;
             r ^= r << 5; r >>>= 0;
             const idx = (i << 2) + (r & 3);   // absolute slot to evict from bucket i
             kickPath[n] = idx;                // trail it for a possible unwind
@@ -2423,10 +2513,15 @@ export class Cuckoo {
         if (snap === null || typeof snap !== "object") {
             throw new TypeError("[lite-filter] restore(snap): snapshot must be an object");
         }
+        void validateOptions(opts, KNOWN_RESTORE_OPTS); // fail-closed option door
         if (snap.f !== SNAP_TAG) {
             throw new Error(
                 "[lite-filter] restore(): bad format tag " + String(snap.f) +
-                " (expected " + SNAP_TAG + ")");
+                " (expected " + SNAP_TAG + "). Snapshots are versioned and NEVER " +
+                "auto-migrated: a prior tag (litefilter/2 or earlier) is rejected because " +
+                "the XOR/Binary Fuse string-key hash derivation changed (decisions/0023) -- " +
+                "re-dump() the source filter under 1.1.0 to produce a " + SNAP_TAG +
+                " snapshot.");
         }
         if (snap.mem !== "Cuckoo") {
             throw new Error(
@@ -2479,6 +2574,7 @@ export class Cuckoo {
         // A slot is 0 (empty) or a nonzero fingerprint in 1..fpMask; anything else is a
         // corrupt or foreign store and is rejected rather than coerced to garbage.
         const fpMask = inst._fpMask;
+        let occ = 0;
         for (let i = 0; i < fp.length; i++) {
             const v = fp[i];
             if (!Number.isInteger(v) || v < 0 || v > fpMask) {
@@ -2486,6 +2582,16 @@ export class Cuckoo {
                     "[lite-filter] restore(): corrupt fingerprint at slot " + i + " (" + String(v) +
                     "); each slot must be an integer in 0.." + fpMask);
             }
+            if (v !== 0) occ++;
+        }
+        // Structural cross-check (parity with Quotient.restore): a Cuckoo stores one nonzero
+        // fingerprint per key, so the count of NONZERO slots MUST equal the recorded size.
+        // A snapshot whose count disagrees with its own store is corrupt -- reject it BEFORE
+        // the chk gate (REJECT never truncate; null is not zero).
+        if (occ !== snap.count) {
+            throw new Error(
+                "[lite-filter] restore(): nonzero-slot count " + occ + " != count " +
+                String(snap.count) + " (a corrupt store or a foreign count)");
         }
         // Integrity gate (decisions/0021): reject a flipped keys-mode / seed / store slot.
         verifySnapChecksum(snap, "Cuckoo",
@@ -2539,6 +2645,7 @@ export class Quotient {
      */
     constructor(capacity, options) {
         // Cold sizing door: fail closed on every impossible request (decisions/0016).
+        void validateOptions(options, KNOWN_OPTS); // fail-closed option door (decisions/0001)
         const fpp = (options && options.fpp !== undefined) ? options.fpp : DEFAULT_FPP;
         const dims = quotientSizeFor(capacity, fpp);
 
@@ -3040,10 +3147,15 @@ export class Quotient {
         if (snap === null || typeof snap !== "object") {
             throw new TypeError("[lite-filter] restore(snap): snapshot must be an object");
         }
+        void validateOptions(opts, KNOWN_RESTORE_OPTS); // fail-closed option door
         if (snap.f !== SNAP_TAG) {
             throw new Error(
                 "[lite-filter] restore(): bad format tag " + String(snap.f) +
-                " (expected " + SNAP_TAG + ")");
+                " (expected " + SNAP_TAG + "). Snapshots are versioned and NEVER " +
+                "auto-migrated: a prior tag (litefilter/2 or earlier) is rejected because " +
+                "the XOR/Binary Fuse string-key hash derivation changed (decisions/0023) -- " +
+                "re-dump() the source filter under 1.1.0 to produce a " + SNAP_TAG +
+                " snapshot.");
         }
         if (snap.mem !== "Quotient") {
             throw new Error(
@@ -3238,6 +3350,7 @@ export class XorFilter {
             throw new TypeError(
                 "[lite-filter] XorFilter.from(iterable): the first argument must be iterable");
         }
+        void validateOptions(options, KNOWN_OPTS); // fail-closed option door (decisions/0001)
         const fpp = (options && options.fpp !== undefined) ? options.fpp : DEFAULT_FPP;
         const fw = _xorSizeError(fpp);                     // width door (decisions/0020)
         const int = validateKeys(options && options.keys); // keys door (decisions/0001)
@@ -3317,8 +3430,9 @@ export class XorFilter {
             h = fmix32((key ^ this._seed) | 0);
             g = fmix32((Math.imul(key | 0, 0x9e3779b1) ^ this._seed2) | 0);
         } else {
-            h = this._hashKey(key);
-            g = fmix32((h ^ this._seed2) | 0);
+            const s = (typeof key === "string") ? key : String(key);
+            h = hashStr(s, this._seed);
+            g = hashStr(s, this._seed2);
         }
         const t = fmix32((h ^ g) | 0);
         const fp = fmix32((h + g) | 0) & this._fpMask;
@@ -3437,10 +3551,15 @@ export class XorFilter {
         if (snap === null || typeof snap !== "object") {
             throw new TypeError("[lite-filter] restore(snap): snapshot must be an object");
         }
+        void validateOptions(opts, KNOWN_RESTORE_OPTS); // fail-closed option door
         if (snap.f !== SNAP_TAG) {
             throw new Error(
                 "[lite-filter] restore(): bad format tag " + String(snap.f) +
-                " (expected " + SNAP_TAG + ")");
+                " (expected " + SNAP_TAG + "). Snapshots are versioned and NEVER " +
+                "auto-migrated: a prior tag (litefilter/2 or earlier) is rejected because " +
+                "the XOR/Binary Fuse string-key hash derivation changed (decisions/0023) -- " +
+                "re-dump() the source filter under 1.1.0 to produce a " + SNAP_TAG +
+                " snapshot.");
         }
         if (snap.mem !== "Xor") {
             throw new Error(
@@ -3597,6 +3716,7 @@ export class BinaryFuse {
             throw new TypeError(
                 "[lite-filter] BinaryFuse.from(iterable): the first argument must be iterable");
         }
+        void validateOptions(options, KNOWN_OPTS); // fail-closed option door (decisions/0001)
         const fpp = (options && options.fpp !== undefined) ? options.fpp : DEFAULT_FPP;
         const fw = _xorSizeError(fpp);                     // width door (decisions/0020, reused)
         const int = validateKeys(options && options.keys); // keys door (decisions/0001)
@@ -3683,8 +3803,9 @@ export class BinaryFuse {
             h = fmix32((key ^ this._seed) | 0);
             g = fmix32((Math.imul(key | 0, 0x9e3779b1) ^ this._seed2) | 0);
         } else {
-            h = this._hashKey(key);
-            g = fmix32((h ^ this._seed2) | 0);
+            const s = (typeof key === "string") ? key : String(key);
+            h = hashStr(s, this._seed);
+            g = hashStr(s, this._seed2);
         }
         const t = fmix32((h ^ g) | 0);
         const fp = fmix32((h + g) | 0) & this._fpMask;
@@ -3800,10 +3921,15 @@ export class BinaryFuse {
         if (snap === null || typeof snap !== "object") {
             throw new TypeError("[lite-filter] restore(snap): snapshot must be an object");
         }
+        void validateOptions(opts, KNOWN_RESTORE_OPTS); // fail-closed option door
         if (snap.f !== SNAP_TAG) {
             throw new Error(
                 "[lite-filter] restore(): bad format tag " + String(snap.f) +
-                " (expected " + SNAP_TAG + ")");
+                " (expected " + SNAP_TAG + "). Snapshots are versioned and NEVER " +
+                "auto-migrated: a prior tag (litefilter/2 or earlier) is rejected because " +
+                "the XOR/Binary Fuse string-key hash derivation changed (decisions/0023) -- " +
+                "re-dump() the source filter under 1.1.0 to produce a " + SNAP_TAG +
+                " snapshot.");
         }
         if (snap.mem !== "BinaryFuse") {
             throw new Error(

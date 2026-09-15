@@ -7,6 +7,65 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The `VERSION` constant, `package.json` `version`, and `llms.txt` are bumped
 together (three-place version sync) at release.
 
+## [1.1.0] - 2026-09-15
+
+### Added
+
+- **A second INDEPENDENT string-key hash for `XorFilter` / `BinaryFuse`** (decisions/0023).
+  The string edge hash `g` moves from `fmix32(h ^ seed2)` (a pure function of `h`, ~32-bit edge
+  entropy) to an independent `hashStr(s, seed2)` (~64-bit edge entropy). A set of DISTINCT
+  strings now peels at ANY size: `XorFilter.from` / `BinaryFuse.from` build 300k distinct
+  strings with 0 false negatives on full readback in well under 5s. The single-hash birthday
+  CEILING (~250k, past which a non-degenerate set was wrongly rejected) is gone; exhaustion
+  again means only a genuinely degenerate set (identical `String()` encodings). The key is
+  `String()`-encoded ONCE per call into a local; the `keys:'int'` path is byte-identical.
+- **Fail-closed option doors on every constructor, static factory, and `restore()`** (ported
+  from `@zakkster/lite-lru`): `validateOptions` rejects a non-object bag and any unknown key
+  with a did-you-mean hint (`KNOWN_OPTS = fpp/seed/keys/stats`; `KNOWN_RESTORE_OPTS = stats`).
+- **Torture hardening**: a phase-1 liveness count (`tracked` asserted against the exact loop
+  total), a string-key hot lane under the same zero-major-GC window (proving string keys are
+  zero-alloc), a CBF churn law (`removes > 20000`, `validateCounting` on the churned instance),
+  and `cbf removes=` on the GATE line. `main()` now `.catch`es and fails closed.
+- **Controls hardening**: a `LEAK` (retained-tracked-object) arm and a `SABOTAGE` (wiped-store
+  false-negative) arm, each matched on its SPECIFIC stderr violation text; the `BREAK` arm now
+  also requires the `violation gc.major` text, not merely a nonzero exit.
+- **Bench**: `falseNeg` is enforced everywhere (importable fns THROW, the CLI exits 1);
+  `distinct`/`added` and `fn` columns on all 7 tables; a seed + one-process/JIT-order honesty
+  header; zipfian honesty (Bloom-family filters sized to the DISTINCT count; the Quotient zipf
+  theoretical derived from distinct fingerprints, not `size` multiplicity; the Cuckoo zipf row
+  annotated as a duplicate-saturation demonstration).
+- **`Cuckoo.restore` structural cross-check**: the nonzero-slot count MUST equal `count`
+  (parity with `Quotient.restore`), rejected BEFORE the `chk` gate.
+- **`test/Doors.test.js`**: a family-wide option-door matrix (every constructor, static
+  `from`/`build` factory, and `restore()` swept against the same unknown-key/non-object/
+  did-you-mean matrix), a `litefilter/2` rejection proof for `Bloom`, `XorFilter`, and
+  `BinaryFuse`, and a 300k-distinct-string scale proof (`XorFilter.from`/`BinaryFuse.from`,
+  0 false negatives, well under 5s) confirming the decisions/0023 birthday ceiling is gone.
+  Test count 479 -> 497.
+
+### Changed
+
+- **Snapshot format tag `litefilter/2` -> `litefilter/3`** (decisions/0023). One tag is ONE
+  algorithm for the whole family, so EVERY member is re-tagged -- including members whose bytes
+  did not change (Bloom, int-mode filters). `restore()` REJECTS a `litefilter/2` (or earlier)
+  snapshot fail-closed with a migration message: re-`dump()` under 1.1.0. The `chk` integrity
+  door (decisions/0021) is unchanged and still runs after the tag check.
+- The `XOR_CONSTRUCT_MSG` / `BF_CONSTRUCT_MSG` exhaustion messages now truthfully diagnose a
+  degenerate set for the new two-independent-hash behavior.
+- `Filter.d.ts`: `BinaryFuse` is branded the family's SMALLEST member (~1.13x); `XorFilter`
+  keeps the "space-optimal" (~1.23x reference) branding.
+
+### Fixed
+
+- Unsigned right shift in every xorshift step: the Cuckoo kick RNG (`r ^= r >>> 17`) and the
+  `_qfGuard` slot-shift (`nslots >>> 3`) in `Filter.js`, plus the PRNGs in `benchmark/Bench.mjs`
+  and the torture / oracle / Quotient test files. A signed `>>` on a high-bit-set word skewed
+  the stream; the gates re-verified clean under the corrected streams.
+- The `Filter.js` Binary Fuse geometry comment no longer claims a divergence from the FastFilter
+  reference -- the code MATCHES it (slot 0 is the raw multiply-shift base in the reference too).
+
+[1.1.0]: https://github.com/PeshoVurtoleta/lite-filter/releases/tag/v1.1.0
+
 ## [1.0.0] - 2026-09-15
 
 The 7th and FINAL member -- `BinaryFuse`, the SMALLEST filter (static, ~9.0 bits/item). The
@@ -60,6 +119,8 @@ release moves the package from status building -> **stable**.
   an XOR-vs-BinaryFuse side-by-side table; `GUIDE.md` is rewritten with all 7 members as rows
   and BOTH decision axes (mutable-vs-static AND, within static, XOR-vs-Binary-Fuse on
   space/simplicity).
+
+[1.0.0]: https://github.com/PeshoVurtoleta/lite-filter/releases/tag/v1.0.0
 
 ## [0.6.0] - 2026-09-15
 
@@ -138,6 +199,8 @@ The 6th member -- `XorFilter`, the space-optimal STATIC one (built once, immutab
     positive per-member checksum tests added (pristine round-trip 0 FN; keys-flip / seed-flip /
     one-store-word-flip each throw).
 
+[0.6.0]: https://github.com/PeshoVurtoleta/lite-filter/releases/tag/v0.6.0
+
 ## [0.5.0] - 2026-09-14
 
 The 5th member -- `Quotient`, the mergeable + resizable one (deletable, fail-closed at the load ceiling).
@@ -205,6 +268,8 @@ The 5th member -- `Quotient`, the mergeable + resizable one (deletable, fail-clo
   (Bloom vs Quotient, measured-vs-theory FPR, add ns rising toward the ceiling); the torture GATE
   line grows `qf` terms (`fn=0`, `fpr`, `churnFn`/`present`/`size`, `resizeFn=0`, `mergeFn=0`,
   `mergeSize`, `ceilingThrew=true`, `ceilingNoop=true`).
+
+[0.5.0]: https://github.com/PeshoVurtoleta/lite-filter/releases/tag/v0.5.0
 
 ## [0.4.0] - 2026-09-14
 

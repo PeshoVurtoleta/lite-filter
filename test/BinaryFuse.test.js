@@ -307,7 +307,7 @@ test("dump: round-trips through JSON and structuredClone", () => {
 
 test("dump: the tag shape is stable and self-describing (mem + fw + sl + sc + fp)", () => {
     const snap = filledBf({ fpp: 0.01, keys: "int" }).dump();
-    assert.equal(snap.f, "litefilter/2");
+    assert.equal(snap.f, "litefilter/3");
     assert.equal(snap.mem, "BinaryFuse");
     assert.equal(snap.fw, 8);
     assert.equal(typeof snap.sl, "number");

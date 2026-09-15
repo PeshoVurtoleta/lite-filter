@@ -60,7 +60,7 @@ test("dump: the snapshot round-trips through JSON and structuredClone", () => {
 
 test("dump: the tag shape is stable and self-describing", () => {
     const snap = filled({ fpp: 0.01, keys: "int" }).dump();
-    assert.equal(snap.f, "litefilter/2");
+    assert.equal(snap.f, "litefilter/3");
     assert.equal(snap.mem, "Bloom");
     assert.equal(snap.keys, "int");
     assert.equal(Array.isArray(snap.bits), true);
@@ -206,7 +206,7 @@ test("CountingBloom dump: round-trips through JSON and structuredClone", () => {
 
 test("CountingBloom dump: the tag shape is stable and self-describing (mem + w:4 + cnts)", () => {
     const snap = filledCounting({ fpp: 0.01, keys: "int" }).dump();
-    assert.equal(snap.f, "litefilter/2");
+    assert.equal(snap.f, "litefilter/3");
     assert.equal(snap.mem, "CountingBloom");
     assert.equal(snap.w, 4);
     assert.equal(snap.keys, "int");
@@ -287,7 +287,7 @@ test("BlockedBloom dump: round-trips through JSON and structuredClone", () => {
 
 test("BlockedBloom dump: the tag shape is stable and self-describing (mem + bb:512 + nb + bits)", () => {
     const snap = filledBlocked({ fpp: 0.01, keys: "int" }).dump();
-    assert.equal(snap.f, "litefilter/2");
+    assert.equal(snap.f, "litefilter/3");
     assert.equal(snap.mem, "BlockedBloom");
     assert.equal(snap.bb, 512);
     assert.equal(typeof snap.nb, "number");
@@ -388,7 +388,7 @@ test("Cuckoo dump: round-trips through JSON and structuredClone", () => {
 
 test("Cuckoo dump: the tag shape is stable and self-describing (mem + fw + b:4 + nb + fp)", () => {
     const snap = filledCuckoo({ fpp: 0.01, keys: "int" }).dump();
-    assert.equal(snap.f, "litefilter/2");
+    assert.equal(snap.f, "litefilter/3");
     assert.equal(snap.mem, "Cuckoo");
     assert.equal(snap.b, 4);
     assert.equal(typeof snap.fw, "number");
@@ -531,7 +531,7 @@ test("Cuckoo restore opts: stats can be re-derived on restore", () => {
 });
 
 /* ============================================================================
- * Family-wide snapshot integrity checksum (decisions/0021, format litefilter/2).
+ * Family-wide snapshot integrity checksum (decisions/0021, tag now litefilter/3).
  *
  * The QA-reported fail-open: keys-mode and seed are free construction inputs that
  * CANNOT be re-derived from the stored bytes, so a flipped `keys` ("int" <-> null) or
@@ -595,9 +595,9 @@ const CHK_MEMBERS = [
 ];
 
 for (const m of CHK_MEMBERS) {
-    test("chk " + m.name + ": every dump carries a 32-bit integrity checksum + the v2 tag", () => {
+    test("chk " + m.name + ": every dump carries a 32-bit integrity checksum + the litefilter/3 tag", () => {
         const snap = m.build().dump();
-        assert.equal(snap.f, "litefilter/2");
+        assert.equal(snap.f, "litefilter/3");
         assert.equal(Number.isInteger(snap.chk) && snap.chk >= 0 && snap.chk <= 0xffffffff, true,
             "chk must be a 32-bit unsigned integer");
     });

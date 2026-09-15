@@ -535,7 +535,7 @@ test("QA: adversarial -- back-to-back builds do not leak peeling scratch state b
 });
 
 /* ============================================================================
- * 9. SNAPSHOT INTEGRITY CHECKSUM (decisions/0021, format litefilter/2) -- the fix for
+ * 9. SNAPSHOT INTEGRITY CHECKSUM (decisions/0021, tag now litefilter/3) -- the fix for
  *    the QA-reported keys-mode/seed fail-open. Proven both positively (the repro is
  *    closed) and by MUTATION (a scratch-patched copy of Filter.js proves the guard --
  *    not luck -- is what closes it).
@@ -700,7 +700,7 @@ test("QA: restore() rejects the deleted-chk case (an absent field, not just an u
 
 test("QA: restore() rejects a v1 ('litefilter/1') tag even with an otherwise-valid chk carried over", () => {
     const snap = chkFilledXor().dump();
-    assert.equal(snap.f, "litefilter/2");
+    assert.equal(snap.f, "litefilter/3");
     snap.f = "litefilter/1"; // the chk field itself is untouched / structurally plausible
     assert.throws(() => XorFilter.restore(snap), /\[lite-filter\].*format tag/,
         "a v1 tag must be rejected on the format-tag door BEFORE the checksum is ever consulted");

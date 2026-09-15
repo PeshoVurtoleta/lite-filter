@@ -34,7 +34,8 @@ export interface FilterStats {
  * `dump()` and consumed by the static `restore()`. The bit store is a plain Array so
  * the snapshot round-trips through `structuredClone` AND JSON. The shared fail-closed
  * tag is always present:
- *   - `f`     -- the format tag, `"litefilter/2"`. `restore()` rejects any other value.
+ *   - `f`     -- the format tag, `"litefilter/3"`. `restore()` rejects any other value
+ *               (a prior tag is never auto-migrated; re-dump under 1.x-next, decisions/0023).
  *   - `chk`   -- a 32-bit integrity checksum (decisions/0021). `restore()` recomputes it and
  *               rejects a mismatch fail-closed (catches a flipped keys-mode / seed).
  *   - `mem`   -- the member name (`"Bloom"`). A mismatch fails closed.
@@ -55,7 +56,7 @@ export interface FilterStats {
  * accepts its own shape and rejects a foreign one via the `mem` tag.
  */
 export interface FilterSnapshot {
-  f: "litefilter/2";
+  f: "litefilter/3";
   /** Family-wide 32-bit integrity checksum (decisions/0021); `restore()` recomputes and
    *  rejects a mismatch fail-closed. An integrity check against corruption, not a MAC. */
   chk: number;
@@ -77,11 +78,12 @@ export interface FilterSnapshot {
   bb?: number;
   /** BlockedBloom / Cuckoo: the block / bucket count. */
   nb?: number;
-  /** Cuckoo: the fingerprint width in bits (8 or 16). Named `fw` -- `f` is the tag. */
+  /** Cuckoo / XOR / BinaryFuse: the fingerprint width in bits (8 or 16). Named `fw` --
+   *  `f` is the format tag. A restore mismatch vs the re-derived width fails closed. */
   fw?: number;
   /** Cuckoo: the bucket size (4). */
   b?: number;
-  /** Cuckoo / XOR: the fingerprint store as a plain array of slots. */
+  /** Cuckoo / XOR / BinaryFuse: the fingerprint store as a plain array of slots. */
   fp?: number[];
   /** XOR: the per-segment length (`bl`; the fingerprint array is `3*bl` slots). */
   bl?: number;
@@ -376,7 +378,8 @@ export class XorFilter<K = unknown> {
 
 /**
  * Binary Fuse filter (Graf & Lemire, "Binary Fuse Filters: Fast and Smaller Than Xor
- * Filters", ACM JEA 2022) -- the SPACE-OPTIMAL static member (decisions/0022). The 7th and
+ * Filters", ACM JEA 2022) -- the SMALLEST static member (~1.13x, decisions/0022; XOR is the
+ * space-optimal ~1.23x reference, BinaryFuse packs tighter still). The 7th and
  * FINAL member: a construction-algorithm swap over XorFilter that reuses the 3-uniform peel
  * but replaces XOR's 3 disjoint segments with 3 OVERLAPPING fuse segments selected by a
  * multiply-shift, packing to ~1.13x (vs XOR's ~1.23x) -- ~9.0 bits/item at fw=8. Static and

@@ -37,7 +37,7 @@ async function main() {
     }
 
     // --- preflight: peers must be installed before anything is imported --------
-    for (const pkg of ["@zakkster/lite-gc-profiler", "@zakkster/lite-leak"]) {
+    for (const pkg of ["@zakkster/lite-gc-profiler", "@zakkster/lite-leak", "@zakkster/lite-signal"]) {
         try { await import(pkg); }
         catch {
             process.stderr.write(
@@ -60,6 +60,15 @@ async function main() {
 
     const SEED = (process.env.TORTURE_SEED >>> 0) || 0x1f2e3d4c;
     const BREAK = process.env.LFILTER_TORTURE_BREAK === "1";
+    // Two more must-fail control arms (test/controls.mjs drives all three out-of-process,
+    // each matched on its SPECIFIC stderr violation text, not merely a nonzero exit):
+    //   LEAK     -- plant a retained-but-tracked object in phase 1 so tracker.size() cannot
+    //               return to 0; the retention gate MUST fail with a RETENTION diagnostic.
+    //   SABOTAGE -- wipe a built filter's store so an added key reads false; the FN law MUST
+    //               trip with a SABOTAGE diagnostic. Both are inert unless their env is set.
+    const LEAK = process.env.LFILTER_TORTURE_LEAK === "1";
+    const SABOTAGE = process.env.LFILTER_TORTURE_SABOTAGE === "1";
+    const leakSink = [];   // module-lifetime retainer for the LEAK arm (never released)
 
     const leaks = [];
     const warns = [];
@@ -74,6 +83,14 @@ async function main() {
     // kernels here would only emit no-owner-set advisories for surfaces we never use.
     tracker.registerKernel(createOwnerCascadeOrphanKernel());
 
+    // Phase-1 LIVENESS proof (a torture that never fires is a false PASS): count every
+    // tracker.track() call and assert it equals the EXACT total the literal loop bounds
+    // below produce. If a loop silently stops tracking (a broken effect, a swallowed
+    // throw), the count diverges from EXPECTED_TRACKED and the gate fails -- so a green
+    // `live === 0` can never be the vacuous "nothing was ever tracked" pass.
+    let tracked = 0;
+    const track = (obj, cleanup, tag, opts) => { tracked++; tracker.track(obj, cleanup, tag, opts); };
+
     // ---- phase 1: retention torture ------------------------------------------
     // Bloom holds only a typed array -- no timers, listeners, or global registry.
     // Each cycle tracks a fresh filter INSIDE a reactive owner scope; disposing the
@@ -86,33 +103,33 @@ async function main() {
                 const f = new Bloom(1024, { keys: "int" });
                 f.add(i | 0);
                 f.mightContain(i | 0);
-                tracker.track(f, () => {}, "bloom", { audit: true });
+                track(f, () => {}, "bloom", { audit: true });
                 // CountingBloom holds only a Uint8Array -- same retention shape. Churn
                 // it through the SAME owner scope so a leak here surfaces too.
                 const g = new CountingBloom(1024, { keys: "int" });
                 g.add(i | 0);
                 g.remove(i | 0);
-                tracker.track(g, () => {}, "counting-bloom", { audit: true });
+                track(g, () => {}, "counting-bloom", { audit: true });
                 // BlockedBloom holds only a Uint32Array -- same retention shape as Bloom.
                 // Churn it through the SAME owner scope so a leak here surfaces too.
                 const h = new BlockedBloom(1024, { keys: "int" });
                 h.add(i | 0);
                 h.mightContain(i | 0);
-                tracker.track(h, () => {}, "blocked-bloom", { audit: true });
+                track(h, () => {}, "blocked-bloom", { audit: true });
                 // Cuckoo holds only a Uint8Array|Uint16Array -- same retention shape.
                 // Churn it through the SAME owner scope so a leak here surfaces too.
                 const c = new Cuckoo(1024, { keys: "int" });
                 c.add(i | 0);
                 c.mightContain(i | 0);
                 c.remove(i | 0);
-                tracker.track(c, () => {}, "cuckoo", { audit: true });
+                track(c, () => {}, "cuckoo", { audit: true });
                 // Quotient holds only a Uint8Array|Uint16Array (+ two preallocated scratch
                 // buffers) -- same retention shape. Churn it through the SAME owner scope.
                 const qf = new Quotient(1024, { keys: "int" });
                 qf.add(i | 0);
                 qf.mightContain(i | 0);
                 qf.remove(i | 0);
-                tracker.track(qf, () => {}, "quotient", { audit: true });
+                track(qf, () => {}, "quotient", { audit: true });
             });
             dispose(e); // disposing the owner untracks the filters -> collectable
         }
@@ -127,7 +144,7 @@ async function main() {
             const e = effect(() => {
                 const xf = XorFilter.from([i, i + 1, i + 2, i + 3, i + 4], { keys: "int" });
                 xf.mightContain(i | 0);
-                tracker.track(xf, () => {}, "xor", { audit: true });
+                track(xf, () => {}, "xor", { audit: true });
             });
             dispose(e); // disposing the owner untracks the filter -> collectable
         }
@@ -141,15 +158,31 @@ async function main() {
             const e = effect(() => {
                 const bf = BinaryFuse.from([i, i + 1, i + 2, i + 3, i + 4], { keys: "int" });
                 bf.mightContain(i | 0);
-                tracker.track(bf, () => {}, "binary-fuse", { audit: true });
+                track(bf, () => {}, "binary-fuse", { audit: true });
             });
             dispose(e); // disposing the owner untracks the filter -> collectable
         }
     });
+    // LEAK control arm: track an object AND retain it in a module-lifetime array, so it can
+    // never be collected. tracker.size() therefore cannot return to 0 -- the retention gate
+    // MUST fail. Uses tracker.track directly (not the counted wrapper) so the phase-1 liveness
+    // count stays exact and the ONLY failing cause is the planted leak. Inert unless LEAK set.
+    if (LEAK) {
+        const planted = new Bloom(1024, { keys: "int" });
+        tracker.track(planted, () => {}, "leak-plant", { audit: true });
+        leakSink.push(planted); // retained forever -> never finalized -> live stays > 0
+    }
     globalThis.gc();
     await new Promise((r) => setTimeout(r, 50));
     const live = tracker.size();
     const findings = tracker.audit();
+    // The EXACT track() total the loops above must have produced, derived from the literal
+    // bounds: the main scope tracks 5 members (bloom, counting, blocked, cuckoo, quotient)
+    // per cycle over CYCLES cycles, then the XOR loop tracks 1 over 50 cycles, then the
+    // BinaryFuse loop tracks 1 over 50 cycles. A divergence means a loop silently stopped
+    // tracking -- so the gate can never pass vacuously on "nothing tracked".
+    const EXPECTED_TRACKED = CYCLES * 5 + 50 + 50;
+    const trackedOk = tracked === EXPECTED_TRACKED;
 
     // ---- phase 2: allocation + GC torture ------------------------------------
     const HOT_CAP = 1 << 16;   // 65536
@@ -190,6 +223,16 @@ async function main() {
     // multiply-shift + 2 within-segment offsets, an XOR-compare -- no scratch). Every probed key
     // is present, so it exercises the query-HIT path. Like XOR it has no add/remove/clear.
     const binstFuse = BinaryFuse.from(xkeys, { keys: "int" });
+    // STRING-KEY steady-state lane (llms.txt: "string keys are zero-alloc-proven"). The
+    // default (arbitrary-key) backing hashes a string over its UTF-16 code units via
+    // charCodeAt -- no String() encode, no scratch -- so add/mightContain on a string key
+    // allocate NOTHING. The keys are pre-interned into an array HERE, OUTSIDE the profiled
+    // loop (building a string per op WOULD allocate and is the very thing the lane must not
+    // do), so the loop below only reads existing string references. It runs inside the SAME
+    // GcProfiler window under the same maxMajor:0 gate, making the llms.txt claim true.
+    const skeys = new Array(HOT_CAP);
+    for (let i = 0; i < HOT_CAP; i++) skeys[i] = "k:" + i;
+    const sinst = new Bloom(HOT_CAP, {});   // default backing: arbitrary (string) keys
 
     // The BREAK control: a retained sink the hot loop feeds one fresh object per op,
     // so heapUsed climbs and the major-GC / pause gate rejects the window.
@@ -225,6 +268,10 @@ async function main() {
         // BinaryFuse: query-only hot path (static). Every probed key is present -- the zero-alloc
         // multiply-shift query-hit path on keys:'int'.
         acc = (acc + (binstFuse.mightContain(i & MASK) ? 1 : 0)) | 0;
+        // STRING lane: add then query a PRE-INTERNED string key (no per-op allocation). Under
+        // the same gc window and maxMajor:0 -- the proof string keys are zero-alloc.
+        sinst.add(skeys[i & MASK]);
+        acc = (acc + (sinst.mightContain(skeys[i & MASK]) ? 1 : 0)) | 0;
         if (BREAK) sink.push({ i: i, acc: acc }); // retained: MUST trip the gate
         if ((i & 8191) === 0) {
             gc.sampleHeap(performance.now(), process.memoryUsage().heapUsed);
@@ -238,6 +285,12 @@ async function main() {
     const s = gc.summary();
     const report = checkNoGc(s, { maxMajor: 0, maxPauseMs: 4 });
     gc.stop();
+
+    // String lane law: every distinct pre-interned string key was added during the loop
+    // (i & MASK cycles the full [0, HOT_CAP) key domain), so all must read true -- one-sided,
+    // 0 false negatives. Proves the string hot path is not only zero-alloc but CORRECT.
+    let strFn = 0;
+    for (let i = 0; i < HOT_CAP; i++) if (!sinst.mightContain(skeys[i])) strFn++;
 
     // clear() must reuse the SAME ArrayBuffer (zero-alloc reset) for both members.
     inst.clear();
@@ -262,7 +315,8 @@ async function main() {
     // that loop, before any merge/resize law runs), so it reflects the genuinely zero-alloc
     // add/mightContain/remove hot paths. A small nonzero value (single-digit B/op) is
     // heapUsed sampling noise, NOT cold-path amortization -- the real zero-alloc proof is the
-    // GC profiler (minor=0, major=0 above) and the lite-perf-gate 0-scavenge scenarios. If
+    // GC profiler's GATED metric (major=0 above; minor GCs are REPORTED but not individually
+    // gated here -- the lite-perf-gate 0-scavenge scenarios own the minor/scavenge bound). If
     // this creeps into the tens/hundreds it is a real hot-path regression, not noise.
     const allocPerOp = Math.max(0, Math.round((heapAfter - heapBefore) / HOT));
 
@@ -272,10 +326,20 @@ async function main() {
     // Law 2: n=1e5, fpp=0.01, 1e6 disjoint probes -- FPR <= 0.0125 (<= 25% over formula).
     const law2 = differentialInt(Bloom, { n: 100000, fpp: 0.01, probes: 1000000, seed: SEED ^ 0x55 });
     const FPR_LIMIT = 0.0125;
-    // Law 3 (CountingBloom): 1e5 mixed add/remove ops mirrored against a Set -- 0 false
-    // negatives for keys CURRENTLY present, and the net count tracks the present-set.
+    // Law 3a (CountingBloom): 1e6 adds then requery -- exactly 0 false negatives (add-only
+    // view; the same one-sided law every member carries).
+    const cbfLaw1 = differentialInt(CountingBloom, { n: 1000000, fpp: 0.01, probes: 1, seed: SEED });
+    // Law 3b (CountingBloom churn): mixed add/remove ops mirrored against a Set -- 0 false
+    // negatives for keys CURRENTLY present, and the net count tracks the present-set. The
+    // keyspace:20000 bound RECURS keys so remove() actually fires (equilibrium present-set
+    // ~keyspace/2, well under the n=20000 capacity, every key at multiplicity 1 so no counter
+    // saturates, decisions/0008). removes MUST exceed 20000 -- proof the delete path ran hard,
+    // not a vacuous add-only churn -- and validateCounting on the CHURNED instance proves the
+    // nibble store survived the churn intact.
     const churn = differentialChurnInt(CountingBloom,
-        { n: 20000, fpp: 0.01, ops: 100000, seed: SEED ^ 0xa5 });
+        { n: 20000, fpp: 0.01, ops: 100000, seed: SEED ^ 0xa5, keyspace: 20000 });
+    validateCounting(churn.filter);
+    const cbfRemovesOk = churn.removes > 20000;
 
     // Law 4 (BlockedBloom): 1e6 adds -> exactly 0 false negatives (add-only, one-sided).
     const bbLaw1 = differentialInt(BlockedBloom, { n: 1000000, fpp: 0.01, probes: 1, seed: SEED });
@@ -412,7 +476,7 @@ async function main() {
     // Law 16c: validate structure after the churn filter too (the shift-back repair proof).
     {
         const vq = new Quotient(20000, { fpp: 0.01, keys: "int", seed: SEED });
-        const rng = (function (seed) { let x = seed >>> 0 || 1; return function () { x ^= x << 13; x >>>= 0; x ^= x >> 17; x ^= x << 5; x >>>= 0; return x >>> 0; }; })(SEED ^ 0x1234);
+        const rng = (function (seed) { let x = seed >>> 0 || 1; return function () { x ^= x << 13; x >>>= 0; x ^= x >>> 17; x ^= x << 5; x >>>= 0; return x >>> 0; }; })(SEED ^ 0x1234);
         const live = new Set();
         for (let i = 0; i < 200000; i++) {
             const k = rng() % 8000;
@@ -515,7 +579,7 @@ async function main() {
     }
 
     // Law 21 (snapshot integrity checksum, decisions/0021): the family-wide `chk` (format
-    // litefilter/2) must REJECT a keys-mode flip and a store-bit flip fail-closed -- the QA
+    // litefilter/3) must REJECT a keys-mode flip and a store-bit flip fail-closed -- the QA
     // fail-open. Proven for a representative MUTABLE member (Bloom) and the STATIC member
     // (XorFilter): pristine dumps round-trip; a flipped keys-mode and a flipped store word
     // each throw [lite-filter]. A pass here means the provenance/store corruption door holds.
@@ -538,13 +602,27 @@ async function main() {
         snapChkOk = bOk && bKeys && bWord && xOk && xKeys && xWord;
     }
 
+    // SABOTAGE control arm: build a filter, add keys, then WIPE its bit store so every added
+    // key now reads false -- a manufactured FALSE NEGATIVE. sabotageFn counts them; it stays 0
+    // on a normal run and is nonzero only when SABOTAGE is set, so the FN law below trips ONLY
+    // under sabotage. Inert (0) unless the env is set. Proves the FN gate has teeth.
+    let sabotageFn = 0;
+    if (SABOTAGE) {
+        const sf = new Bloom(4096, { keys: "int" });
+        for (let i = 0; i < 1000; i++) sf.add(i);
+        sf._words.fill(0);   // corrupt the built store: every added key now reads false
+        for (let i = 0; i < 1000; i++) if (!sf.mightContain(i)) sabotageFn++;
+    }
+
     // ---- verdict --------------------------------------------------------------
     const oracleOk =
         law1.falseNegatives === 0 &&
         law2.falseNegatives === 0 &&
         law2.fpr <= FPR_LIMIT &&
+        cbfLaw1.falseNegatives === 0 &&
         churn.falseNegatives === 0 &&
         churn.present === churn.filterSize &&
+        cbfRemovesOk === true &&
         bbLaw1.falseNegatives === 0 &&
         bbLaw2.falseNegatives === 0 &&
         bbLaw2.fpr <= BB_FPR_LIMIT &&
@@ -588,19 +666,24 @@ async function main() {
         live === 0 &&
         leaks.length === 0 &&
         findings.length === 0 &&
+        trackedOk &&
+        strFn === 0 &&
+        sabotageFn === 0 &&
         sameBuffer &&
         oracleOk;
 
     process.stderr.write(
         "GATE leak=size " + live + "/0 findings=" + findings.length +
         " warnings=" + warns.length +
+        " tracked=" + tracked + "/" + EXPECTED_TRACKED +
         " | gc major=" + s.gc.major + " minor=" + s.gc.minor +
         " maxMs=" + s.gc.maxMs.toFixed(2) +
-        " | alloc=" + allocPerOp + " B/op" +
+        " | alloc=" + allocPerOp + " B/op strFn=" + strFn +
         " | oracle fn=" + (law1.falseNegatives + law2.falseNegatives) +
         " fpr=" + law2.fpr.toFixed(5) + " target=" + law2.target.toFixed(5) +
         " over=" + (((law2.fpr - law2.target) / law2.target) * 100).toFixed(1) + "%" +
-        " | cbf churn fn=" + churn.falseNegatives +
+        " | cbf fn=" + cbfLaw1.falseNegatives + " churn fn=" + churn.falseNegatives +
+        " removes=" + churn.removes +
         " present=" + churn.present + " size=" + churn.filterSize +
         " | bb fn=" + (bbLaw1.falseNegatives + bbLaw2.falseNegatives) +
         " fpr=" + bbLaw2.fpr.toFixed(5) + " ceiling=" + BB_FPR_LIMIT.toFixed(5) +
@@ -639,6 +722,23 @@ async function main() {
         }
         for (const f of findings) process.stderr.write("  finding " + f.kind + ":" + f.reason + "\n");
         for (const l of leaks) process.stderr.write("  leak " + l + "\n");
+        if (live !== 0)
+            process.stderr.write("  RETENTION: " + live +
+                " tracked object(s) outlived their owner -- tracker.size() did not return to 0\n");
+        if (sabotageFn > 0)
+            process.stderr.write("  SABOTAGE: " + sabotageFn +
+                " FALSE NEGATIVE(s) on a corrupted store -- the one-sided guarantee is void\n");
+        if (!trackedOk)
+            process.stderr.write("  phase-1 liveness: tracked " + tracked + " != expected " +
+                EXPECTED_TRACKED + " -- a retention loop stopped tracking (would falsely PASS)\n");
+        if (strFn > 0)
+            process.stderr.write("  STRING lane FALSE NEGATIVE " + strFn +
+                " -- the string hot path read an added key false\n");
+        if (cbfLaw1.falseNegatives > 0)
+            process.stderr.write("  CountingBloom FALSE NEGATIVE on the 1e6-add law -- one-sided guarantee void\n");
+        if (!cbfRemovesOk)
+            process.stderr.write("  CountingBloom churn removes=" + churn.removes +
+                " <= 20000 -- the delete path did not run hard enough (vacuous churn)\n");
         if (!sameBuffer) process.stderr.write("  clear() reallocated the bit store\n");
         if (law1.falseNegatives + law2.falseNegatives + churn.falseNegatives +
             bbLaw1.falseNegatives + bbLaw2.falseNegatives +
@@ -732,4 +832,9 @@ async function main() {
     process.exit(0);
 }
 
-main();
+main().catch((e) => {
+    // A throw anywhere in the gate is a FAIL, not a crash-with-clean-stdout that could be
+    // mistaken for a pass: print the error to stderr and exit nonzero with stdout untouched.
+    process.stderr.write("torture: FAIL -- " + ((e && e.stack) || String(e)) + "\n");
+    process.exit(1);
+});

@@ -275,7 +275,7 @@ test("dump: round-trips through JSON and structuredClone", () => {
 
 test("dump: the tag shape is stable and self-describing (mem + fw + bl + fp)", () => {
     const snap = filledXor({ fpp: 0.01, keys: "int" }).dump();
-    assert.equal(snap.f, "litefilter/2");
+    assert.equal(snap.f, "litefilter/3");
     assert.equal(snap.mem, "Xor");
     assert.equal(snap.fw, 8);
     assert.equal(typeof snap.bl, "number");

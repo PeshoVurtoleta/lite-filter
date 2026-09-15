@@ -401,8 +401,8 @@ self-corrupted. Sizing is pinned to the paper / the FastFilter reference (arity 
 
 **The measure-vs-configured hook.** Same byte-aligned width door (`fw = 8` when
 `fpp >= 2^-8`, else `16`; `fpp < 2^-16` throws) and same width-quantized `2^-fw` FPR. MEASURED
-at n=1e6, fpp=0.01: **slots/item 1.1305, 9.04 bits/item** (LEANER than XOR's ~9.85), measured
-FPR ~0.0038. `npm run bench` prints XOR vs BinaryFuse side by side.
+at n=1e6, fpp=0.01: **slots/item 1.1305 (1.13 at 2dp), 9.04 bits/item** (LEANER than XOR's
+~9.85), measured FPR ~0.0039. `npm run bench` prints XOR vs BinaryFuse side by side.
 
 **Fail-closed build + restore.** Same deterministic reseed (x100 then throw) and the same
 `sp !== n` peel-completeness fail-OPEN guard. `restore()` RE-DERIVES the whole segment
@@ -509,16 +509,24 @@ building. `BinaryFuse.restore` RE-DERIVES the whole segment geometry (`sl`/`sc`)
 -- rejecting an internally-inconsistent-but-legal `sl`/`sc`/`fp.length` triple -- then checks
 `fp.length === (sc+2)*sl` and every word before building.
 
-**Snapshot format v2 -- integrity checksum (decisions/0021).** As of v0.6.0 the format tag
-is `"litefilter/2"` and every `dump()` carries a 32-bit integrity checksum `chk` over the
-tag, member, keys-mode, seed, every sizing/width field, count, and every store word.
-`restore()` recomputes it (after the structural checks, before any write) and REJECTS a
-mismatch fail-closed. This closes a real fail-OPEN: the keys-mode and seed CANNOT be
-re-derived from the stored bytes, so a flipped `keys` (`"int"` <-> `null`) or `seed` used to
-silently reconstruct under the wrong hash path (1990/2000 false negatives on a 2000-key XOR
-dump in the QA repro). `chk` is an INTEGRITY check against accidental corruption, NOT a MAC:
-a determined forger who recomputes `chk` is out of scope, the same as any checksum. A v1
-snapshot has no `chk` and is rejected -- re-`dump()` from a live filter to migrate.
+**Snapshot format v3 -- integrity checksum + the string-derivation break (decisions/0021,
+0023).** The format tag is `"litefilter/3"` and every `dump()` carries a 32-bit integrity
+checksum `chk` over the tag, member, keys-mode, seed, every sizing/width field, count, and
+every store word. `restore()` recomputes it (after the tag check and the structural checks,
+before any write) and REJECTS a mismatch fail-closed. This closes a real fail-OPEN: the
+keys-mode and seed CANNOT be re-derived from the stored bytes, so a flipped `keys` (`"int"`
+<-> `null`) or `seed` used to silently reconstruct under the wrong hash path (1990/2000 false
+negatives on a 2000-key XOR dump in the QA repro). `chk` is an INTEGRITY check against
+accidental corruption, NOT a MAC: a determined forger who recomputes `chk` is out of scope,
+the same as any checksum.
+
+The tag advanced `"litefilter/2"` -> `"litefilter/3"` in 1.1.0 (decisions/0023): the
+`XorFilter` / `BinaryFuse` STRING-key second hash `g` changed from `fmix32(h ^ seed2)` to an
+INDEPENDENT `hashStr(s, seed2)` (removing a single-hash birthday ceiling that wrongly rejected
+large distinct-string sets), so a `"litefilter/2"` XOR/BF snapshot would read every string key
+FALSE. One tag is ONE algorithm for the WHOLE family, so every member is re-tagged -- including
+`Bloom` and int-mode filters whose bytes are unchanged. A `"litefilter/2"` (or earlier)
+snapshot is REJECTED with a migration message -- re-`dump()` from a live filter to migrate.
 
 ### The bench tool
 
@@ -532,7 +540,7 @@ const rows = runBench({ cap: 100000, fpp: 0.01 });
 
 | Export | Meaning |
 | --- | --- |
-| `VERSION` | the package version string (`"1.0.0"`) |
+| `VERSION` | the package version string (`"1.1.0"`) |
 | `Bloom` | the reference member (also the default export) |
 | `CountingBloom` | the deletable member (4-bit saturating counters; a real `remove`) |
 | `BlockedBloom` | the cache-local member (one 512-bit block per key; one cache miss per query, at a higher measured FPR) |
@@ -690,7 +698,8 @@ machine-local -- run `npm run bench`.
 
 ## Testing
 
-`node:test` only, zero runtime deps. The gates (`npm run verify` runs all of them):
+`node:test` only, zero runtime deps -- **497 deterministic tests** across the boundary
+suite. The gates (`npm run verify` runs all of them):
 
 - `npm test` -- the boundary suite: every method, every one-sided law, every
   fail-closed door, plus an ASCII-source guard.
@@ -711,7 +720,7 @@ machine-local -- run `npm run bench`.
   false negatives -- the fail-open regression gate; a non-vacuous width-quantized FPR;
   PROVEN fail-closed exhaustion + immutability throws; 50 build-then-drop retention cycles)
   + a BinaryFuse oracle (a 1e6-key static build with 0 false negatives -- the fail-open
-  regression gate; MEASURED slots/item in [1.08, 1.13] and bits/item <= 9.30; a non-vacuous
+  regression gate; MEASURED slots/item in [1.08, 1.13] (2dp) and bits/item <= 9.30; a non-vacuous
   width-quantized FPR; PROVEN fail-closed exhaustion + immutability + inconsistent-geometry
   restore throws; 50 build-then-drop retention cycles)
   + the `clear()` ArrayBuffer-identity check for the five mutable members.

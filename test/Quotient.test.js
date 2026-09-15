@@ -189,7 +189,7 @@ test("differential: mixed add/remove churn (bounded keyspace) -> 0 false negativ
 test("shift-back repair: validateQuotient passes after heavy add/remove churn (the flagged risk)", () => {
     const f = new Quotient(4000, { fpp: 0.01, keys: "int", seed: 777 });
     let x = 42 >>> 0;
-    const rng = () => { x ^= x << 13; x >>>= 0; x ^= x >> 17; x ^= x << 5; x >>>= 0; return x >>> 0; };
+    const rng = () => { x ^= x << 13; x >>>= 0; x ^= x >>> 17; x ^= x << 5; x >>>= 0; return x >>> 0; };
     const live = new Set();
     for (let i = 0; i < 100000; i++) {
         const k = rng() % 4000;
@@ -266,7 +266,7 @@ test("dump/restore: round-trips membership; restore emits a fresh independent fi
     for (let i = 0; i < 1500; i++) f.add(i);
     const snap = f.dump();
     assert.equal(snap.mem, "Quotient");
-    assert.equal(snap.f, "litefilter/2");
+    assert.equal(snap.f, "litefilter/3");
     const g = Quotient.restore(snap);
     assert.equal(g.size, f.size);
     for (let i = 0; i < 1500; i++) assert.equal(g.mightContain(i), true, "key " + i + " lost on restore");

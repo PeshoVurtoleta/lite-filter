@@ -6,7 +6,7 @@
  *
  * Test-only; not in files[]. ASCII-only.
  */
-import Bloom, { VERSION, CountingBloom, BlockedBloom, Quotient, XorFilter, BinaryFuse } from "../../Filter.js";
+import Bloom, { VERSION, CountingBloom, BlockedBloom, Cuckoo, Quotient, XorFilter, BinaryFuse } from "../../Filter.js";
 import type { LiteFilter, FilterOptions, FilterSnapshot } from "../../Filter.js";
 
 type Equal<A, B> =
@@ -86,6 +86,27 @@ expectTrue<Equal<typeof got3, boolean>>();
 const bbSnap: FilterSnapshot = bb.dump();
 const bbRestored: BlockedBloom<number> = BlockedBloom.restore(bbSnap);
 void bbRestored;
+
+// ---- Cuckoo: the fingerprint deletable member, remove() is REAL (boolean) -----
+const ck = new Cuckoo<number>(1000, { fpp: 0.01, keys: "int" });
+expectTrue<Equal<ReturnType<typeof ck.mightContain>, boolean>>();
+expectTrue<Equal<ReturnType<typeof ck.has>, boolean>>();
+expectTrue<Equal<ReturnType<typeof ck.fpp>, number>>();
+expectTrue<Equal<typeof ck.size, number>>();
+expectTrue<Equal<typeof ck.capacity, number>>();
+const ckRemoved: boolean = ck.remove(1);
+expectTrue<Equal<typeof ckRemoved, boolean>>();
+
+// Cuckoo SATISFIES the uniform surface (one-line member swap).
+const iface5: LiteFilter<number> = new Cuckoo<number>(1000);
+iface5.add(1);
+const got5 = iface5.mightContain(1);
+expectTrue<Equal<typeof got5, boolean>>();
+
+// snapshot round-trips through the typed surface.
+const ckSnap: FilterSnapshot = ck.dump();
+const ckRestored: Cuckoo<number> = Cuckoo.restore(ckSnap);
+void ckRestored;
 
 // ---- Quotient: the mergeable + resizable deletable member --------------------
 const qf = new Quotient<number>(1000, { fpp: 0.01, keys: "int" });

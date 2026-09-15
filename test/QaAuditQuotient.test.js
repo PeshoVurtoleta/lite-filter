@@ -168,7 +168,7 @@ test("QA3: an over-filled Quotient throws [lite-filter], is a byte-identical no-
 test("QA4: shift-back repair keeps validateQuotient (metadata-set==size, #homes==#runs, sorted runs) sound after heavy churn", () => {
     const f = new Quotient(8000, { fpp: 0.01, keys: "int", seed: 0xbeef });
     let x = 13 >>> 0;
-    const rng = () => { x ^= x << 13; x >>>= 0; x ^= x >> 17; x ^= x << 5; x >>>= 0; return x >>> 0; };
+    const rng = () => { x ^= x << 13; x >>>= 0; x ^= x >>> 17; x ^= x << 5; x >>>= 0; return x >>> 0; };
     const live = new Set();
     for (let i = 0; i < 300000; i++) {
         const k = rng() % 6000;

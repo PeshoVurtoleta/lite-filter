@@ -19,7 +19,7 @@ import { validateQuotient } from "./validate.mjs";
  * restored instance silently returns FALSE for every key that was present before the dump,
  * a total false-negative corruption, with NO thrown error.
  * ========================================================================== */
-test("QAH-DEFECT: restore() must reject p===r (quotient width 0 is impossible) -- currently fails open", () => {
+test("QAH: restore() rejects p===r (quotient width 0 is impossible) -- the fail-closed door holds", () => {
     const f = new Quotient(50, { fpp: 0.1, keys: "int" });
     for (let i = 0; i < 30; i++) f.add(i);
     const snap = f.dump();
@@ -28,14 +28,14 @@ test("QAH-DEFECT: restore() must reject p===r (quotient width 0 is impossible) -
     const bad = JSON.parse(JSON.stringify(snap));
     bad.p = bad.r; // quotient width 0 -- impossible for any real Quotient
     assert.throws(
-        () => Quotient.restore(bad, { keys: "int" }),
+        () => Quotient.restore(bad),
         /\[lite-filter\]/,
         "restore() must REJECT p===r as corrupt (q0 = p - r must be >= 1); " +
         "it currently accepts it and produces a silently-corrupted instance"
     );
 });
 
-test("QAH-DEFECT-b: demonstrates the consequence when the door is NOT tightened -- 100% false negatives post-restore", () => {
+test("QAH: the closed p===r door precludes the 100%-false-negative corruption a fail-open would allow", () => {
     const f = new Quotient(50, { fpp: 0.1, keys: "int" });
     for (let i = 0; i < 30; i++) f.add(i);
     const snap = f.dump();
@@ -43,7 +43,7 @@ test("QAH-DEFECT-b: demonstrates the consequence when the door is NOT tightened 
     bad.p = bad.r;
     let restored;
     try {
-        restored = Quotient.restore(bad, { keys: "int" });
+        restored = Quotient.restore(bad);
     } catch {
         return; // if the door is fixed, this test is moot -- QAH-DEFECT above is the gate
     }
@@ -62,7 +62,7 @@ test("QAH boundary: N=1 dump/restore round-trips membership exactly", () => {
     const f = new Quotient(1, { keys: "int" });
     f.add(9);
     const snap = f.dump();
-    const g = Quotient.restore(snap, { keys: "int" });
+    const g = Quotient.restore(snap);
     assert.equal(g.mightContain(9), true);
     assert.equal(g.size, 1);
     validateQuotient(g);
@@ -203,7 +203,7 @@ test("QAH snapshot: dump -> restore -> dump is idempotent (byte-identical snapsh
     for (let i = 0; i < 300; i++) f.add(i);
     for (let i = 0; i < 50; i++) f.remove(i);
     const snap1 = f.dump();
-    const g = Quotient.restore(snap1, { keys: "int" });
+    const g = Quotient.restore(snap1);
     const snap2 = g.dump();
     assert.deepEqual(snap1, snap2, "a restore -> dump round trip must reproduce byte-identical state");
 });
@@ -292,7 +292,7 @@ test("QAH restore: rejects an unsorted run (in-range words, homes==runs, but rem
     const headMeta = store[head] & 7, contMeta = store[cont] & 7;
     store[head] = (contRem << 3) | headMeta;
     store[cont] = (headRem << 3) | contMeta;
-    assert.throws(() => Quotient.restore(Object.assign({}, snap, { store }), { keys: "int" }),
+    assert.throws(() => Quotient.restore(Object.assign({}, snap, { store })),
         /\[lite-filter\].*(corrupt slot structure|not sorted)/,
         "an unsorted run must be rejected by the deep structural check");
 });
@@ -307,7 +307,7 @@ test("QAH restore: a wrong (but validly-shaped) seed is REJECTED by the integrit
     // checked against opaque slot data). The family-wide snapshot checksum (decisions/0021)
     // folds the seed into `chk`, so a flipped seed now fails closed rather than shipping a
     // wrong filter -- the fix for the QA-reported fail-open (same class as the keys-mode flip).
-    assert.throws(() => Quotient.restore(bad, { keys: "int" }), /\[lite-filter\].*checksum/,
+    assert.throws(() => Quotient.restore(bad), /\[lite-filter\].*checksum/,
         "a wrong seed must be rejected by the integrity checksum, not silently trusted");
 });
 
@@ -338,8 +338,8 @@ test("QAH restore: a truncated store and an over-long store are BOTH rejected, n
     const snap = f.dump();
     const short = { ...snap, store: snap.store.slice(0, snap.store.length - 10) };
     const long = { ...snap, store: snap.store.concat([0, 0, 0]) };
-    assert.throws(() => Quotient.restore(short, { keys: "int" }), /corrupt slot store/);
-    assert.throws(() => Quotient.restore(long, { keys: "int" }), /corrupt slot store/);
+    assert.throws(() => Quotient.restore(short), /corrupt slot store/);
+    assert.throws(() => Quotient.restore(long), /corrupt slot store/);
 });
 
 // out-of-range remainder (word encodes a remainder wider than r bits, but metadata nonzero).
@@ -353,7 +353,7 @@ test("QAH restore: an out-of-range remainder (exceeds r bits) in an occupied slo
     // Overflow the remainder field beyond r bits while keeping metadata plausible.
     let idx = store.findIndex((w) => (w & 7) !== 0);
     store[idx] = maxWord + 8; // remainder now (rMask+1), out of range
-    assert.throws(() => Quotient.restore(Object.assign({}, snap, { store }), { keys: "int" }),
+    assert.throws(() => Quotient.restore(Object.assign({}, snap, { store })),
         /corrupt slot word/);
 });
 
@@ -362,7 +362,7 @@ test("QAH restore: an out-of-range remainder (exceeds r bits) in an occupied slo
 test("QAH restore: occ-count matches count, but #homes != #runs (a continuation slot fabricated as ALSO a home) is rejected", () => {
     const f = new Quotient(1000, { fpp: 0.01, keys: "int", seed: 0x44 });
     let x = 99 >>> 0;
-    const rng = () => { x ^= x << 13; x >>>= 0; x ^= x >> 17; x ^= x << 5; x >>>= 0; return x >>> 0; };
+    const rng = () => { x ^= x << 13; x >>>= 0; x ^= x >>> 17; x ^= x << 5; x >>>= 0; return x >>> 0; };
     // Drive enough churn to guarantee at least one multi-element run (a continuation slot).
     for (let i = 0; i < 400; i++) f.add(rng() % 100);
     const snap = f.dump();
@@ -376,7 +376,7 @@ test("QAH restore: occ-count matches count, but #homes != #runs (a continuation 
     }
     assert.notEqual(idx, -1, "test setup: expected at least one continuation slot (a multi-element run)");
     store[idx] |= 1; // fabricate an extra "home" inside an existing run without a new run
-    assert.throws(() => Quotient.restore(Object.assign({}, snap, { store }), { keys: "int" }),
+    assert.throws(() => Quotient.restore(Object.assign({}, snap, { store })),
         /\[lite-filter\].*(corrupt slot structure|occupied homes but)/,
         "an occupied-count/run-count mismatch must be rejected (REJECT never truncate)");
 });

@@ -10,7 +10,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
-const FILES = ["../Filter.js", "../Filter.d.ts"];
+const FILES = ["../Filter.js", "../Filter.d.ts", "../benchmark/Bench.mjs", "../llms.txt"];
 const ALLOWED = new Set([0x00d7, 0x00b5]); // x (multiply) and micro
 
 test("source is ASCII-only (U+00D7 and U+00B5 excepted)", () => {

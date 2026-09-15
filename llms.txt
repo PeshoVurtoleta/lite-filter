@@ -18,7 +18,7 @@ via <Member>.from(keys) and throw on add/remove/clear. Single-file ESM, zero run
 dependencies, node:test only. Ships a runnable + importable bench (Bench.mjs) that measures
 ACTUAL vs THEORETICAL false-positive rate on your own keys, checked against a real Set oracle.
 
-## Status: 1.0.0 (family complete, API frozen) - Bloom (reference) + CountingBloom (deletable) + BlockedBloom (cache-local) + Cuckoo (fingerprint) + Quotient (mergeable/resizable) + XorFilter (static, space-optimal) + BinaryFuse (static, smallest).
+## Status: 1.1.0 - fail-closed option doors + string-edge entropy fix + litefilter/3 snapshots. Family complete and API frozen since 1.0.0 - Bloom (reference) + CountingBloom (deletable) + BlockedBloom (cache-local) + Cuckoo (fingerprint) + Quotient (mergeable/resizable) + XorFilter (static, space-optimal) + BinaryFuse (static, smallest).
 
 The problem it solves: "have I seen this key?" -- dedup, set membership, cache
 admission -- at a handful of BITS per entry instead of the tens of bytes a Set costs
@@ -70,14 +70,19 @@ Cross-cutting, mirrored from lite-lru:
   { fw, sl, sc, fp } and RE-DERIVES the whole segment geometry from count (rejecting an
   internally-inconsistent sl/sc/fp.length triple), fw from fpp, fp.length == (sc+2)*sl, and
   every slot 0..(1<<fw)-1 before build.
-  SNAPSHOT FORMAT v2 (litefilter/2, decisions/0021): every dump() also carries a 32-bit
+  SNAPSHOT FORMAT v3 (litefilter/3, decisions/0021, 0023): every dump() also carries a 32-bit
   integrity checksum `chk` over the tag, mem, keys-mode, seed, every sizing/width field,
-  count, and every store word. restore() recomputes it (after the structural checks, before
-  any write) and REJECTS a mismatch fail-closed. This closes a real fail-OPEN: keys-mode and
-  seed cannot be re-derived from the stored bytes, so a flipped keys ("int" <-> null) or seed
-  used to silently reconstruct under the wrong hash path (1990/2000 false negatives). `chk`
-  is an INTEGRITY check against accidental corruption, NOT a MAC (a forger who recomputes chk
-  is out of scope). A v1 snapshot has no chk and is REJECTED (re-dump to migrate).
+  count, and every store word. restore() recomputes it (after the tag check and the structural
+  checks, before any write) and REJECTS a mismatch fail-closed. This closes a real fail-OPEN:
+  keys-mode and seed cannot be re-derived from the stored bytes, so a flipped keys ("int" <->
+  null) or seed used to silently reconstruct under the wrong hash path (1990/2000 false
+  negatives). `chk` is an INTEGRITY check against accidental corruption, NOT a MAC (a forger who
+  recomputes chk is out of scope). The tag advanced litefilter/2 -> litefilter/3 in 1.1.0
+  (decisions/0023): the XOR/Binary Fuse STRING-key second hash `g` changed from fmix32(h ^ seed2)
+  to an independent hashStr(s, seed2), so a litefilter/2 XOR/BF snapshot would read every string
+  key FALSE. One tag is ONE algorithm for the WHOLE family, so every member is re-tagged --
+  including Bloom and int-mode filters whose bytes are unchanged. A litefilter/2 (or earlier)
+  snapshot is REJECTED with a migration message: re-dump() under 1.1.0 to produce litefilter/3.
 
 ## Members
 
@@ -276,7 +281,7 @@ is a hypothesis, not your filter's behavior on your keys -- MEASURE.
 - BinaryFuse static + SMALLEST + fail-closed: mightContain on keys:'int' is 0 scavenges at
   N=200000 and 8N=1600000 (perf-gate; 3 hashes, a multiply-shift + 2 within-segment offsets,
   an XOR-compare, no scratch); a filter built from 1e6 distinct keys reads back with EXACTLY 0
-  false negatives (the fail-OPEN regression gate); measured slots/item 1.1305 (in [1.08,1.13])
+  false negatives (the fail-OPEN regression gate); measured slots/item 1.1305 (in [1.08,1.13], 2dp)
   and bits/item 9.04 <= 9.30 at n=1e6 -- LEANER than XOR's ~9.85; n=1e5, fpp=0.01 (fw=8) over
   1e6 disjoint probes -> measured FPR <= 0.0050 (~0.0038, UNDER target) AND > 0 (non-vacuous);
   a DEGENERATE set exhausts 100 reseeds and THROWS; add/remove/clear/new all THROW; restore()

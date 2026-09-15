@@ -29,12 +29,20 @@
 
 import { Bloom, CountingBloom, BlockedBloom, Cuckoo, Quotient, XorFilter, BinaryFuse, VERSION } from "../Filter.js";
 
+/** The fail-closed message for a bench false negative. The one-sided guarantee ("a key that
+ *  was added always reads true") is a HARD law: a nonzero count is a correctness bug, not a
+ *  metric, so the importable measure fns THROW this and the CLI wrapper exits 1. */
+function benchFnMsg(member, workload, falseNeg) {
+    return "[lite-filter/bench] " + member + " '" + workload + "': " + falseNeg +
+        " FALSE NEGATIVE(s) -- the one-sided guarantee is void (this is a bug, not a rate).";
+}
+
 /** Seeded xorshift32 -- byte-reproducible from its seed. */
 export function makePrng(seed) {
     let x = (seed >>> 0) || 1;
     return function next() {
         x ^= x << 13; x >>>= 0;
-        x ^= x >> 17;
+        x ^= x >>> 17;
         x ^= x << 5;  x >>>= 0;
         return x >>> 0;
     };
@@ -107,9 +115,12 @@ export function adversarial(n, probes, seed) {
  * Measure one workload against a fresh Bloom sized (cap, fpp). Returns a plain row
  * of numbers. Checked against a real `Set` oracle so a false positive is unambiguous.
  */
-export function measure(name, gen, cap, fpp, seed) {
+export function measure(name, gen, cap, fpp, seed, sizeCap) {
     const { keys, probes } = gen(cap, Math.max(cap * 10, 100000), seed);
-    const filter = new Bloom(cap, { fpp, keys: "int" });
+    // sizeCap decouples FILTER sizing from the workload key COUNT: for a skewed workload
+    // (zipfian) the honest filter is sized to the DISTINCT count, not the cap, so bits/item
+    // and the theoretical rate reflect a correctly-sized filter (zipfian honesty, task 13).
+    const filter = new Bloom((sizeCap || cap), { fpp, keys: "int" });
     const truth = new Set();
 
     const t0 = performance.now();
@@ -126,6 +137,7 @@ export function measure(name, gen, cap, fpp, seed) {
     let acc = 0;
     for (let i = 0; i < probes.length; i++) acc += filter.mightContain(probes[i]) ? 1 : 0;
     const queryNs = ((performance.now() - t1) * 1e6) / probes.length;
+    if (acc === -1) process.stdout.write(""); // keep acc observable (no DCE)
     let falsePos = 0, probed = 0;
     for (let i = 0; i < probes.length; i++) {
         if (truth.has(probes[i])) continue;
@@ -141,6 +153,10 @@ export function measure(name, gen, cap, fpp, seed) {
     const overPct = theoretical === 0 ? 0 : ((measuredFpr - theoretical) / theoretical) * 100;
     const bitsPerItem = m / distinct;
 
+    // A false negative voids the one-sided guarantee: the importable fn THROWS (the CLI
+    // wrapper catches it, prints to stderr, and exits 1) -- never a silently-reported row.
+    if (falseNeg !== 0) throw new Error(benchFnMsg("Bloom", name, falseNeg));
+
     return {
         name, added: keys.length, distinct, bitsPerItem, k,
         measuredFpr, theoretical, overPct, addNs, queryNs, falseNeg,
@@ -151,9 +167,9 @@ export function measure(name, gen, cap, fpp, seed) {
  * Measure one workload against a fresh CountingBloom sized (cap, fpp). Same row shape
  * as `measure`, so the two members print into the same table for a direct comparison.
  */
-export function measureCounting(name, gen, cap, fpp, seed) {
+export function measureCounting(name, gen, cap, fpp, seed, sizeCap) {
     const { keys, probes } = gen(cap, Math.max(cap * 10, 100000), seed);
-    const filter = new CountingBloom(cap, { fpp, keys: "int" });
+    const filter = new CountingBloom((sizeCap || cap), { fpp, keys: "int" });
     const truth = new Set();
 
     const t0 = performance.now();
@@ -168,6 +184,7 @@ export function measureCounting(name, gen, cap, fpp, seed) {
     let acc = 0;
     for (let i = 0; i < probes.length; i++) acc += filter.mightContain(probes[i]) ? 1 : 0;
     const queryNs = ((performance.now() - t1) * 1e6) / probes.length;
+    if (acc === -1) process.stdout.write(""); // keep acc observable (no DCE)
     let falsePos = 0, probed = 0;
     for (let i = 0; i < probes.length; i++) {
         if (truth.has(probes[i])) continue;
@@ -184,6 +201,8 @@ export function measureCounting(name, gen, cap, fpp, seed) {
     // CountingBloom's nibble store is 4 bits/counter -> 4x a plain Bloom's bits/item.
     const bitsPerItem = (m * 4) / distinct;
 
+    if (falseNeg !== 0) throw new Error(benchFnMsg("CountingBloom", name, falseNeg));
+
     return {
         name, added: keys.length, distinct, bitsPerItem, k,
         measuredFpr, theoretical, overPct, addNs, queryNs, falseNeg,
@@ -196,9 +215,9 @@ export function measureCounting(name, gen, cap, fpp, seed) {
  * (same store size as Bloom); the honest deltas are query ns (LOWER -- one cache miss)
  * and measured FPR (HIGHER -- lost cross-block independence, decisions/0013).
  */
-export function measureBlocked(name, gen, cap, fpp, seed) {
+export function measureBlocked(name, gen, cap, fpp, seed, sizeCap) {
     const { keys, probes } = gen(cap, Math.max(cap * 10, 100000), seed);
-    const filter = new BlockedBloom(cap, { fpp, keys: "int" });
+    const filter = new BlockedBloom((sizeCap || cap), { fpp, keys: "int" });
     const truth = new Set();
 
     const t0 = performance.now();
@@ -228,6 +247,8 @@ export function measureBlocked(name, gen, cap, fpp, seed) {
     const theoretical = Math.pow(1 - Math.exp(-(k * distinct) / m), k);
     const overPct = theoretical === 0 ? 0 : ((measuredFpr - theoretical) / theoretical) * 100;
     const bitsPerItem = m / distinct;
+
+    if (falseNeg !== 0) throw new Error(benchFnMsg("BlockedBloom", name, falseNeg));
 
     return {
         name, added: keys.length, distinct, bitsPerItem, k,
@@ -285,6 +306,8 @@ export function measureCuckoo(name, gen, cap, fpp, seed) {
     // ACTUAL store: nb*b slots byte-aligned to 8 or 16 bits per slot.
     const bitsPerItem = distinct === 0 ? 0 : (filter._store.byteLength * 8) / distinct;
 
+    if (falseNeg !== 0) throw new Error(benchFnMsg("Cuckoo", name, falseNeg));
+
     return {
         name, added, distinct, bitsPerItem, k,
         measuredFpr, theoretical, overPct, addNs, queryNs, falseNeg, overflowed,
@@ -334,11 +357,16 @@ export function measureQuotient(name, gen, cap, fpp, seed) {
     // The remainder width r is the row's "k" column (a Quotient has no k probes).
     const k = filter._r;
     const measuredFpr = probed === 0 ? 0 : falsePos / probed;
-    // Quotient FPR is remainder-quantized: load * 2^-r.
-    const theoretical = (filter.size / filter._nslots) * Math.pow(2, -filter._r);
+    // Quotient FPR is remainder-quantized: load * 2^-r. The load is the fraction of slots
+    // holding a DISTINCT fingerprint -- use `distinct`, NOT filter.size, which on a skewed
+    // (zipfian) workload counts multiplicity (repeated adds of the same key) and would
+    // OVERSTATE the load and thus the theoretical rate (zipfian honesty, task 13).
+    const theoretical = (distinct / filter._nslots) * Math.pow(2, -filter._r);
     const overPct = theoretical === 0 ? 0 : ((measuredFpr - theoretical) / theoretical) * 100;
     // ACTUAL store: (nslots + guard) slots byte-aligned to the r+3 slot word width.
     const bitsPerItem = distinct === 0 ? 0 : (filter._store.byteLength * 8) / distinct;
+
+    if (falseNeg !== 0) throw new Error(benchFnMsg("Quotient", name, falseNeg));
 
     return {
         name, added, distinct, bitsPerItem, k,
@@ -389,6 +417,8 @@ export function measureXor(name, gen, cap, fpp, seed) {
     // ACTUAL store: 3*bl slots byte-aligned to fw bits per slot.
     const bitsPerItem = distinct === 0 ? 0 : (filter._fp.byteLength * 8) / distinct;
 
+    if (falseNeg !== 0) throw new Error(benchFnMsg("XorFilter", name, falseNeg));
+
     return {
         name, added: distinct, distinct, bitsPerItem, k,
         measuredFpr, theoretical, overPct, addNs, queryNs, falseNeg,
@@ -436,6 +466,8 @@ export function measureBinaryFuse(name, gen, cap, fpp, seed) {
     // ACTUAL store: (sc+2)*sl slots byte-aligned to fw bits per slot.
     const bitsPerItem = distinct === 0 ? 0 : (filter._fp.byteLength * 8) / distinct;
 
+    if (falseNeg !== 0) throw new Error(benchFnMsg("BinaryFuse", name, falseNeg));
+
     return {
         name, added: distinct, distinct, bitsPerItem, k,
         measuredFpr, theoretical, overPct, addNs, queryNs, falseNeg,
@@ -469,11 +501,22 @@ export function measureRemove(cap, fpp, seed) {
     let residual = 0;
     for (let i = 0; i < half; i++) if (filter.mightContain(distinct[i])) residual++;
 
+    if (falseNegPresent !== 0) throw new Error(benchFnMsg("CountingBloom remove-churn", "present", falseNegPresent));
+
     return {
         name: "remove-churn", added: distinct.length, removed: half,
         stillPresent: distinct.length - half, falseNegPresent, residual,
         residualRate: half === 0 ? 0 : residual / half, removeNs, size: filter.size,
     };
+}
+
+/** The DISTINCT-key count a seeded generator actually produces at (cap, seed). Used to
+ *  size a Bloom-family filter for the ZIPFIAN workload to its real distinct cardinality
+ *  (not the cap), so bits/item and the theoretical rate are honest (task 13). Deterministic:
+ *  the same seed replays, so the count matches the run the measure fn does internally. */
+function distinctCount(gen, cap, seed) {
+    const { keys } = gen(cap, 1, seed);
+    return new Set(keys).size;
 }
 
 /** Run the full workload matrix. Returns an array of rows. */
@@ -483,7 +526,7 @@ export function runBench(opts) {
     const seed = (opts && opts.seed) || 0xC0FFEE;
     const rows = [];
     rows.push(measure("uniform", uniform, cap, fpp, seed));
-    rows.push(measure("zipfian", zipfian, cap, fpp, seed ^ 0x11));
+    rows.push(measure("zipfian", zipfian, cap, fpp, seed ^ 0x11, distinctCount(zipfian, cap, seed ^ 0x11)));
     rows.push(measure("sequential", sequential, cap, fpp, seed ^ 0x22));
     // adversarial: oversize the key set to ~1.5x cap -> near-full load factor.
     rows.push(measure("adversarial", (n, p, s) => adversarial(Math.floor(cap * 1.5), p, s),
@@ -498,7 +541,7 @@ export function runBenchBlocked(opts) {
     const seed = (opts && opts.seed) || 0xC0FFEE;
     const rows = [];
     rows.push(measureBlocked("uniform", uniform, cap, fpp, seed));
-    rows.push(measureBlocked("zipfian", zipfian, cap, fpp, seed ^ 0x11));
+    rows.push(measureBlocked("zipfian", zipfian, cap, fpp, seed ^ 0x11, distinctCount(zipfian, cap, seed ^ 0x11)));
     rows.push(measureBlocked("sequential", sequential, cap, fpp, seed ^ 0x22));
     rows.push(measureBlocked("adversarial", (n, p, s) => adversarial(Math.floor(cap * 1.5), p, s),
         cap, fpp, seed ^ 0x33));
@@ -512,7 +555,7 @@ export function runBenchCounting(opts) {
     const seed = (opts && opts.seed) || 0xC0FFEE;
     const rows = [];
     rows.push(measureCounting("uniform", uniform, cap, fpp, seed));
-    rows.push(measureCounting("zipfian", zipfian, cap, fpp, seed ^ 0x11));
+    rows.push(measureCounting("zipfian", zipfian, cap, fpp, seed ^ 0x11, distinctCount(zipfian, cap, seed ^ 0x11)));
     rows.push(measureCounting("sequential", sequential, cap, fpp, seed ^ 0x22));
     rows.push(measureCounting("adversarial", (n, p, s) => adversarial(Math.floor(cap * 1.5), p, s),
         cap, fpp, seed ^ 0x33));
@@ -585,7 +628,8 @@ function printRows(rows) {
     process.stdout.write(
         pad("workload", 12) + pad("bits/item", 11) + pad("k", 3) +
         pad("measFPR", 11) + pad("theoFPR", 11) + pad("% over", 9) +
-        pad("add ns", 9) + pad("query ns", 10) + pad("falseNeg", 10) + "\n");
+        pad("add ns", 9) + pad("query ns", 10) +
+        pad("added", 9) + pad("distinct", 10) + pad("falseNeg", 10) + "\n");
     for (const r of rows) {
         process.stdout.write(
             pad(r.name, 12) +
@@ -596,6 +640,8 @@ function printRows(rows) {
             pad(r.overPct.toFixed(1) + "%", 9) +
             pad(r.addNs.toFixed(1), 9) +
             pad(r.queryNs.toFixed(1), 10) +
+            pad(r.added, 9) +
+            pad(r.distinct, 10) +
             pad(r.falseNeg, 10) + "\n");
     }
 }
@@ -644,7 +690,8 @@ function printBlockedTable(bloomRows, blockedRows, cap, fpp) {
     process.stdout.write(
         pad("workload", 12) + pad("bits/item", 11) +
         pad("Bloom FPR", 12) + pad("Blkd FPR", 12) + pad("FPR delta", 11) +
-        pad("Bloom qns", 11) + pad("Blkd qns", 11) + pad("qns delta", 11) + "\n");
+        pad("Bloom qns", 11) + pad("Blkd qns", 11) + pad("qns delta", 11) +
+        pad("distinct", 10) + pad("fn", 5) + "\n");
     for (let i = 0; i < bloomRows.length; i++) {
         const bl = bloomRows[i];
         const bb = blockedRows[i];
@@ -658,7 +705,8 @@ function printBlockedTable(bloomRows, blockedRows, cap, fpp) {
             pad((fprDelta >= 0 ? "+" : "") + fprDelta.toFixed(5), 11) +
             pad(bl.queryNs.toFixed(1), 11) +
             pad(bb.queryNs.toFixed(1), 11) +
-            pad((qnsDelta >= 0 ? "+" : "") + qnsDelta.toFixed(1), 11) + "\n");
+            pad((qnsDelta >= 0 ? "+" : "") + qnsDelta.toFixed(1), 11) +
+            pad(bb.distinct, 10) + pad(bl.falseNeg + bb.falseNeg, 5) + "\n");
     }
     process.stdout.write(
         "\nBlkd FPR > Bloom FPR is the PENALTY (decisions/0013); Blkd qns < Bloom qns is\n" +
@@ -683,12 +731,18 @@ function printCuckooTable(bloomRows, cuckooRows, cap, fpp) {
     process.stdout.write(
         pad("workload", 12) + pad("Bl b/item", 11) + pad("Ck b/item", 11) +
         pad("Bloom FPR", 12) + pad("Ckoo FPR", 12) + pad("Ck theoFPR", 12) +
-        pad("Bl add", 9) + pad("Ck add", 9) + pad("added", 9) + "\n");
+        pad("Bl add", 9) + pad("Ck add", 9) +
+        pad("added", 9) + pad("distinct", 10) + pad("fn", 5) + "\n");
     for (let i = 0; i < bloomRows.length; i++) {
         const bl = bloomRows[i];
         const ck = cuckooRows[i];
+        // Cuckoo does NOT dedupe: on the zipfian workload the same key is inserted many
+        // times, so it fills with DUPLICATE fingerprints and saturates the table (added >>
+        // distinct, an early fail-closed overflow). The row is a duplicate-saturation
+        // demonstration, NOT a like-for-like space number -- flagged with (dup-sat) below.
+        const dupSat = ck.name === "zipfian" && ck.added > ck.distinct;
         process.stdout.write(
-            pad(bl.name, 12) +
+            pad(bl.name + (dupSat ? " (dup-sat)" : ""), 12) +
             pad(bl.bitsPerItem.toFixed(2), 11) +
             pad(ck.bitsPerItem.toFixed(2), 11) +
             pad(bl.measuredFpr.toFixed(5), 12) +
@@ -696,12 +750,15 @@ function printCuckooTable(bloomRows, cuckooRows, cap, fpp) {
             pad(ck.theoretical.toFixed(5), 12) +
             pad(bl.addNs.toFixed(1), 9) +
             pad(ck.addNs.toFixed(1), 9) +
-            pad(ck.added + (ck.overflowed ? "*" : ""), 9) + "\n");
+            pad(ck.added + (ck.overflowed ? "*" : ""), 9) +
+            pad(ck.distinct, 10) + pad(bl.falseNeg + ck.falseNeg, 5) + "\n");
     }
     process.stdout.write(
         "\n* = add() hit the fail-closed capacity door (decisions/0014); metrics are over\n" +
-        "the keys that landed. Cuckoo deletes (remove -> boolean) and its FPR is quantized\n" +
-        "by the byte-aligned fingerprint width -- MEASURE your own keys.\n\n");
+        "the keys that landed. (dup-sat) = Cuckoo does NOT dedupe, so the zipfian row inserts\n" +
+        "repeated keys as DUPLICATE fingerprints (added >> distinct) and saturates -- a\n" +
+        "duplicate-saturation demonstration, not a like-for-like space number. Cuckoo deletes\n" +
+        "(remove -> boolean); its FPR is quantized by the fingerprint width -- MEASURE your keys.\n\n");
 }
 
 /**
@@ -723,7 +780,8 @@ function printQuotientTable(bloomRows, qfRows, cap, fpp) {
     process.stdout.write(
         pad("workload", 12) + pad("Bl b/item", 11) + pad("Qf b/item", 11) +
         pad("Bloom FPR", 12) + pad("Qtnt FPR", 12) + pad("Qf theoFPR", 12) +
-        pad("Bl add", 9) + pad("Qf add", 9) + pad("added", 9) + "\n");
+        pad("Bl add", 9) + pad("Qf add", 9) +
+        pad("added", 9) + pad("distinct", 10) + pad("fn", 5) + "\n");
     for (let i = 0; i < bloomRows.length; i++) {
         const bl = bloomRows[i];
         const qf = qfRows[i];
@@ -736,7 +794,8 @@ function printQuotientTable(bloomRows, qfRows, cap, fpp) {
             pad(qf.theoretical.toFixed(5), 12) +
             pad(bl.addNs.toFixed(1), 9) +
             pad(qf.addNs.toFixed(1), 9) +
-            pad(qf.added + (qf.overflowed ? "*" : ""), 9) + "\n");
+            pad(qf.added + (qf.overflowed ? "*" : ""), 9) +
+            pad(qf.distinct, 10) + pad(bl.falseNeg + qf.falseNeg, 5) + "\n");
     }
     process.stdout.write(
         "\n* = add() hit the fail-closed 0.90 load ceiling (decisions/0016); metrics are over\n" +
@@ -764,7 +823,8 @@ function printXorTable(bloomRows, xfRows, cap, fpp) {
     process.stdout.write(
         pad("workload", 12) + pad("Bl b/item", 11) + pad("Xf b/item", 11) +
         pad("Bloom FPR", 12) + pad("Xor FPR", 12) + pad("Xf theoFPR", 12) +
-        pad("Bl add", 9) + pad("Xf build", 10) + pad("distinct", 10) + "\n");
+        pad("Bl add", 9) + pad("Xf build", 10) +
+        pad("added", 9) + pad("distinct", 10) + pad("fn", 5) + "\n");
     for (let i = 0; i < bloomRows.length; i++) {
         const bl = bloomRows[i];
         const xf = xfRows[i];
@@ -777,7 +837,8 @@ function printXorTable(bloomRows, xfRows, cap, fpp) {
             pad(xf.theoretical.toFixed(5), 12) +
             pad(bl.addNs.toFixed(1), 9) +
             pad(xf.addNs.toFixed(1), 10) +
-            pad(xf.distinct, 10) + "\n");
+            pad(bl.added, 9) +
+            pad(xf.distinct, 10) + pad(bl.falseNeg + xf.falseNeg, 5) + "\n");
     }
     process.stdout.write(
         "\nAn XOR filter DEDUPES its input (keys are a SET, not multiplicity -- contrast\n" +
@@ -803,7 +864,8 @@ function printBinaryFuseTable(xorRows, bfRows, cap, fpp) {
     process.stdout.write(
         pad("workload", 12) + pad("Xf b/item", 11) + pad("Bf b/item", 11) +
         pad("Xor FPR", 12) + pad("Bf FPR", 12) + pad("Bf theoFPR", 12) +
-        pad("Xf build", 10) + pad("Bf build", 10) + pad("distinct", 10) + "\n");
+        pad("Xf build", 10) + pad("Bf build", 10) +
+        pad("added", 9) + pad("distinct", 10) + pad("fn", 5) + "\n");
     for (let i = 0; i < xorRows.length; i++) {
         const xf = xorRows[i];
         const bf = bfRows[i];
@@ -816,7 +878,8 @@ function printBinaryFuseTable(xorRows, bfRows, cap, fpp) {
             pad(bf.theoretical.toFixed(5), 12) +
             pad(xf.addNs.toFixed(1), 10) +
             pad(bf.addNs.toFixed(1), 10) +
-            pad(bf.distinct, 10) + "\n");
+            pad(bf.added, 9) +
+            pad(bf.distinct, 10) + pad(xf.falseNeg + bf.falseNeg, 5) + "\n");
     }
     process.stdout.write(
         "\nBf b/item < Xf b/item is the WIN (the space headline of the family). Both DEDUPE their\n" +
@@ -828,13 +891,30 @@ if (import.meta.url === "file://" + process.argv[1] ||
     import.meta.url === new URL("file://" + process.argv[1]).href) {
     const cap = 100000;
     const fpp = 0.01;
-    const bloomRows = runBench({ cap, fpp });
-    printTable(bloomRows, cap, fpp);
-    printCountingTable(runBenchCounting({ cap, fpp }), measureRemove(cap, fpp, 0xC0FFEE ^ 0x44), cap, fpp);
-    printBlockedTable(bloomRows, runBenchBlocked({ cap, fpp }), cap, fpp);
-    printCuckooTable(bloomRows, runBenchCuckoo({ cap, fpp }), cap, fpp);
-    printQuotientTable(bloomRows, runBenchQuotient({ cap, fpp }), cap, fpp);
-    const xorRows = runBenchXor({ cap, fpp });
-    printXorTable(bloomRows, xorRows, cap, fpp);
-    printBinaryFuseTable(xorRows, runBenchBinaryFuse({ cap, fpp }), cap, fpp);
+    const seed = 0xC0FFEE;
+    // Honesty header (lite-lru precedent): print the exact replay seed and the caveat that
+    // EVERY member runs in ONE process in a FIXED order, so JIT warmup and GC timing colour
+    // the ns/op numbers -- they are machine-local examples, never a cross-member headline.
+    process.stdout.write(
+        "@zakkster/lite-filter v" + VERSION + " -- bench  (seed=0x" + seed.toString(16) +
+        ", cap=" + cap + ", fpp=" + fpp + ")\n" +
+        "All members run in ONE process in a FIXED order: JIT warmup + GC timing colour the\n" +
+        "ns/op numbers. They are machine-local EXAMPLES, not a cross-member headline. The\n" +
+        "load-bearing columns are measured-vs-theoretical FPR and % over -- MEASURE your keys.\n" +
+        "falseNeg / fn columns are the one-sided law: any nonzero value ABORTS the bench.\n");
+    try {
+        const bloomRows = runBench({ cap, fpp, seed });
+        printTable(bloomRows, cap, fpp);
+        printCountingTable(runBenchCounting({ cap, fpp, seed }), measureRemove(cap, fpp, seed ^ 0x44), cap, fpp);
+        printBlockedTable(bloomRows, runBenchBlocked({ cap, fpp, seed }), cap, fpp);
+        printCuckooTable(bloomRows, runBenchCuckoo({ cap, fpp, seed }), cap, fpp);
+        printQuotientTable(bloomRows, runBenchQuotient({ cap, fpp, seed }), cap, fpp);
+        const xorRows = runBenchXor({ cap, fpp, seed });
+        printXorTable(bloomRows, xorRows, cap, fpp);
+        printBinaryFuseTable(xorRows, runBenchBinaryFuse({ cap, fpp, seed }), cap, fpp);
+    } catch (e) {
+        // A false negative anywhere voids the one-sided guarantee: fail the tool loudly.
+        process.stderr.write("bench: FAIL -- " + ((e && e.message) || String(e)) + "\n");
+        process.exit(1);
+    }
 }

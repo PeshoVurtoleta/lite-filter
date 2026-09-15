@@ -119,3 +119,14 @@ assignment (the signature fail-open catch); and the snapshot v2 envelope with th
   hold if the peel completed, so it doubles as the fail-open regression gate.
 - v1.0.0: the family is complete (7 members) and the surface is API-frozen (status
   building -> stable).
+
+## Amendment (1.1.0, decisions/0023)
+
+Binary Fuse shares XOR's edge-hash structure, so it shared XOR's single-hash STRING ceiling:
+until 1.1.0 `g = fmix32(h ^ seed2)` was a pure function of `h` (~32-bit edge entropy), and a
+set of DISTINCT strings hit a birthday CEILING (~250k) past which a non-degenerate set was wrongly
+rejected. decisions/0023 replaces it with a second INDEPENDENT `g = hashStr(s, seed2)` (~64-bit edge
+entropy); distinct strings now peel at any size. The overlapping-segment geometry, the sizing
+constants, and the `keys:'int'` path here are all UNCHANGED. The snapshot tag moves to
+`litefilter/3` (decisions/0023); a `litefilter/2` Binary Fuse snapshot is rejected because the
+new string query would read every string key false.

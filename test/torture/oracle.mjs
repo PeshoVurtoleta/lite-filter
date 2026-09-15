@@ -21,7 +21,7 @@ export function makePrng(seed) {
     let x = (seed >>> 0) || 1;
     return function next() {
         x ^= x << 13; x >>>= 0;
-        x ^= x >> 17;
+        x ^= x >>> 17;
         x ^= x << 5;  x >>>= 0;
         return x >>> 0;
     };
@@ -102,7 +102,8 @@ export function differentialInt(Ctor, opts) {
  *
  * @param {Function} Ctor  the member constructor (e.g. CountingBloom, Cuckoo)
  * @param {{ n:number, fpp:number, ops:number, seed:number, keyspace?:number }} opts
- * @returns {{ falseNegatives:number, present:number, filterSize:number }}
+ * @returns {{ falseNegatives:number, present:number, filterSize:number,
+ *             removes:number, filter:object }}
  */
 export function differentialChurnInt(Ctor, opts) {
     const n = opts.n;
@@ -114,6 +115,7 @@ export function differentialChurnInt(Ctor, opts) {
     const filter = new Ctor(n, { fpp: fpp, keys: "int" });
     const present = new Set();
     let falseNegatives = 0;
+    let removes = 0;   // remove() calls that actually fired (an add/remove cycle happened)
 
     for (let i = 0; i < ops; i++) {
         // Bounded keyspace (Cuckoo) recurs keys so removes fire; else the low int32 half.
@@ -124,6 +126,7 @@ export function differentialChurnInt(Ctor, opts) {
             const removed = filter.remove(key);
             if (!removed) falseNegatives++;
             present.delete(key);
+            removes++;
         } else {
             filter.add(key);
             present.add(key);
@@ -139,6 +142,8 @@ export function differentialChurnInt(Ctor, opts) {
         falseNegatives: falseNegatives,
         present: present.size,
         filterSize: filter.size,
+        removes: removes,
+        filter: filter,
     };
 }
 

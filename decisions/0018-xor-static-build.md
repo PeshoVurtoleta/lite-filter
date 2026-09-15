@@ -64,6 +64,14 @@ Exhaustion is expected only for a DEGENERATE key set (e.g. many distinct keys th
 `String()`-encode identically -> duplicate edges no reseed can separate), which is exactly
 the case the exhaustion throw is for.
 
+> **Amendment (1.1.0, decisions/0023).** Until 1.1.0 the STRING path derived the
+> second edge hash as `g = fmix32(h ^ seed2)`, a pure function of `h`. That capped the pair
+> `(h, g)` at ~32 bits of entropy, so a set of DISTINCT strings hit a single-hash birthday
+> CEILING (~250k) past which a non-degenerate set was wrongly rejected as "degenerate".
+> decisions/0023 replaces it with a second INDEPENDENT `g = hashStr(s, seed2)` (~64-bit edge
+> entropy); distinct strings now peel at any size and exhaustion again means only a genuinely
+> degenerate set. The `keys:'int'` path here is unchanged.
+
 ## Consequences
 
 - Space at `fpp = 0.01` (fw=8): ~9.84 bits/item measured -- LEANER than Cuckoo (~21) and

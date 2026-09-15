@@ -71,3 +71,14 @@ membership filter must never ship.
   caught transitively; the snapshot cannot smuggle a wrong-shaped array past the doors.
 - The modulo reduction trades a few cycles for exactness; the zero-GC proof (perf gate 0
   scavenges at N and 8N) is unaffected -- modulo allocates nothing.
+
+## Amendment (1.1.0, decisions/0023)
+
+The 100-attempt peeling door described here is unchanged, but its FAILURE MODE for STRING keys
+was corrected. Until 1.1.0 the string path's second edge hash `g = fmix32(h ^ seed2)` was a
+pure function of `h`, capping edge entropy at ~32 bits, so a set of DISTINCT strings hit a
+single-hash birthday CEILING (~250k) and a non-degenerate set was wrongly rejected. decisions/0023
+switches to a second INDEPENDENT `g = hashStr(s, seed2)` (~64-bit edge entropy): distinct strings
+peel at any size, and exhaustion again means only a genuinely degenerate set (identical `String()`
+encodings). The width door and the `keys:'int'` path are byte-identical; only the string edge
+entropy changed. The snapshot tag moves to `litefilter/3` (decisions/0023).

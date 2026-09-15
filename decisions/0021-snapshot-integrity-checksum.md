@@ -83,3 +83,13 @@ tamper-proofing.
   this fails CLOSED (restore throws on the mismatch, never accepts corruption), consistent
   with the library's law. A future release may fold via a canonical byte order if a
   big-endian target is ever supported.
+
+## Amendment (1.1.0, decisions/0023)
+
+The format tag documented above as `litefilter/2` is now `litefilter/3` (decisions/0023): the
+XOR / Binary Fuse string-key second hash changed from `fmix32(h ^ seed2)` to an INDEPENDENT
+`hashStr(s, seed2)`, so a `litefilter/2` snapshot would read string keys FALSE and must be
+rejected. The `chk` integrity door itself is UNCHANGED -- it still runs after the (now `/3`)
+tag check and after each member's structural checks. One tag is one algorithm for the whole
+family, so the bump re-tags even members whose bytes are unchanged (Bloom, int-mode filters);
+their `chk` fold is identical, only the tag string advanced.

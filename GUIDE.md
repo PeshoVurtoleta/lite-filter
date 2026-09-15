@@ -47,13 +47,13 @@ Measured at cap=100000, fpp=0.01, uniform workload (`npm run bench`):
 
 | Your need | Pick | bits/item | measured FPR | Why |
 | --- | --- | --- | --- | --- |
-| Simple, well-understood baseline | **Bloom** | 9.59 | 0.00997 | the textbook default; the one-sided floor |
-| Need deletes | **CountingBloom** | 38.34 | 0.00997 | 4-bit counters decrement; real `remove()` |
-| Need deletes at low space | **Cuckoo** | 20.97 | 0.00595 | fingerprints in 2 buckets; deletes, ~half CBF's space |
-| Deletes + merge + resize | **Quotient** | 23.59 | 0.00590 | the only member that merges AND resizes |
-| Maximum query throughput | **BlockedBloom** | 9.59 | 0.01397 | one cache miss/query (at a HIGHER measured FPR) |
-| Known static set, simple geometry | **XorFilter** | 9.85 | 0.00400 | ~1.23x space, no inserts, plain `hash % bl` |
-| Known static set, SMALLEST space | **BinaryFuse** | 9.50 | 0.00390 | ~1.13x space (9.04 b/item at 1e6), fastest build |
+| Simple, well-understood baseline | **Bloom** | 9.59 | 0.01004 | the textbook default; the one-sided floor |
+| Need deletes | **CountingBloom** | 38.34 | 0.01004 | 4-bit counters decrement; real `remove()` |
+| Need deletes at low space | **Cuckoo** | 20.97 | 0.00584 | fingerprints in 2 buckets; deletes, ~half CBF's space |
+| Deletes + merge + resize | **Quotient** | 23.59 | 0.00581 | the only member that merges AND resizes |
+| Maximum query throughput | **BlockedBloom** | 9.59 | 0.01415 | one cache miss/query (at a HIGHER measured FPR) |
+| Known static set, simple geometry | **XorFilter** | 9.85 | 0.00383 | ~1.23x space, no inserts, plain `hash % bl` |
+| Known static set, SMALLEST space | **BinaryFuse** | 9.50 | 0.00392 | ~1.13x space (9.04 b/item at 1e6), fastest build |
 
 Space note: the bits/item column is measured at the bench cap (n=1e5). The STATIC members get
 leaner as n grows and their fixed per-array overhead amortizes -- BinaryFuse measures ~9.04
@@ -115,7 +115,7 @@ Every key routes to ONE block, all `k` bits live in that block, so a query touch
 cache line regardless of `k` -- the throughput win (query ns DOWN vs Bloom at the SAME
 bits/item). Add-only: `remove()` throws. The caveat is inherent and MEASURED
 (decisions/0013): confining a key to one block loses cross-block independence, so its
-measured FPR runs OVER plain Bloom's for the same bits/item (0.01397 vs 0.00997 here).
+measured FPR runs OVER plain Bloom's for the same bits/item (0.01415 vs 0.01004 here).
 `fpp()` reports the plain closed-form as a labeled FLOOR, not the delivered rate.
 
 ### Cuckoo -- fingerprints, deletes, low space
