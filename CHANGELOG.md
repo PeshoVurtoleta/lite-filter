@@ -7,6 +7,60 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The `VERSION` constant, `package.json` `version`, and `llms.txt` are bumped
 together (three-place version sync) at release.
 
+## [1.0.0] - 2026-09-15
+
+The 7th and FINAL member -- `BinaryFuse`, the SMALLEST filter (static, ~9.0 bits/item). The
+family is COMPLETE (7 members under one `LiteFilter<K>` surface) and the API is FROZEN: this
+release moves the package from status building -> **stable**.
+
+### Added
+
+- **`BinaryFuse` -- the space-optimal static member** (Graf & Lemire, "Binary Fuse Filters:
+  Fast and Smaller Than Xor Filters", ACM JEA 2022; decisions/0022). A construction-algorithm
+  SWAP over `XorFilter`, NOT a new surface: a new class ALONGSIDE `XorFilter` in `Filter.js`
+  that REUSES the immutable surface, the static `from()`/`build()`, the 3-uniform peel +
+  reverse-assign, the deterministic reseed (`seed ^ (attempt * 0x9e3779b1)`, x100 then throw),
+  the `sp !== n` peel-completeness fail-OPEN guard, the byte-aligned width door
+  (decisions/0020), and the snapshot v2 + `chk` integrity checksum (decisions/0021).
+  - **Overlapping fuse geometry** (decisions/0022): XOR's 3 equal DISJOINT segments become 3
+    OVERLAPPING segments selected by a multiply-shift. A key's first slot is
+    `mulhiU32(h, scl)` in `[0, scl)` (`scl = segCount * segLen`); the next two are one and two
+    segments further, each perturbed within-segment by `^ (g & segMask)` / `^ (t & segMask)`.
+    Since `segLen` is a power of two, the three slots always land in three DISTINCT consecutive
+    segments -- the peeling XOR trick is never self-corrupted.
+  - **Sizing, cited to the reference** (decisions/0022; Graf & Lemire 2022 / FastFilter
+    `binaryfusefilter.h`, arity 3): `segLen = clamp(2^floor(log(n)/log(3.33) + 2.25), 4,
+    262144)`; `segCount = max(1, ceil(round(n * sizeFactor) / segLen) - 2)` with `sizeFactor =
+    max(1.125, 0.875 + 0.25*log(1e6)/log(n))`; array length `(segCount + 2) * segLen`. `n = 1`
+    and `n = 2` land on the small-n clamp (segLen 4, segCount 1, 12 slots); an empty key set
+    throws `[lite-filter]` (null is not zero).
+  - **Smaller than XOR**: measured slots/item **1.1305** (vs XOR's ~1.23) and **9.04
+    bits/item** at n=1e6 (vs XOR's ~9.85) -- the family's space headline -- while building
+    FASTER. Width-quantized `2^-fw` FPR (MEASURED ~0.0038 at fw=8, UNDER the configured 0.01).
+  - **0 false negatives, proven at scale**: a filter built from 1e6 distinct ints reads back
+    with EXACTLY 0 false negatives (which can hold ONLY if the peel was complete -- the
+    fail-OPEN regression gate), asserted in the torture GATE.
+  - **`restore()` re-derives the geometry** (decisions/0022, the CHARTER-SIGNATURE fail-open
+    hunt): `sl`/`sc` are NOT trusted from the snapshot -- the whole geometry is RE-DERIVED from
+    the count via `_bfDims(count)` and cross-checked, so an internally-inconsistent-but-legal
+    `sl`/`sc`/`fp.length` triple is REJECTED (not merely range-checked); the `chk` integrity
+    checksum then catches a keys-mode/seed flip.
+  - **Snapshot**: `dump()` emits `{ mem: "BinaryFuse", fw, sl, sc, fp, chk }` under the shared
+    `litefilter/2` envelope; `FilterSnapshot` gains optional `sl`/`sc`.
+  - **Immutable + strict**: `add`/`remove`/`clear` and `new BinaryFuse()` all throw
+    `[lite-filter]`; `keys: 'int'` validates on build and query; a degenerate set exhausts 100
+    reseeds and throws.
+
+### Changed
+
+- **Status: building -> stable.** The 7-member family is complete and the `LiteFilter<K>`
+  surface is API-frozen. Version bumped to `1.0.0` across `package.json`, the `VERSION`
+  constant, and `llms.txt` (three-place sync).
+- **Bench + GUIDE**: `benchmark/Bench.mjs` adds `measureBinaryFuse` / `runBenchBinaryFuse` and
+  an XOR-vs-BinaryFuse side-by-side table; `GUIDE.md` is rewritten with all 7 members as rows
+  and BOTH decision axes (mutable-vs-static AND, within static, XOR-vs-Binary-Fuse on
+  space/simplicity).
+
 ## [0.6.0] - 2026-09-15
 
 The 6th member -- `XorFilter`, the space-optimal STATIC one (built once, immutable, ~9.84 bits/item).

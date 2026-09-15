@@ -24,7 +24,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { zgcSuite } from "@zakkster/lite-perf-gate";
-import { Bloom, CountingBloom, BlockedBloom, Cuckoo, Quotient, XorFilter } from "../../Filter.js";
+import { Bloom, CountingBloom, BlockedBloom, Cuckoo, Quotient, XorFilter, BinaryFuse } from "../../Filter.js";
 
 const CAP = 4096;
 const MASK = CAP - 1;
@@ -44,6 +44,9 @@ function qfBytes(c) { return c._store.buffer.byteLength; }
 
 /** The XOR equivalent: the fingerprint store's byte length, fixed at build. */
 function xfBytes(c) { return c._fp.buffer.byteLength; }
+
+/** The BinaryFuse equivalent: the fingerprint store's byte length, fixed at build. */
+function bfBytes(c) { return c._fp.buffer.byteLength; }
 
 /** add-churn: fresh int keys; every op sets k bits in the fixed store. */
 const addChurn = {
@@ -308,6 +311,28 @@ const xfQueryHit = {
     statsOf(s) { return { grows: xfBytes(s.c) }; },
 };
 
+/** BinaryFuse query-hit: a STATIC filter built once from CAP distinct int keys; every op is
+ *  a present-key positive (3 hashes + a multiply-shift segment base + 2 within-segment offsets
+ *  + an XOR-compare, no scratch -- strict zero-alloc). BinaryFuse has no add/remove/clear (they
+ *  throw), so it has only a query scenario. Build is a cold path (allocation fine there) done in
+ *  setup(), outside the measured window. The gated 0-scavenge scenario at N and k*N (decisions/0022). */
+const bfQueryHit = {
+    name: "BinaryFuse query-hit (int)",
+    setup() {
+        const keys = new Array(CAP);
+        for (let i = 0; i < CAP; i++) keys[i] = i;
+        const c = BinaryFuse.from(keys, { fpp: 0.01, keys: "int" });
+        return { c, acc: 0 };
+    },
+    hot(s, n) {
+        const c = s.c;
+        let acc = s.acc | 0;
+        for (let i = 0; i < n; i++) acc = (acc + (c.mightContain(i & MASK) ? 1 : 0)) | 0;
+        s.acc = acc | 0;
+    },
+    statsOf(s) { return { grows: bfBytes(s.c) }; },
+};
+
 /**
  * The teeth: an object-key churn on the default backing that String()-encodes one
  * fresh object key per op -- it MUST trip the gate (scavenges scale with n).
@@ -328,7 +353,7 @@ zgcSuite({
     maxArrayBuffersKB: 0,
     counters: { grows: 0 },
     scenarios: [addChurn, queryHit, cbfAddChurn, cbfQueryHit, cbfRemoveChurn, bbAddChurn, bbQueryHit,
-        cfAddChurn, cfQueryHit, cfRemoveChurn, qfAddChurn, qfQueryHit, qfRemoveChurn, xfQueryHit],
+        cfAddChurn, cfQueryHit, cfRemoveChurn, qfAddChurn, qfQueryHit, qfRemoveChurn, xfQueryHit, bfQueryHit],
     mustFail: [mustFailAlloc],
 });
 

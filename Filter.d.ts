@@ -85,6 +85,10 @@ export interface FilterSnapshot {
   fp?: number[];
   /** XOR: the per-segment length (`bl`; the fingerprint array is `3*bl` slots). */
   bl?: number;
+  /** BinaryFuse: the segment length (`sl`, a power of two). */
+  sl?: number;
+  /** BinaryFuse: the segment count (`sc`; the fingerprint array is `(sc+2)*sl` slots). */
+  sc?: number;
   /** Quotient: the remainder width in bits (r = ceil(log2(1/fpp))). */
   r?: number;
   /** Quotient: the quotient width in bits (q; nslots === 2^q; tracks a resize). */
@@ -368,6 +372,60 @@ export class XorFilter<K = unknown> {
   static build<K = unknown>(iterable: Iterable<K>, options?: FilterOptions): XorFilter<K>;
   /** Reconstruct a fresh XorFilter from a snapshot. Fail closed on any mismatch. */
   static restore(snap: FilterSnapshot, opts?: FilterRestoreOptions): XorFilter;
+}
+
+/**
+ * Binary Fuse filter (Graf & Lemire, "Binary Fuse Filters: Fast and Smaller Than Xor
+ * Filters", ACM JEA 2022) -- the SPACE-OPTIMAL static member (decisions/0022). The 7th and
+ * FINAL member: a construction-algorithm swap over XorFilter that reuses the 3-uniform peel
+ * but replaces XOR's 3 disjoint segments with 3 OVERLAPPING fuse segments selected by a
+ * multiply-shift, packing to ~1.13x (vs XOR's ~1.23x) -- ~9.0 bits/item at fw=8. Static and
+ * immutable like XorFilter; same defining traits:
+ *   - STATIC: there is no public constructor (`new BinaryFuse()` throws) and no mutation --
+ *     `add` / `remove` / `clear` all throw a `[lite-filter]`-tagged Error. Rebuild with
+ *     `BinaryFuse.from(newKeys)` to change membership.
+ *   - KEYS ARE A SET: `from()` DEDUPES its input; `size` is the deduped key count.
+ *   - WIDTH: byte-aligned -- 8 bits when `fpp >= 2^-8`, else 16; `fpp < 2^-16` throws.
+ *     `fpp()` reports the width-quantized `2^-fw`, typically BELOW target -- MEASURE.
+ * A build over a DEGENERATE key set exhausts 100 reseeds and throws `[lite-filter]`
+ * fail-closed; it never ships a partial build.
+ */
+export class BinaryFuse<K = unknown> {
+  private constructor();
+  /** Query membership. NO false negatives for a key in the built set; false positives
+   *  bounded by the width-quantized `2^-fw`. Zero allocation on the int + string paths. */
+  mightContain(key: K): boolean;
+  /** The sole alias of `mightContain`, same one-sided semantics. */
+  has(key: K): boolean;
+  /** A static filter has no incremental add: this always throws a `[lite-filter]` Error. */
+  add(key: K): never;
+  /** A static filter cannot delete: this always throws a `[lite-filter]` Error. */
+  remove(key: K): never;
+  /** A static filter has nothing to clear to: this always throws a `[lite-filter]` Error. */
+  clear(): never;
+  /** The deduped key count the filter was built from (a plain counter, not an estimate). */
+  readonly size: number;
+  /** Alias of `size`. */
+  readonly count: number;
+  /** The deduped key count (== size; a Binary Fuse filter is built from exactly its set). */
+  readonly capacity: number;
+  /** The width-quantized `2^-fw` (typically below the configured target). MEASURE. */
+  fpp(): number;
+  /** The live per-instance stats holder. Throws without `{ stats: true }`. */
+  stats(): FilterStats;
+  /** Zero the stats counters in place. Throws without `{ stats: true }`. */
+  resetStats(): void;
+  /** Serialize to a plain, structurally-cloneable snapshot. Cold; may allocate. */
+  dump(): FilterSnapshot;
+  /** Build a frozen Binary Fuse filter from a known key set (deduped internally). Peels the
+   *  3-uniform hypergraph with up to 100 deterministic reseeds; throws `[lite-filter]`
+   *  fail-closed on an unpeelable (degenerate) set -- never a partial build. Cold. */
+  static from<K = unknown>(iterable: Iterable<K>, options?: FilterOptions): BinaryFuse<K>;
+  /** The `.build` alias of `from` -- the family's static-build verb, same contract. */
+  static build<K = unknown>(iterable: Iterable<K>, options?: FilterOptions): BinaryFuse<K>;
+  /** Reconstruct a fresh BinaryFuse from a snapshot. Fail closed on any mismatch, including
+   *  an internally-inconsistent segment geometry (re-derived from the count). */
+  static restore(snap: FilterSnapshot, opts?: FilterRestoreOptions): BinaryFuse;
 }
 
 export const VERSION: string;

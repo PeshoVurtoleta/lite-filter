@@ -6,7 +6,7 @@
  *
  * Test-only; not in files[]. ASCII-only.
  */
-import Bloom, { VERSION, CountingBloom, BlockedBloom, Quotient, XorFilter } from "../../Filter.js";
+import Bloom, { VERSION, CountingBloom, BlockedBloom, Quotient, XorFilter, BinaryFuse } from "../../Filter.js";
 import type { LiteFilter, FilterOptions, FilterSnapshot } from "../../Filter.js";
 
 type Equal<A, B> =
@@ -133,3 +133,28 @@ void new XorFilter<number>();
 const xfSnap: FilterSnapshot = xf.dump();
 const xfRestored: XorFilter = XorFilter.restore(xfSnap);
 void xfRestored;
+
+// ---- BinaryFuse: the space-optimal STATIC member (from()/build(), no mutation) ----
+const bf = BinaryFuse.from<number>([1, 2, 3], { fpp: 0.01, keys: "int" });
+expectTrue<Equal<ReturnType<typeof bf.mightContain>, boolean>>();
+expectTrue<Equal<ReturnType<typeof bf.has>, boolean>>();
+expectTrue<Equal<ReturnType<typeof bf.fpp>, number>>();
+expectTrue<Equal<typeof bf.size, number>>();
+expectTrue<Equal<typeof bf.capacity, number>>();
+
+// static: add / remove / clear are all `never` (a static filter has no mutation).
+expectTrue<Equal<ReturnType<typeof bf.add>, never>>();
+expectTrue<Equal<ReturnType<typeof bf.remove>, never>>();
+expectTrue<Equal<ReturnType<typeof bf.clear>, never>>();
+
+// the .build alias has the same shape as from().
+const bf2: BinaryFuse<number> = BinaryFuse.build<number>([4, 5, 6], { keys: "int" });
+void bf2;
+
+// @ts-expect-error -- there is no public constructor (build via the factory).
+void new BinaryFuse<number>();
+
+// snapshot round-trips through the typed surface.
+const bfSnap: FilterSnapshot = bf.dump();
+const bfRestored: BinaryFuse = BinaryFuse.restore(bfSnap);
+void bfRestored;

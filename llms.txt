@@ -1,22 +1,24 @@
 # @zakkster/lite-filter
 
 Zero-dependency, zero-GC approximate-membership filter FAMILY for JavaScript under
-one uniform LiteFilter<K> surface. v0.1.0 ships the substrate + the reference
-member: Bloom (Bloom, CACM 1970) -- the differential oracle and the honest floor the
-rest of the family (XOR, Binary Fuse) will improve
-on, one member per release. v0.2.0 adds CountingBloom (deletable); v0.3.0 adds
-BlockedBloom (one 512-bit cache-line block per key); v0.4.0 adds Cuckoo (deletable,
-fingerprint-based, fail-closed at capacity); v0.5.0 adds Quotient (deletable,
-mergeable + resizable, fail-closed at the 0.90 load ceiling); v0.6.0 adds XorFilter (the
-FIRST static member -- built once from a known key set, immutable, ~1.23x space-optimal at
-~9.84 bits/item, fail-closed on an unpeelable set). Every mutable member exposes the SAME
+one uniform LiteFilter<K> surface. COMPLETE at v1.0.0: 7 members. v0.1.0 ships the
+substrate + the reference member: Bloom (Bloom, CACM 1970) -- the differential oracle and
+the honest floor the rest of the family improves on, one member per release. v0.2.0 adds
+CountingBloom (deletable); v0.3.0 adds BlockedBloom (one 512-bit cache-line block per key);
+v0.4.0 adds Cuckoo (deletable, fingerprint-based, fail-closed at capacity); v0.5.0 adds
+Quotient (deletable, mergeable + resizable, fail-closed at the 0.90 load ceiling); v0.6.0
+adds XorFilter (the FIRST static member -- built once from a known key set, immutable,
+~1.23x space-optimal at ~9.85 bits/item, fail-closed on an unpeelable set); v1.0.0 adds
+BinaryFuse (the 7th and FINAL member -- static like XOR but SMALLER: ~1.13x, ~9.04 bits/item
+at n=1e6, and faster to build; Graf & Lemire 2022) and FREEZES the API (status
+building -> stable). Every mutable member exposes the SAME
 add/mightContain/has/size/count/capacity/fpp/clear API, so the filter is a one-line
-constructor swap; the static XorFilter shares the query surface but is built via
-XorFilter.from(keys) and throws on add/remove/clear. Single-file ESM, zero runtime dependencies, node:test only. Ships
-a runnable + importable bench (Bench.mjs) that measures ACTUAL vs THEORETICAL
-false-positive rate on your own keys, checked against a real Set oracle.
+constructor swap; the static XorFilter and BinaryFuse share the query surface but are built
+via <Member>.from(keys) and throw on add/remove/clear. Single-file ESM, zero runtime
+dependencies, node:test only. Ships a runnable + importable bench (Bench.mjs) that measures
+ACTUAL vs THEORETICAL false-positive rate on your own keys, checked against a real Set oracle.
 
-## Status: 0.6.0 - Bloom (reference) + CountingBloom (deletable) + BlockedBloom (cache-local) + Cuckoo (fingerprint) + Quotient (mergeable/resizable) + XorFilter (static, space-optimal).
+## Status: 1.0.0 (family complete, API frozen) - Bloom (reference) + CountingBloom (deletable) + BlockedBloom (cache-local) + Cuckoo (fingerprint) + Quotient (mergeable/resizable) + XorFilter (static, space-optimal) + BinaryFuse (static, smallest).
 
 The problem it solves: "have I seen this key?" -- dedup, set membership, cache
 admission -- at a handful of BITS per entry instead of the tens of bytes a Set costs
@@ -64,7 +66,10 @@ Cross-cutting, mirrored from lite-lru:
   BlockedBloom emits { bb:512, nb, bits }; Cuckoo emits { fw, b:4, nb, fp } (fw is the
   fingerprint width -- f is the format tag) and validates every slot 0..fpMask before build;
   XorFilter emits { fw, bl, fp } and re-derives fw from fpp, bl from count, fp.length == 3*bl,
-  and every slot 0..(1<<fw)-1 before build (REJECT, never truncate).
+  and every slot 0..(1<<fw)-1 before build (REJECT, never truncate); BinaryFuse emits
+  { fw, sl, sc, fp } and RE-DERIVES the whole segment geometry from count (rejecting an
+  internally-inconsistent sl/sc/fp.length triple), fw from fpp, fp.length == (sc+2)*sl, and
+  every slot 0..(1<<fw)-1 before build.
   SNAPSHOT FORMAT v2 (litefilter/2, decisions/0021): every dump() also carries a 32-bit
   integrity checksum `chk` over the tag, mem, keys-mode, seed, every sizing/width field,
   count, and every store word. restore() recomputes it (after the structural checks, before
@@ -89,7 +94,7 @@ Cross-cutting, mirrored from lite-lru:
   false negative -- only remove keys you added; (2) a counter that SATURATES at 15 is
   clamped forever (never wraps on add, never decrements on remove), so its keys stick
   present. Good for: membership + deletes with Bloom semantics. Not for: the lowest
-  space per deletable item (Cuckoo, planned), or a multiplicity readout (deferred,
+  space per deletable item (Cuckoo), or a multiplicity readout (deferred,
   decisions/0010 -- saturation makes it an over-estimate).
 - BlockedBloom (decisions/0012..0013): the bit array is partitioned into fixed 512-bit
   BLOCKS (16 x 32-bit words = 64 bytes, one cache line). Every key is routed to ONE
@@ -121,7 +126,7 @@ Cross-cutting, mirrored from lite-lru:
   Space ~2x Bloom at fpp 0.01 (byte-aligned slots). Good for: membership + deletes with an
   FPR bounded by the fingerprint width, not the load. Not for: removing untrusted /
   never-inserted keys, or duplicate-heavy streams (a key added > 2b times overflows its
-  bucket pair), or the smallest static space (XOR / Binary Fuse, planned).
+  bucket pair), or the smallest static space (XOR / BinaryFuse).
 - Quotient (decisions/0016..0017): ONE open-addressed LINEAR slot array. A key's 32-bit hash
   splits into a QUOTIENT (home slot index, high bits) and a REMAINDER (stored, low r bits);
   same-home keys form a RUN, adjacent runs a CLUSTER under linear probing, encoded by 3
@@ -171,6 +176,22 @@ Cross-cutting, mirrored from lite-lru:
   identically -> duplicate edges no reseed can separate). Good for: a large, KNOWN, read-only
   key set where the smallest space at a given FPR matters (e.g. a shipped dictionary / URL
   blocklist). Not for: incremental adds, deletes, or a set that changes (use a mutable member).
+- BinaryFuse (decisions/0022): the 7th and FINAL member -- STATIC like XOR (built ONCE via
+  BinaryFuse.from(iterable, options) / .build, then FROZEN; add/remove/clear and new
+  BinaryFuse() all throw), a construction-algorithm SWAP over XOR (Graf & Lemire, "Binary Fuse
+  Filters: Fast and Smaller Than Xor Filters", 2022). It reuses the peel + reverse-assign
+  substrate and the snapshot integrity checksum, but replaces XOR's 3 equal DISJOINT segments
+  with 3 OVERLAPPING fuse segments selected by a multiply-shift (mulhiU32(h, scl) picks the
+  first segment base in [0, scl); the next two are one/two segments further, perturbed
+  within-segment), so it packs TIGHTER: ~1.13x slots/item (segLen = 2^floor(log(n)/log(3.33)
+  +2.25) clamped, segCount from a ~1.125 load), ~9.04 bits/item at n=1e6 -- LEANER than XOR's
+  ~9.85 -- and it builds FASTER. Same byte-aligned width door (fw 8/16, fpp < 2^-16 throws),
+  same width-quantized 2^-fw FPR (MEASURED ~0.0039 at fw=8), same deterministic reseed x100
+  then throw, same fail-OPEN peel-completeness guard, same dedupe (keys are a SET). restore()
+  RE-DERIVES the segment geometry from the count (rejecting an internally-inconsistent sl/sc/
+  fp.length triple) before the chk check. Good for: a static, KNOWN, read-only key set where you
+  want the SMALLEST space and fastest build -- the default static choice. Not for: incremental
+  adds, deletes, or a set that changes (use a mutable member).
 
 ## Construction
 
@@ -180,6 +201,7 @@ new BlockedBloom(capacity, { fpp = 0.01, seed?, keys?: 'int', stats?: true })
 new Cuckoo(capacity, { fpp = 0.01, seed?, keys?: 'int', stats?: true })
 new Quotient(capacity, { fpp = 0.01, seed?, keys?: 'int', stats?: true })
 XorFilter.from(iterable, { fpp = 0.01, seed?, keys?: 'int', stats?: true })  // static; .build alias
+BinaryFuse.from(iterable, { fpp = 0.01, seed?, keys?: 'int', stats?: true })  // static; .build alias
 
 Sizing (decisions/0002): m = ceil(-n * ln(fpp) / ln(2)^2), k = round((m/n) * ln(2)),
 k clamped to >= 1. All Bloom-family members share the sizing; CountingBloom stores
@@ -194,11 +216,14 @@ slot word r+3 bits byte-aligned to 8 or 16 bits, slot count nslots = pow2 >= cei
 XorFilter sizes differently (decisions/0018): 3 segments of bl = ceil(1.23*n/3)+32 slots
 (n = deduped key count), fingerprint fw = 8 or 16 bits byte-aligned, store 3*bl slots
 (Uint8Array or Uint16Array); it takes the whole key set up front (no incremental capacity).
-Fail-closed doors: fpp not in (0,1), capacity < 1, an overflowing store, (for Cuckoo) a
-fingerprint width > 16 bits, (for Quotient) a slot word > 16 bits or a q+r budget > 32 bits,
-or (for XorFilter) an empty key set, fpp < 2^-16, or 100 exhausted peel attempts all throw a
-[lite-filter] Error at construction. null is not zero: an unsized filter is never a
-zero-capacity one.
+BinaryFuse sizes differently (decisions/0022): segLen sl = clamp(2^floor(log(n)/log(3.33)
++2.25), 4, 262144), segCount sc = max(1, ceil(round(n*sizeFactor)/sl) - 2) with sizeFactor =
+max(1.125, 0.875+0.25*log(1e6)/log(n)), store (sc+2)*sl slots byte-aligned to fw; n=1 and n=2
+land on the small-n clamp (sl=4, sc=1, 12 slots). Fail-closed doors: fpp not in (0,1),
+capacity < 1, an overflowing store, (for Cuckoo) a fingerprint width > 16 bits, (for Quotient)
+a slot word > 16 bits or a q+r budget > 32 bits, or (for XorFilter / BinaryFuse) an empty key
+set, fpp < 2^-16, or 100 exhausted peel attempts all throw a [lite-filter] Error at
+construction. null is not zero: an unsized filter is never a zero-capacity one.
 
 ## The honesty hook (the bench's whole point)
 
@@ -248,6 +273,16 @@ is a hypothesis, not your filter's behavior on your keys -- MEASURE.
   reseeds and THROWS [lite-filter]; add/remove/clear/new all THROW [lite-filter]; 50
   build-then-drop cycles leave the leak tracker at 0 (torture, decisions/0018..0020).
   fp.length == 3*bl and bl == ceil(1.23*count/3)+32 (validateXor).
+- BinaryFuse static + SMALLEST + fail-closed: mightContain on keys:'int' is 0 scavenges at
+  N=200000 and 8N=1600000 (perf-gate; 3 hashes, a multiply-shift + 2 within-segment offsets,
+  an XOR-compare, no scratch); a filter built from 1e6 distinct keys reads back with EXACTLY 0
+  false negatives (the fail-OPEN regression gate); measured slots/item 1.1305 (in [1.08,1.13])
+  and bits/item 9.04 <= 9.30 at n=1e6 -- LEANER than XOR's ~9.85; n=1e5, fpp=0.01 (fw=8) over
+  1e6 disjoint probes -> measured FPR <= 0.0050 (~0.0038, UNDER target) AND > 0 (non-vacuous);
+  a DEGENERATE set exhausts 100 reseeds and THROWS; add/remove/clear/new all THROW; restore()
+  rejects an internally-inconsistent segment geometry (re-derived from count) and a chk flip;
+  50 build-then-drop cycles leave the leak tracker at 0 (torture, decisions/0022). geometry ==
+  _bfDims(count) and fp.length == (sc+2)*sl (validateBinaryFuse).
 - Fail closed on every unverified state; [lite-filter]-tagged errors throughout.
 
 ## Testing

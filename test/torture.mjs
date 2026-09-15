@@ -52,8 +52,8 @@ async function main() {
         createOwnerCascadeOrphanKernel,
     } = await import("@zakkster/lite-leak");
     const { createRoot, effect, dispose } = await import("@zakkster/lite-signal");
-    const { Bloom, CountingBloom, BlockedBloom, Cuckoo, Quotient, XorFilter } = await import("../Filter.js");
-    const { validate, validateCounting, validateBlocked, validateCuckoo, validateQuotient, validateXor } =
+    const { Bloom, CountingBloom, BlockedBloom, Cuckoo, Quotient, XorFilter, BinaryFuse } = await import("../Filter.js");
+    const { validate, validateCounting, validateBlocked, validateCuckoo, validateQuotient, validateXor, validateBinaryFuse } =
         await import("./validate.mjs");
     const { differentialInt, differentialChurnInt, differentialResizeInt, differentialMergeInt, differentialStaticInt } =
         await import("./torture/oracle.mjs");
@@ -132,6 +132,20 @@ async function main() {
             dispose(e); // disposing the owner untracks the filter -> collectable
         }
     });
+    // BinaryFuse build-then-drop retention (decisions/0022): identical to XOR -- the peel
+    // scaffold allocated inside from() MUST NOT outlive the instance, and the instance must be
+    // collectable once its owner scope disposes. 50 cycles surfaces a retained buffer; after gc
+    // the tracker returns to 0. cleanup + tag are detached primitives (no capture of `bf`).
+    createRoot(() => {
+        for (let i = 0; i < 50; i++) {
+            const e = effect(() => {
+                const bf = BinaryFuse.from([i, i + 1, i + 2, i + 3, i + 4], { keys: "int" });
+                bf.mightContain(i | 0);
+                tracker.track(bf, () => {}, "binary-fuse", { audit: true });
+            });
+            dispose(e); // disposing the owner untracks the filter -> collectable
+        }
+    });
     globalThis.gc();
     await new Promise((r) => setTimeout(r, 50));
     const live = tracker.size();
@@ -170,6 +184,12 @@ async function main() {
     const xkeys = new Array(HOT_CAP);
     for (let i = 0; i < HOT_CAP; i++) xkeys[i] = i;
     const xinst = XorFilter.from(xkeys, { keys: "int" });
+    // BinaryFuse steady-state instance: STATIC, built ONCE from the full [0, HOT_CAP) key set
+    // (the build is a cold path -- allocation there is fine, OUTSIDE the hot loop). The hot loop
+    // only QUERIES it: mightContain is strictly zero-alloc on keys:'int' (3 hashes, a
+    // multiply-shift + 2 within-segment offsets, an XOR-compare -- no scratch). Every probed key
+    // is present, so it exercises the query-HIT path. Like XOR it has no add/remove/clear.
+    const binstFuse = BinaryFuse.from(xkeys, { keys: "int" });
 
     // The BREAK control: a retained sink the hot loop feeds one fresh object per op,
     // so heapUsed climbs and the major-GC / pause gate rejects the window.
@@ -202,6 +222,9 @@ async function main() {
         // XOR: query-only hot path (the filter is static). Every probed key is present, so
         // this is the zero-alloc query-hit path on keys:'int'.
         acc = (acc + (xinst.mightContain(i & MASK) ? 1 : 0)) | 0;
+        // BinaryFuse: query-only hot path (static). Every probed key is present -- the zero-alloc
+        // multiply-shift query-hit path on keys:'int'.
+        acc = (acc + (binstFuse.mightContain(i & MASK) ? 1 : 0)) | 0;
         if (BREAK) sink.push({ i: i, acc: acc }); // retained: MUST trip the gate
         if ((i & 8191) === 0) {
             gc.sampleHeap(performance.now(), process.memoryUsage().heapUsed);
@@ -233,6 +256,7 @@ async function main() {
     validateCuckoo(kinst);
     validateQuotient(qinst);
     validateXor(xinst);
+    validateBinaryFuse(binstFuse);
 
     // allocPerOp is measured across the phase-2 HOT loop ONLY (heapBefore/heapAfter bracket
     // that loop, before any merge/resize law runs), so it reflects the genuinely zero-alloc
@@ -429,6 +453,67 @@ async function main() {
     }
     const xfFn = xfLaw1.falseNegatives + xfLaw2.falseNegatives;
 
+    // ---- BinaryFuse laws (decisions/0022) ------------------------------------
+    // Law bf1 (BinaryFuse): a static filter built from 1e6 distinct int keys -> EXACTLY 0
+    // false negatives (the complete-peel assignment guarantees every key reads true -- the
+    // fail-open regression gate). ALSO measure the space headline off the same 1e6 build:
+    // slots/item in [1.08, 1.13] (2dp) AND bits/item <= 9.30 (leaner than XOR's ~9.84).
+    let bfFn = 0, bfSlotsPerItem = 0, bfBitsPerItem = 0;
+    {
+        const N = 1000000;
+        const keys = new Array(N);
+        for (let i = 0; i < N; i++) keys[i] = i;
+        const bf = BinaryFuse.from(keys, { fpp: 0.01, keys: "int" });
+        for (let i = 0; i < N; i++) if (!bf.mightContain(i)) bfFn++;
+        bfSlotsPerItem = bf._arrayLen / N;
+        bfBitsPerItem = (bf._fp.byteLength * 8) / N;
+        validateBinaryFuse(bf);
+    }
+    const bfSlotsRound = Math.round(bfSlotsPerItem * 100) / 100;
+    const BF_SLOTS_LO = 1.08, BF_SLOTS_HI = 1.13, BF_BITS_LIMIT = 9.30;
+    // Law bf2 (BinaryFuse): n=1e5, fpp=0.01 (fw=8), 1e6 disjoint probes -> measured FPR within
+    // the width-quantized ceiling 2^-8 (~0.0039) AND strictly > 0 (non-vacuous).
+    const bfLaw2 = differentialStaticInt(BinaryFuse, { n: 100000, fpp: 0.01, probes: 1000000, seed: SEED ^ 0x55 });
+    const BF_FPR_LIMIT = 0.0050;
+    // Law bf3 (BinaryFuse build door): a DEGENERATE key set (distinct objects that all encode
+    // to "[object Object]") -> peeling exhausts all 100 attempts and THROWS [lite-filter].
+    let bfBuildThrew = false;
+    try { BinaryFuse.from([{}, {}, {}]); }
+    catch (e) { bfBuildThrew = e instanceof Error && /\[lite-filter\]/.test(e.message); }
+    // Law bf4 (BinaryFuse immutability): add / remove / clear / new all THROW [lite-filter].
+    let bfMutThrew = false;
+    {
+        const bf = BinaryFuse.from([1, 2, 3, 4, 5], { keys: "int" });
+        let a = false, r = false, c = false, ctor = false;
+        try { bf.add(6); } catch (e) { a = /\[lite-filter\]/.test(e.message); }
+        try { bf.remove(1); } catch (e) { r = /\[lite-filter\]/.test(e.message); }
+        try { bf.clear(); } catch (e) { c = /\[lite-filter\]/.test(e.message); }
+        try { new BinaryFuse(); } catch (e) { ctor = /\[lite-filter\]/.test(e.message); }
+        bfMutThrew = a && r && c && ctor;
+        validateBinaryFuse(bf);
+    }
+    // Law bf5 (BinaryFuse restore fail-open): the CHARTER-SIGNATURE hunt -- an internally
+    // consistent-but-wrong segment geometry (fp.length === (sc+2)*sl but sl disagrees with
+    // _bfDims(count)) MUST be rejected by re-derivation; a chk mismatch (keys flip) MUST throw.
+    let bfRestoreOk = false;
+    {
+        const isTag = (e) => e instanceof Error && /\[lite-filter\]/.test(e.message);
+        const keys = []; for (let i = 0; i < 2000; i++) keys.push(i);
+        const bf = BinaryFuse.from(keys, { keys: "int" });
+        const pristine = BinaryFuse.restore(JSON.parse(JSON.stringify(bf.dump())));
+        let ok = true; for (let i = 0; i < 2000; i++) if (!pristine.mightContain(i)) ok = false;
+        let geom = false;
+        {
+            const s = bf.dump(); s.sl = s.sl * 2; s.fp = new Array((s.sc + 2) * s.sl).fill(0);
+            try { BinaryFuse.restore(s); } catch (e) { geom = isTag(e); }
+        }
+        let chk = false;
+        { const s = bf.dump(); s.keys = null; try { BinaryFuse.restore(s); } catch (e) { chk = isTag(e); } }
+        let word = false;
+        { const s = bf.dump(); const j = s.fp.length >> 1; s.fp[j] = (s.fp[j] ^ 1) & 0xff; try { BinaryFuse.restore(s); } catch (e) { word = isTag(e); } }
+        bfRestoreOk = ok && geom && chk && word;
+    }
+
     // Law 21 (snapshot integrity checksum, decisions/0021): the family-wide `chk` (format
     // litefilter/2) must REJECT a keys-mode flip and a store-bit flip fail-closed -- the QA
     // fail-open. Proven for a representative MUTABLE member (Bloom) and the STATIC member
@@ -488,6 +573,15 @@ async function main() {
         xfLaw2.fpr > 0 &&
         xfBuildThrew === true &&
         xfMutThrew === true &&
+        bfFn === 0 &&
+        bfSlotsRound >= BF_SLOTS_LO &&
+        bfSlotsRound <= BF_SLOTS_HI &&
+        bfBitsPerItem <= BF_BITS_LIMIT &&
+        bfLaw2.fpr <= BF_FPR_LIMIT &&
+        bfLaw2.fpr > 0 &&
+        bfBuildThrew === true &&
+        bfMutThrew === true &&
+        bfRestoreOk === true &&
         snapChkOk === true;
     const ok =
         report.ok &&
@@ -529,6 +623,11 @@ async function main() {
         " | xf fn=" + xfFn +
         " fpr=" + xfLaw2.fpr.toFixed(5) + " ceiling=" + XF_FPR_LIMIT.toFixed(5) +
         " buildThrew=" + xfBuildThrew + " mutThrew=" + xfMutThrew +
+        " | bf fn=" + bfFn +
+        " fpr=" + bfLaw2.fpr.toFixed(5) + " ceiling=" + BF_FPR_LIMIT.toFixed(5) +
+        " slots/item=" + bfSlotsPerItem.toFixed(4) + " bits/item=" + bfBitsPerItem.toFixed(3) +
+        " buildThrew=" + bfBuildThrew + " mutThrew=" + bfMutThrew +
+        " restoreOk=" + bfRestoreOk +
         " | snapChk=" + (snapChkOk ? "ok" : "FAIL") +
         " clearReuse=" + sameBuffer +
         " | " + (ok ? "ok" : "FAIL") + "\n");
@@ -590,6 +689,24 @@ async function main() {
             process.stderr.write("  XOR degenerate build did NOT throw -- the 100-attempt exhaustion door is broken (decisions/0018)\n");
         if (!xfMutThrew)
             process.stderr.write("  XOR mutation (add/remove/clear/new) did NOT throw fail-closed (decisions/0019)\n");
+        if (bfFn > 0)
+            process.stderr.write("  BinaryFuse FALSE NEGATIVE -- a peeled key read false; the peel was INCOMPLETE (fail-open!) (decisions/0022)\n");
+        if (!(bfSlotsRound >= BF_SLOTS_LO && bfSlotsRound <= BF_SLOTS_HI))
+            process.stderr.write("  BinaryFuse slots/item " + bfSlotsPerItem.toFixed(4) +
+                " outside [" + BF_SLOTS_LO + ", " + BF_SLOTS_HI + "] (2dp) (decisions/0022)\n");
+        if (bfBitsPerItem > BF_BITS_LIMIT)
+            process.stderr.write("  BinaryFuse bits/item " + bfBitsPerItem.toFixed(3) +
+                " over ceiling " + BF_BITS_LIMIT + " -- not leaner than XOR (decisions/0022)\n");
+        if (bfLaw2.fpr > BF_FPR_LIMIT)
+            process.stderr.write("  BinaryFuse FPR " + bfLaw2.fpr.toFixed(5) + " over ceiling " + BF_FPR_LIMIT + "\n");
+        if (!(bfLaw2.fpr > 0))
+            process.stderr.write("  BinaryFuse FPR is 0 -- vacuous (the query never matches a non-member; structure broken)\n");
+        if (!bfBuildThrew)
+            process.stderr.write("  BinaryFuse degenerate build did NOT throw -- the 100-attempt exhaustion door is broken (decisions/0022)\n");
+        if (!bfMutThrew)
+            process.stderr.write("  BinaryFuse mutation (add/remove/clear/new) did NOT throw fail-closed (decisions/0022)\n");
+        if (!bfRestoreOk)
+            process.stderr.write("  BinaryFuse restore did NOT reject an inconsistent geometry / chk flip -- fail-open door broken (decisions/0021, 0022)\n");
         if (!snapChkOk)
             process.stderr.write("  SNAPSHOT CHECKSUM: a keys-mode / store-bit flip was NOT rejected -- the fail-open door is broken (decisions/0021)\n");
         if (law2.fpr > FPR_LIMIT)

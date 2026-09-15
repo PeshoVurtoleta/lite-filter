@@ -76,17 +76,32 @@
  * (decisions/0017). Delete repairs metadata by REBUILDING the affected cluster through the
  * verified insert path -- so the shift-back is provably correct by construction.
  *
+ * The 6th member -- `XorFilter` (Graf & Lemire, "Xor Filters", ACM JEA 2020) -- is the
+ * FIRST immutable/static member: built ONCE from a KNOWN key set by peeling a 3-uniform
+ * hypergraph (each key touches 3 slots in 3 equal DISJOINT segments), then frozen. It
+ * approaches the ~1.23x information-theoretic space bound; add/remove/clear (and the public
+ * constructor) throw fail-closed (decisions/0018, 0019, 0020).
+ *
+ * The 7th and FINAL member -- `BinaryFuse` (Graf & Lemire, "Binary Fuse Filters: Fast and
+ * Smaller Than Xor Filters", ACM JEA 2022) -- is a construction-algorithm SWAP over XOR: it
+ * reuses the peel + reverse-assign substrate but replaces XOR's 3 disjoint segments with 3
+ * OVERLAPPING fuse segments selected by a multiply-shift, packing to ~1.13x (vs ~1.23x) --
+ * ~9.0 bits/item at fw=8, leaner than XOR and faster to build. Static and immutable like
+ * XOR; same width door and snapshot integrity (decisions/0022). It completes the family.
+ *
  * Design decisions live in decisions/ (0001 hashing; 0002 sizing; 0003 remove +
  * count; 0004 fpp; 0005 snapshot; 0006 deferred static-build API; 0007 counter
  * width; 0008 saturation; 0009 remove caveat; 0010 count deferred; 0011 CBF
  * snapshot; 0012 block size; 0013 FPR locality; 0014 Cuckoo sizing/overload; 0015
  * Cuckoo delete caveat; 0016 Quotient sizing/split/storage/ceiling/resize; 0017
- * Quotient delete caveat) and are summarized in ROADMAP.md.
+ * Quotient delete caveat; 0018 XOR static build; 0019 XOR surface; 0020 XOR width;
+ * 0021 snapshot integrity checksum; 0022 Binary Fuse sizing) and are summarized in
+ * ROADMAP.md.
  *
  * @license MIT
  */
 
-export const VERSION = "0.6.0";
+export const VERSION = "1.0.0";
 
 /* -------------------------------------------------------------------------- *
  * Constants + fail-closed messages (built ONCE, thrown only on misuse).
@@ -340,6 +355,93 @@ const XOR_TOO_LARGE_MSG =
  *  factories construct a bare instance internally. Never exported. */
 const XOR_BUILD_TOKEN = Symbol("lite-filter/xor.build");
 
+/* -------------------------------------------------------------------------- *
+ * Binary Fuse (Graf & Lemire, "Binary Fuse Filters: Fast and Smaller Than Xor
+ * Filters", ACM JEA 2022) -- the SPACE-OPTIMAL static member (decisions/0022). The
+ * 7th and FINAL member. It REUSES the XOR peeling substrate (3-uniform hypergraph,
+ * peel + reverse-assign, deterministic reseed, snapshot v2 + chk) and swaps ONLY the
+ * geometry: XOR's 3 equal DISJOINT segments become OVERLAPPING fuse segments selected
+ * by a multiply-shift, which pack to ~1.13x (vs XOR's ~1.23x) and peel faster.
+ * -------------------------------------------------------------------------- */
+
+/** Binary Fuse is 3-uniform like XOR: every key touches exactly 3 fingerprint slots, one
+ *  in each of 3 CONSECUTIVE overlapping segments. PINNED (decisions/0022) -- the ~1.125x
+ *  load and the segment-length formula below are both tied to arity 3. */
+const BF_ARITY = 3;
+
+/** Segment-length sizing constants (decisions/0022; Graf & Lemire 2022, and FastFilter's
+ *  reference binaryfusefilter.h `binary_fuse_calculate_segment_length`, arity 3):
+ *  `segLen = 1 << floor(log(n)/log(3.33) + 2.25)`. The 3.33 log base and +2.25 offset are
+ *  the paper's tuned arity-3 constants -- the reference comments them "very sensitive"
+ *  (replacing floor by round substantially changes construction time). PINNED. */
+const BF_SEG_LOG_BASE = 3.33;
+const BF_SEG_LOG_OFFSET = 2.25;
+
+/** The minimum segment length (decisions/0022; binaryfusefilter.h uses 4 for size 0). Small
+ *  n floors here so the three overlapping segments still exist. PINNED. */
+const BF_MIN_SEG_LEN = 4;
+
+/** The segment-length clamp (decisions/0022; binaryfusefilter.h caps at 2^18): segLen is
+ *  capped at 262144 so a segment index stays small and the multiply-shift stays exact. PINNED. */
+const BF_MAX_SEG_LEN = 262144;
+
+/** Size-factor sizing constants (decisions/0022; binaryfusefilter.h
+ *  `binary_fuse_calculate_size_factor`, arity 3):
+ *  `sizeFactor = max(1.125, 0.875 + 0.25*log(1e6)/log(n))`. The asymptotic 1.125 load
+ *  (12.5% overhead, vs XOR's 23%) is the headline; the log term adds slack at small n where
+ *  a 3-uniform hypergraph is harder to peel. PINNED. */
+const BF_SIZE_FACTOR_MIN = 1.125;
+const BF_SIZE_FACTOR_BASE = 0.875;
+const BF_SIZE_FACTOR_COEF = 0.25;
+const BF_SIZE_FACTOR_REF = 1000000;
+
+/** The peeling reseed ceiling (decisions/0022): identical to XOR -- up to 100 deterministic
+ *  reseeds `seed ^ (attempt * 0x9e3779b1)` before a fail-closed throw. Exhaustion means a
+ *  DEGENERATE key set (duplicate-encoding keys -> parallel edges no reseed can separate). */
+const BF_MAX_ATTEMPTS = 100;
+
+/** The largest fingerprint array the too-large door admits (decisions/0022). Same cap as XOR:
+ *  the array length must fit a typed array AND keep the multiply-shift exact. */
+const BF_MAX_SLOTS = 0x3fffffff; // ~1.07e9 slots
+
+/** Fail-closed message: `new BinaryFuse()` is forbidden -- a static member is built via the
+ *  factory, never incrementally (decisions/0022). Built once, thrown only on misuse. */
+const BF_CTOR_MSG =
+    "[lite-filter] BinaryFuse is a STATIC member built from a known key set: use " +
+    "BinaryFuse.from(iterable, options) (or the .build alias), not new BinaryFuse().";
+
+/** Fail-closed message: a static filter has no mutation surface (decisions/0022). add/remove/
+ *  clear all throw this -- membership is fixed at construction. Built once, thrown only on misuse. */
+const BF_STATIC_MSG =
+    "[lite-filter] BinaryFuse is immutable: a static filter is built once from a fixed key " +
+    "set and has no add()/remove()/clear(). Rebuild with BinaryFuse.from(newKeys) to change " +
+    "membership (a deletable member -- Counting Bloom / Cuckoo / Quotient -- mutates in place).";
+
+/** Fail-closed message: a Binary Fuse filter over ZERO keys is undefined (decisions/0022);
+ *  null is not zero. Built once, thrown only on an empty key set. */
+const BF_EMPTY_MSG =
+    "[lite-filter] BinaryFuse.from() requires a non-empty key set; a filter over zero keys " +
+    "is undefined (null is not zero).";
+
+/** Fail-closed message when peeling exhausts every reseed (decisions/0022). Expected ONLY for
+ *  a degenerate key set (duplicate-encoding keys -> parallel hypergraph edges no reseed can
+ *  separate). Built once, thrown only on a genuinely unpeelable set. */
+const BF_CONSTRUCT_MSG =
+    "[lite-filter] BinaryFuse.from() could not construct after 100 peeling attempts: the key " +
+    "set produced an unpeelable 3-uniform hypergraph under every reseed. This is expected only " +
+    "for a DEGENERATE set -- e.g. many distinct keys that encode to the same string " +
+    "(String(key) collision -> duplicate edges). Check for duplicate-encoding keys.";
+
+/** Fail-closed message when the derived array would exceed the too-large cap (decisions/0022).
+ *  Built once, thrown only at construction for very large key sets. */
+const BF_TOO_LARGE_MSG =
+    "[lite-filter] requested BinaryFuse filter is too large (would need > " + BF_MAX_SLOTS +
+    " fingerprint slots); lower the key count.";
+
+/** Module-private build brand (decisions/0022). The constructor throws on any token but this
+ *  one, so `new BinaryFuse()` fails closed while the static factories construct internally. */
+const BF_BUILD_TOKEN = Symbol("lite-filter/bf.build");
+
 /** ln(2) and ln(2)^2 precomputed (decisions/0002): the Bloom sizing constants.
  *  Cold path -- used only in the constructor -- but computed once regardless. */
 const LN2 = Math.LN2;
@@ -364,6 +466,25 @@ function fmix32(h) {
     h = Math.imul(h, 0xc2b2ae35);
     h ^= h >>> 16;
     return h >>> 0;
+}
+
+/**
+ * The high 32 bits of the 32x32 -> 64-bit unsigned product `a * b` (decisions/0022). This
+ * IS Lemire's multiply-shift range reduction: `mulhiU32(x, N) === floor(x * N / 2^32)`, a
+ * value uniformly in `[0, N)` for a well-mixed 32-bit `x` -- the Binary Fuse segment-base
+ * selector. Computed via four 16x16 partial products so every intermediate stays a safe
+ * integer (`a*b` alone would exceed 2^53 and lose precision). Zero allocation -- pure
+ * integer arithmetic -- so it is safe on the query hot path. Returns an unsigned 32-bit int.
+ */
+function mulhiU32(a, b) {
+    const ah = a >>> 16, al = a & 0xffff;
+    const bh = b >>> 16, bl = b & 0xffff;
+    const albl = al * bl;
+    const albh = al * bh;
+    const ahbl = ah * bl;
+    const ahbh = ah * bh;
+    const carry = ((albl >>> 16) + (albh & 0xffff) + (ahbl & 0xffff)) >>> 16;
+    return (ahbh + (albh >>> 16) + (ahbl >>> 16) + carry) >>> 0;
 }
 
 /**
@@ -629,6 +750,52 @@ function _xorGuard(n) {
     return bl;
 }
 
+/**
+ * The Binary Fuse geometry for a deduped key count `n` (decisions/0022). Derives the four
+ * quantities the peel and the query share, from the Graf & Lemire 2022 arity-3 formulas
+ * (FastFilter binaryfusefilter.h `binary_fuse_calculate_segment_length` /
+ * `binary_fuse_calculate_size_factor` / `binary_fuse8_allocate`):
+ *
+ *   segLen  = clamp(1 << floor(log(n)/log(3.33) + 2.25), 4, 262144)   (a power of two)
+ *   sizeF   = max(1.125, 0.875 + 0.25*log(1e6)/log(n))                (n > 1; else load 0)
+ *   segCount= max(1, ceil(round(n*sizeF)/segLen) - 2)                 (n > 1; else 1)
+ *   arrayLen= (segCount + 2) * segLen                                 (arity 3 -> +2 segments)
+ *   scl     = segCount * segLen                                       (SegmentCountLength)
+ *
+ * The two-step SegmentCount clamp in the reference (which underflows through uint32 wrap for
+ * n <= 1) reduces exactly to `max(1, initSegmentCount)`; we clamp explicitly rather than rely
+ * on wraparound. `scl` is the multiply-shift domain: a key's first slot is `mulhiU32(h, scl)`
+ * in `[0, scl)`, its second/third are one/two segments further, so every slot stays in
+ * `[0, arrayLen)`. Fails closed on `n < 1` (a filter over zero keys is undefined; null is not
+ * zero) and on a request whose array would exceed the too-large cap. Cold -- called once by
+ * from()/restore(), never on a hot path. Returns `{ segLen, segCount, arrayLen, scl }`.
+ */
+function _bfDims(n) {
+    if (!Number.isInteger(n) || n < 1) {
+        throw new RangeError(BF_EMPTY_MSG);
+    }
+    let segLen = 1 << Math.floor(Math.log(n) / Math.log(BF_SEG_LOG_BASE) + BF_SEG_LOG_OFFSET);
+    if (segLen > BF_MAX_SEG_LEN) segLen = BF_MAX_SEG_LEN;
+    if (segLen < BF_MIN_SEG_LEN) segLen = BF_MIN_SEG_LEN;
+    let segCount;
+    if (n <= 1) {
+        segCount = 1;
+    } else {
+        const sizeFactor = Math.max(
+            BF_SIZE_FACTOR_MIN,
+            BF_SIZE_FACTOR_BASE + BF_SIZE_FACTOR_COEF * Math.log(BF_SIZE_FACTOR_REF) / Math.log(n));
+        const capacity = Math.round(n * sizeFactor);
+        const initSegmentCount = Math.ceil(capacity / segLen) - (BF_ARITY - 1);
+        segCount = initSegmentCount < 1 ? 1 : initSegmentCount;
+    }
+    const arrayLen = (segCount + BF_ARITY - 1) * segLen;
+    const scl = segCount * segLen;
+    if (!Number.isFinite(arrayLen) || arrayLen < 1 || arrayLen > BF_MAX_SLOTS) {
+        throw new RangeError(BF_TOO_LARGE_MSG);
+    }
+    return { segLen: segLen, segCount: segCount, arrayLen: arrayLen, scl: scl };
+}
+
 /* -------------------------------------------------------------------------- *
  * Snapshot integrity checksum (decisions/0021). Family-wide, COLD -- computed only by
  * dump()/restore(), never on a hot path. It closes a real fail-OPEN: keys-mode and seed
@@ -816,6 +983,117 @@ function _xorTryBuild(keys, int, seed, seed2, n, bl, fw) {
     // is still 0 (each slot is owned by exactly one edge) and the OTHER two slots are
     // already final (their edges peeled later -> higher stack index -> assigned earlier
     // here). So fp[v] = efp ^ fp[a] ^ fp[b] ^ fp[c] makes the three slots XOR to efp.
+    const arr = fw <= 8 ? new Uint8Array(m) : new Uint16Array(m);
+    for (let i = sp - 1; i >= 0; i--) {
+        const e = stackE[i];
+        const v = stackV[i];
+        arr[v] = (efp[e] ^ arr[eh0[e]] ^ arr[eh1[e]] ^ arr[eh2[e]]) & fpMask;
+    }
+    return arr;
+}
+
+/**
+ * ONE Binary Fuse peeling attempt (decisions/0022). Structurally IDENTICAL to `_xorTryBuild`
+ * -- build the 3-uniform hypergraph, peel degree-1 vertices, and (ONLY on a complete peel)
+ * reverse-assign so a key's three slots XOR to its fingerprint -- with a SINGLE change: the
+ * three slot positions are the OVERLAPPING fuse segments, not XOR's three disjoint ones. The
+ * first slot is `mulhiU32(h, scl)` (a multiply-shift into `[0, scl)`); the second and third
+ * are one and two segments further, each perturbed within its segment by `^ (g & segMask)` /
+ * `^ (t & segMask)`. Because `segLen` is a power of two, adding it never disturbs the low
+ * `log2(segLen)` bits, so the three slots always land in three DISTINCT consecutive segments
+ * (h0 < h1 < h2, never colliding) -- the XOR peeling trick is never corrupted by a
+ * self-collision, exactly as in XOR. Returns the fingerprint array on a complete peel, or
+ * `null` on a peel FAILURE. Cold; allocates its own scaffold each attempt.
+ *
+ * THE SIGNATURE FAIL-OPEN CATCH (decisions/0022, shared with XOR): the `if (sp !== n) return
+ * null` guard BEFORE assignment is the only thing between a short stack and a fail-OPEN
+ * filter; it treats a short stack as a peel failure (the caller reseeds, or throws on
+ * exhaustion), NEVER assigning fingerprints from a partial peel.
+ *
+ * @param {Array} keys   the deduped keys (int32 numbers when int, else arbitrary)
+ * @param {boolean} int  the keys:'int' backing (no String encode)
+ * @param {number} seed  the attempt seed (32-bit unsigned)
+ * @param {number} seed2 the derived second seed word (fmix32(seed ^ 0x9e3779b9))
+ * @param {number} n     the deduped key count (edge count)
+ * @param {{segLen:number,segCount:number,arrayLen:number,scl:number}} dims  the geometry
+ * @param {number} fw    the fingerprint width (8 or 16)
+ * @returns {Uint8Array|Uint16Array|null}
+ */
+function _bfTryBuild(keys, int, seed, seed2, n, dims, fw) {
+    const segLen = dims.segLen;
+    const segMask = segLen - 1;
+    const scl = dims.scl;
+    const m = dims.arrayLen;
+    const fpMask = (1 << fw) - 1;
+
+    // Per-edge geometry: the three ABSOLUTE slot positions (one per consecutive segment) and
+    // the fingerprint. Computed with EXACTLY the math the query hot path uses, so a key in the
+    // set always reads true. `mulhiU32(h, scl)` is the segment-base selector (multiply-shift,
+    // zero-branch); `^ (g & segMask)` / `^ (t & segMask)` place the other two within-segment.
+    // NOTE (decisions/0022): h0 is the raw segment base with NO within-segment perturbation -- a
+    // deliberate divergence from the FastFilter reference, which also perturbs slot 0. Membership
+    // stays exact (build and query hash byte-identically); only slot 0's intra-segment spread
+    // differs, and the measured 1.1305 slots/item + peel-success gate confirm it is benign.
+    const eh0 = new Uint32Array(n);
+    const eh1 = new Uint32Array(n);
+    const eh2 = new Uint32Array(n);
+    const efp = new Uint16Array(n);
+    for (let e = 0; e < n; e++) {
+        const key = keys[e];
+        let h, g;
+        if (int) {
+            h = fmix32((key ^ seed) | 0);
+            g = fmix32((Math.imul(key | 0, 0x9e3779b1) ^ seed2) | 0);
+        } else {
+            h = (typeof key === "string") ? hashStr(key, seed) : hashStr(String(key), seed);
+            g = fmix32((h ^ seed2) | 0);
+        }
+        const t = fmix32((h ^ g) | 0);
+        const hi = mulhiU32(h, scl);
+        eh0[e] = hi;
+        eh1[e] = (hi + segLen) ^ (g & segMask);
+        eh2[e] = (hi + 2 * segLen) ^ (t & segMask);
+        efp[e] = fmix32((h + g) | 0) & fpMask;
+    }
+
+    // Incidence: per-vertex edge COUNT and XOR-of-edge-indices. The three positions of an edge
+    // live in three DISTINCT consecutive segments (h0 in [0,scl), h1 one segment up, h2 two),
+    // so an edge never touches the same vertex twice -- the XOR trick is never self-corrupted.
+    const tcount = new Uint32Array(m);
+    const txor = new Uint32Array(m);
+    for (let e = 0; e < n; e++) {
+        let v = eh0[e]; tcount[v]++; txor[v] ^= e;
+        v = eh1[e]; tcount[v]++; txor[v] ^= e;
+        v = eh2[e]; tcount[v]++; txor[v] ^= e;
+    }
+
+    // Peel: repeatedly take a degree-1 vertex, record (vertex, edge), remove that edge from all
+    // three of its vertices (which may create new degree-1 vertices). Plain-array queue (cold);
+    // the `tcount[v] !== 1` guard drops stale entries.
+    const stackV = new Uint32Array(n);
+    const stackE = new Uint32Array(n);
+    let sp = 0;
+    const queue = [];
+    for (let v = 0; v < m; v++) if (tcount[v] === 1) queue.push(v);
+    while (queue.length > 0) {
+        const v = queue.pop();
+        if (tcount[v] !== 1) continue;
+        const e = txor[v];
+        stackV[sp] = v;
+        stackE[sp] = e;
+        sp++;
+        let p = eh0[e]; tcount[p]--; txor[p] ^= e; if (tcount[p] === 1) queue.push(p);
+        p = eh1[e]; tcount[p]--; txor[p] ^= e; if (tcount[p] === 1) queue.push(p);
+        p = eh2[e]; tcount[p]--; txor[p] ^= e; if (tcount[p] === 1) queue.push(p);
+    }
+
+    // FAIL-OPEN GUARD (decisions/0022): a short stack means a 2-core survived -- an INCOMPLETE
+    // peel. Do NOT assign; return null so the caller reseeds (or throws on exhaustion).
+    if (sp !== n) return null;
+
+    // Assign in REVERSE peel order: when an edge is assigned at its owning slot, that slot is
+    // still 0 and the OTHER two slots are already final, so fp[v] = efp ^ fp[a] ^ fp[b] ^ fp[c]
+    // makes the three slots XOR to efp.
     const arr = fw <= 8 ? new Uint8Array(m) : new Uint16Array(m);
     for (let i = sp - 1; i >= 0; i--) {
         const e = stackE[i];
@@ -3230,6 +3508,378 @@ export class XorFilter {
         inst._seed = snap.seed >>> 0;
         inst._seed2 = fmix32(inst._seed ^ 0x9e3779b9);
         inst._bl = bl;
+        inst._fw = fw;
+        inst._fpMask = fpMask;
+        inst._int = snap.keys === "int";
+        inst._count = snap.count;
+        inst._cap = snap.count;
+        inst._fpp = snap.fpp;
+        inst._stats = validateStats(opts && opts.stats);
+        return inst;
+    }
+}
+
+/* -------------------------------------------------------------------------- *
+ * BinaryFuse -- the SPACE-OPTIMAL static member (decisions/0022). The 7th and FINAL
+ * family member; a construction-algorithm swap over XorFilter, NOT a new surface.
+ *
+ * SHAPE (decisions/0022): a single fingerprint array over OVERLAPPING fuse segments.
+ * A key touches 3 slots, one in each of 3 CONSECUTIVE segments; the first is chosen by
+ * a multiply-shift (`mulhiU32(h, scl)`), the next two are one/two segments further,
+ * perturbed within-segment. The slots are assigned by peeling a 3-uniform hypergraph so
+ * a key's three slots XOR to its fingerprint -- the same peel as XOR, tighter geometry.
+ *
+ * QUERY (the hot body, decisions/0022): compute the key's fingerprint and its 3 slot
+ * positions (multiply-shift segment base + within-segment offsets), then `fp === (arr[h0]
+ * ^ arr[h1] ^ arr[h2])`. Zero allocation, NO branch on build state (a returned instance
+ * is always fully built). One-sided: a key in the set ALWAYS reads true (0 false
+ * negatives, guaranteed by the complete-peel assignment); a never-added key reads true
+ * only on a fingerprint collision (~2^-fw).
+ *
+ * SPACE (the headline, decisions/0022): the array is ~1.13x the key count (vs XOR's
+ * ~1.23x), so at fw=8 it runs ~9.0 bits/item -- leaner than XOR (~9.8) and Cuckoo/
+ * Quotient, at a lower FPR than Bloom for the same budget. The reference for "smaller
+ * and faster than xor filters" (Graf & Lemire 2022).
+ *
+ * NO MUTATION (decisions/0022): a static filter is built once and has no add/remove/
+ * clear -- all three throw `[lite-filter]`, as does `new BinaryFuse()`. Rebuild with
+ * `BinaryFuse.from(newKeys)`.
+ *
+ * WIDTH (decisions/0022): byte-aligned like XOR -- 8 bits when `fpp >= 2^-8`, else 16;
+ * `fpp < 2^-16` throws. `fpp()` reports the width-quantized `2^-fw`.
+ *
+ * KEYS ARE A SET (decisions/0022): `from()` DEDUPES its input; `size` is the deduped count.
+ * -------------------------------------------------------------------------- */
+
+export class BinaryFuse {
+    /**
+     * NOT a public constructor (decisions/0022). A static member is built via the factory;
+     * `new BinaryFuse()` throws `[lite-filter]`. The static `from`/`build`/`restore`
+     * factories construct a bare instance internally via the private brand.
+     */
+    constructor(token) {
+        if (token !== BF_BUILD_TOKEN) {
+            throw new Error(BF_CTOR_MSG);
+        }
+        // Bare instance: the factory fills every field before returning. Initialized to
+        // fail-closed sentinels so a half-built instance can never read as valid.
+        this._fp = null;      // the fingerprint array (Uint8Array | Uint16Array), length arrayLen
+        this._seed = 0;       // the winning hash seed (32-bit unsigned)
+        this._seed2 = 0;      // the derived second seed word
+        this._segLen = 0;     // per-segment length (a power of two)
+        this._segMask = 0;    // segLen - 1 (within-segment offset mask)
+        this._segCount = 0;   // the number of base segments (array is (segCount+2)*segLen slots)
+        this._scl = 0;        // segCount * segLen (the multiply-shift domain)
+        this._arrayLen = 0;   // the fingerprint array length
+        this._fw = 0;         // fingerprint width in bits (8 or 16)
+        this._fpMask = 0;     // fingerprint value mask ((1<<fw)-1)
+        this._int = false;    // keys:'int' backing (strict zero-alloc query)
+        this._count = 0;      // the deduped key count (a SET, not multiplicity)
+        this._cap = 0;        // capacity == count (built from exactly this set)
+        this._fpp = 0;        // the CONFIGURED target fpp (decisions/0004)
+        this._stats = null;   // opt-in stats holder (null when off)
+    }
+
+    /**
+     * Build a frozen Binary Fuse filter from a known key set (decisions/0022). DEDUPES the
+     * input to a Set (keys are a SET, not multiplicity), sizes the array from the arity-3
+     * fuse geometry (`_bfDims`), then PEELS the 3-uniform hypergraph. On a peel failure it
+     * RESEEDS deterministically (`seed ^ (attempt * 0x9e3779b1)`) up to 100 times; if every
+     * attempt fails (a degenerate key set) it THROWS `[lite-filter]` -- never a partial build
+     * (fail closed). Cold; allocates the peeling scaffold. Returns a new BinaryFuse.
+     *
+     * @param {Iterable} iterable  the key set (deduped internally)
+     * @param {{ fpp?: number, seed?: number, keys?: 'int', stats?: boolean }} [options]
+     * @returns {BinaryFuse}
+     */
+    static from(iterable, options) {
+        if (iterable === null || iterable === undefined || typeof iterable[Symbol.iterator] !== "function") {
+            throw new TypeError(
+                "[lite-filter] BinaryFuse.from(iterable): the first argument must be iterable");
+        }
+        const fpp = (options && options.fpp !== undefined) ? options.fpp : DEFAULT_FPP;
+        const fw = _xorSizeError(fpp);                     // width door (decisions/0020, reused)
+        const int = validateKeys(options && options.keys); // keys door (decisions/0001)
+        const baseSeed = validateSeed(options && options.seed);
+        const stats = validateStats(options && options.stats);
+
+        // Dedupe to a Set (decisions/0022). On the int backing every key is validated to the
+        // 32-bit signed domain FIRST (fail closed) -- a bad key never enters the set.
+        const set = new Set();
+        for (const key of iterable) {
+            if (int && (!Number.isInteger(key) || key < INT_MIN || key > INT_MAX)) {
+                throw new TypeError(INT_KEY_MSG + String(key));
+            }
+            set.add(key);
+        }
+        const n = set.size;
+        const dims = _bfDims(n);                           // empty-set + too-large door
+        const keys = Array.from(set);
+
+        // Peel with deterministic reseed (decisions/0022). Only a COMPLETE peel returns a
+        // fingerprint array; a short stack returns null and we reseed. 100 exhausted throws.
+        let arr = null;
+        let seed = baseSeed;
+        let seed2 = 0;
+        for (let attempt = 0; attempt < BF_MAX_ATTEMPTS; attempt++) {
+            const trySeed = (baseSeed ^ Math.imul(attempt, 0x9e3779b1)) >>> 0;
+            const trySeed2 = fmix32(trySeed ^ 0x9e3779b9);
+            const built = _bfTryBuild(keys, int, trySeed, trySeed2, n, dims, fw);
+            if (built !== null) { arr = built; seed = trySeed; seed2 = trySeed2; break; }
+        }
+        if (arr === null) {
+            throw new Error(BF_CONSTRUCT_MSG);
+        }
+
+        const inst = new BinaryFuse(BF_BUILD_TOKEN);
+        inst._fp = arr;
+        inst._seed = seed;
+        inst._seed2 = seed2;
+        inst._segLen = dims.segLen;
+        inst._segMask = dims.segLen - 1;
+        inst._segCount = dims.segCount;
+        inst._scl = dims.scl;
+        inst._arrayLen = dims.arrayLen;
+        inst._fw = fw;
+        inst._fpMask = (1 << fw) - 1;
+        inst._int = int;
+        inst._count = n;
+        inst._cap = n;
+        inst._fpp = fpp;
+        inst._stats = stats;
+        return inst;
+    }
+
+    /** The `.build` alias of `from` (decisions/0022): the family's static-build verb, same
+     *  contract. Some callers prefer "build" for the peeling connotation. */
+    static build(iterable, options) {
+        return BinaryFuse.from(iterable, options);
+    }
+
+    get size() { return this._count; }
+    get count() { return this._count; }
+    get capacity() { return this._cap; }
+
+    // --- hot path (zero allocation; strict on keys:'int') ---------------------
+
+    /**
+     * The query (decisions/0022). Computes the key's fingerprint and its 3 slot positions --
+     * `mulhiU32(h, scl)` selects the first segment base, `+segLen` / `+2*segLen` step to the
+     * next two segments, each perturbed within-segment by `^ (g & segMask)` / `^ (t & segMask)`
+     * -- then tests `fp === (arr[h0] ^ arr[h1] ^ arr[h2])`. One-sided: a key in the built set
+     * ALWAYS reads true (the complete-peel assignment guarantees it -- 0 false negatives); a
+     * never-added key reads true only on a fingerprint collision (~2^-fw). Zero allocation on
+     * the int + string paths; NO branch on build state.
+     */
+    mightContain(key) {
+        const segLen = this._segLen;
+        const segMask = this._segMask;
+        const scl = this._scl;
+        let h, g;
+        if (this._int) {
+            if (!Number.isInteger(key) || key < INT_MIN || key > INT_MAX) {
+                throw new TypeError(INT_KEY_MSG + String(key));
+            }
+            h = fmix32((key ^ this._seed) | 0);
+            g = fmix32((Math.imul(key | 0, 0x9e3779b1) ^ this._seed2) | 0);
+        } else {
+            h = this._hashKey(key);
+            g = fmix32((h ^ this._seed2) | 0);
+        }
+        const t = fmix32((h ^ g) | 0);
+        const fp = fmix32((h + g) | 0) & this._fpMask;
+        const arr = this._fp;
+        const hi = mulhiU32(h, scl);
+        const h0 = hi;
+        const h1 = (hi + segLen) ^ (g & segMask);
+        const h2 = (hi + 2 * segLen) ^ (t & segMask);
+        const hit = fp === (arr[h0] ^ arr[h1] ^ arr[h2]);
+        if (this._stats !== null) {
+            this._stats.queries++;
+            if (hit) this._stats.hits++; else this._stats.misses++;
+        }
+        return hit;
+    }
+
+    /** The SOLE alias of `mightContain` (decisions/0003), same one-sided semantics. */
+    has(key) { return this.mightContain(key); }
+
+    /** A static filter has no incremental add (decisions/0022). THROWS `[lite-filter]`
+     *  fail-closed -- rebuild with BinaryFuse.from(newKeys) to change membership. */
+    add(key) { throw new Error(BF_STATIC_MSG); }
+
+    /** A static filter cannot delete (decisions/0022). THROWS `[lite-filter]` fail-closed. */
+    remove(key) { throw new Error(BF_STATIC_MSG); }
+
+    /** A static filter has nothing to clear TO (decisions/0022): its identity IS its key set.
+     *  THROWS `[lite-filter]` fail-closed rather than silently emptying it. */
+    clear() { throw new Error(BF_STATIC_MSG); }
+
+    /**
+     * Hash an arbitrary key to a 32-bit base (decisions/0001). A string hashes over its code
+     * units (alloc-free); any other type is `String()`-encoded first (the honest amortized
+     * caveat). Never called on the keys:'int' path.
+     */
+    _hashKey(key) {
+        if (typeof key === "string") return hashStr(key, this._seed);
+        return hashStr(String(key), this._seed);
+    }
+
+    // --- cold inspection ------------------------------------------------------
+
+    /**
+     * The false-positive probability (decisions/0004, 0022). The width-quantized `2^-fw` using
+     * the ACTUAL stored fingerprint width -- typically BELOW the configured target (byte
+     * alignment). It is a formula, NOT a measurement -- MEASURE with the bench. Cold, O(1).
+     */
+    fpp() {
+        return Math.pow(2, -this._fw);
+    }
+
+    // --- opt-in stats (decisions/0004) ----------------------------------------
+
+    /** The live per-instance counter holder BY REFERENCE. Requires `{ stats: true }`; throws
+     *  fail-closed otherwise (null is not zero). */
+    stats() {
+        if (this._stats === null) throw new Error(STATS_OFF_MSG);
+        return this._stats;
+    }
+
+    /** Zero the counters IN PLACE. Requires `{ stats: true }`; else fail closed. A static
+     *  filter has no `adds` (build is not add()); adds stays 0. */
+    resetStats() {
+        if (this._stats === null) throw new Error(STATS_OFF_MSG);
+        this._stats.adds = 0;
+        this._stats.queries = 0;
+        this._stats.hits = 0;
+        this._stats.misses = 0;
+    }
+
+    // --- snapshot / restore (decisions/0005, 0022) ----------------------------
+
+    /**
+     * Serialize to a plain, structurally-cloneable snapshot (decisions/0022). COLD -- never a
+     * hot path -- and MAY allocate. The fingerprint array IS the serial form, emitted as a
+     * plain Array (`fp`). `fw` records the width, `sl` the segment length, `sc` the segment
+     * count (the array is `(sc+2)*sl`). The fail-closed tag lets `restore()` reject any
+     * mismatch or corruption (REJECT, never truncate). `f` is the shared FORMAT tag.
+     */
+    dump() {
+        const keys = this._int ? "int" : null;
+        const fp = Array.from(this._fp);
+        return {
+            f: SNAP_TAG,
+            mem: "BinaryFuse",
+            fw: this._fw,
+            sl: this._segLen,
+            sc: this._segCount,
+            cap: this._cap,
+            fpp: this._fpp,
+            seed: this._seed,
+            keys: keys,
+            count: this._count,
+            fp: fp,
+            chk: snapChecksum("BinaryFuse", keys, this._seed, this._count,
+                [this._fw, this._segLen, this._segCount, this._cap, this._fpp], fp),
+        };
+    }
+
+    /**
+     * Reconstruct a FRESH BinaryFuse from a snapshot (decisions/0022). Fail closed on ANY
+     * tag / member / seed / keys / fingerprint-width mismatch, on an internally-inconsistent
+     * segment geometry, and on a corrupt or wrong-length fingerprint array OR an out-of-range
+     * word (REJECT, never truncate -- null is not zero). The CHARTER-SIGNATURE fail-open hunt:
+     * the segment dims (`sl`, `sc`) are NOT trusted from the snapshot -- the entire geometry is
+     * RE-DERIVED from the count via `_bfDims(count)` and cross-checked, so an internally
+     * inconsistent-but-individually-legal `sl`/`sc`/`fp.length` triple is rejected, not just
+     * range-checked. Then the width from the fpp, the array length (`=== (sc+2)*sl`), and every
+     * word (`0 <= word <= fpMask`) are checked BEFORE any instance is populated. `opts`
+     * re-derives runtime-only options (stats); everything structural comes FROM the snapshot.
+     */
+    static restore(snap, opts) {
+        if (snap === null || typeof snap !== "object") {
+            throw new TypeError("[lite-filter] restore(snap): snapshot must be an object");
+        }
+        if (snap.f !== SNAP_TAG) {
+            throw new Error(
+                "[lite-filter] restore(): bad format tag " + String(snap.f) +
+                " (expected " + SNAP_TAG + ")");
+        }
+        if (snap.mem !== "BinaryFuse") {
+            throw new Error(
+                "[lite-filter] restore(): member mismatch " + String(snap.mem) +
+                " (this is BinaryFuse.restore)");
+        }
+        if (!Number.isInteger(snap.seed) || snap.seed < 0 || snap.seed > 0xffffffff) {
+            throw new Error(
+                "[lite-filter] restore(): corrupt seed " + String(snap.seed) +
+                " (must be a 32-bit unsigned integer)");
+        }
+        if (snap.keys !== "int" && snap.keys !== null) {
+            throw new Error(
+                "[lite-filter] restore(): corrupt keys mode " + String(snap.keys) +
+                " (must be 'int' or null)");
+        }
+        // The fingerprint width must be exactly the one the fpp re-derives (decisions/0020):
+        const fw = _xorSizeError(snap.fpp);
+        if (snap.fw !== fw) {
+            throw new Error(
+                "[lite-filter] restore(): fingerprint-width mismatch (snapshot fw=" +
+                String(snap.fw) + ", derived fw=" + fw + ")");
+        }
+        if (!Number.isInteger(snap.count) || snap.count < 1) {
+            throw new Error(
+                "[lite-filter] restore(): corrupt count " + String(snap.count) +
+                " (a Binary Fuse filter is built over >= 1 key)");
+        }
+        // The CHARTER-SIGNATURE fail-open hunt (decisions/0022): the segment geometry is a
+        // deterministic function of the count. RE-DERIVE it from the count and reject any
+        // snapshot whose `sl`/`sc` differ -- an internally inconsistent triple (each field
+        // individually legal, but not mutually consistent with the count) would otherwise
+        // build a wrong-shaped filter and silently drop keys. Re-derive, do not range-check.
+        const dims = _bfDims(snap.count);
+        if (snap.sl !== dims.segLen) {
+            throw new Error(
+                "[lite-filter] restore(): segment-length mismatch (snapshot sl=" +
+                String(snap.sl) + ", derived sl=" + dims.segLen + ")");
+        }
+        if (snap.sc !== dims.segCount) {
+            throw new Error(
+                "[lite-filter] restore(): segment-count mismatch (snapshot sc=" +
+                String(snap.sc) + ", derived sc=" + dims.segCount + ")");
+        }
+        const m = dims.arrayLen;
+        const fp = snap.fp;
+        if (!Array.isArray(fp) || fp.length !== m) {
+            throw new Error(
+                "[lite-filter] restore(): corrupt fingerprint store (expected " + m +
+                " slots, got " + (Array.isArray(fp) ? fp.length : String(fp)) + ")");
+        }
+        // Validate EVERY word BEFORE mutating (REJECT never truncate; null is not zero).
+        const fpMask = (1 << fw) - 1;
+        for (let i = 0; i < m; i++) {
+            const v = fp[i];
+            if (!Number.isInteger(v) || v < 0 || v > fpMask) {
+                throw new Error(
+                    "[lite-filter] restore(): corrupt fingerprint at slot " + i + " (" + String(v) +
+                    "); each slot must be an integer in 0.." + fpMask);
+            }
+        }
+        // Integrity gate (decisions/0021): the seed + keys-mode CANNOT be re-derived from the
+        // fingerprint array, so a flipped `keys` or `seed` is caught here. Recompute over the
+        // snapshot's own fields and REJECT on a mismatch, BEFORE any instance is built.
+        verifySnapChecksum(snap, "BinaryFuse",
+            [snap.fw, snap.sl, snap.sc, snap.cap, snap.fpp], fp);
+        const inst = new BinaryFuse(BF_BUILD_TOKEN);
+        inst._fp = fw <= 8 ? new Uint8Array(m) : new Uint16Array(m);
+        for (let i = 0; i < m; i++) inst._fp[i] = fp[i];
+        inst._seed = snap.seed >>> 0;
+        inst._seed2 = fmix32(inst._seed ^ 0x9e3779b9);
+        inst._segLen = dims.segLen;
+        inst._segMask = dims.segLen - 1;
+        inst._segCount = dims.segCount;
+        inst._scl = dims.scl;
+        inst._arrayLen = m;
         inst._fw = fw;
         inst._fpMask = fpMask;
         inst._int = snap.keys === "int";

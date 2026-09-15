@@ -428,3 +428,95 @@ export function validateXor(filter) {
         }
     }
 }
+
+/** Re-derive the Binary Fuse geometry from a deduped key count (decisions/0022), MIRRORING
+ *  `_bfDims` in Filter.js. Test-only: the validator does not import module internals, so it
+ *  reproduces the sizing math to cross-check the instance's stored geometry against its
+ *  count. Returns { segLen, segCount, arrayLen }. */
+function bfDims(n) {
+    let segLen = 1 << Math.floor(Math.log(n) / Math.log(3.33) + 2.25);
+    if (segLen > 262144) segLen = 262144;
+    if (segLen < 4) segLen = 4;
+    let segCount;
+    if (n <= 1) {
+        segCount = 1;
+    } else {
+        const sizeFactor = Math.max(1.125, 0.875 + 0.25 * Math.log(1000000) / Math.log(n));
+        const capacity = Math.round(n * sizeFactor);
+        const initSeg = Math.ceil(capacity / segLen) - 2;
+        segCount = initSeg < 1 ? 1 : initSeg;
+    }
+    return { segLen: segLen, segCount: segCount, arrayLen: (segCount + 2) * segLen };
+}
+
+/**
+ * Assert the CONSERVATION invariant for a BinaryFuse filter (test/debug only, O(slots)). A
+ * Binary Fuse filter is STATIC (decisions/0022): built once, no fill counter to reconcile.
+ * The teeth are STRUCTURAL soundness -- a store whose geometry does not tie back to the
+ * deduped key count is a corrupt build:
+ *
+ *   fw is 8 or 16                                   (a byte-aligned fingerprint width)
+ *   segLen is a power of two in [4, 262144]         (a valid, exact multiply-shift domain)
+ *   segCount >= 1 && fp.length === (segCount+2)*sl  (arity 3 -> +2 overlap segments)
+ *   (segLen, segCount) === _bfDims(count)           (the geometry is derived from count)
+ *   count >= 1 && count === capacity                (built over >= 1 key; cap == count)
+ *   scl === segCount * segLen                       (the stored multiply-shift domain)
+ *   every slot is in 0..(1<<fw)-1                   (each word fits the fingerprint width)
+ *
+ * The "every present key resolves" law is proven at scale by the torture differential (0
+ * false negatives, which can ONLY hold if the peel was COMPLETE), so it is not re-derived
+ * here. Throws an Error naming the first violation, or returns void.
+ */
+export function validateBinaryFuse(filter) {
+    const fw = filter._fw;
+    const segLen = filter._segLen;
+    const segCount = filter._segCount;
+    const scl = filter._scl;
+    const arrayLen = filter._arrayLen;
+    const fp = filter._fp;
+    const count = filter._count;
+    const cap = filter._cap;
+
+    if (fw !== 8 && fw !== 16) {
+        throw new Error("[validate] BinaryFuse fingerprint width fw=" + fw + " is not 8 or 16");
+    }
+    if (!(segLen >= 4) || segLen > 262144 || (segLen & (segLen - 1)) !== 0) {
+        throw new Error("[validate] BinaryFuse segLen=" + segLen + " is not a power of two in [4, 262144]");
+    }
+    if (!(segCount >= 1)) {
+        throw new Error("[validate] BinaryFuse segCount=" + segCount + " out of range");
+    }
+    const expectedLen = (segCount + 2) * segLen;
+    if (!fp || fp.length !== expectedLen) {
+        throw new Error(
+            "[validate] BinaryFuse store length " + (fp ? fp.length : String(fp)) +
+            " != (segCount+2)*segLen=" + expectedLen);
+    }
+    if (arrayLen !== expectedLen) {
+        throw new Error(
+            "[validate] BinaryFuse _arrayLen=" + arrayLen + " != (segCount+2)*segLen=" + expectedLen);
+    }
+    if (scl !== segCount * segLen) {
+        throw new Error(
+            "[validate] BinaryFuse scl=" + scl + " != segCount*segLen=" + (segCount * segLen));
+    }
+    if (!(count >= 1)) {
+        throw new Error("[validate] BinaryFuse count=" + count + " must be >= 1 (a static filter over a non-empty set)");
+    }
+    if (count !== cap) {
+        throw new Error("[validate] BinaryFuse count=" + count + " != capacity=" + cap);
+    }
+    const d = bfDims(count);
+    if (segLen !== d.segLen || segCount !== d.segCount) {
+        throw new Error(
+            "[validate] BinaryFuse geometry (segLen=" + segLen + ", segCount=" + segCount +
+            ") != _bfDims(count=" + count + ") (segLen=" + d.segLen + ", segCount=" + d.segCount + ")");
+    }
+    const fpMask = (1 << fw) - 1;
+    for (let i = 0; i < fp.length; i++) {
+        const v = fp[i];
+        if (v < 0 || v > fpMask) {
+            throw new Error("[validate] BinaryFuse slot " + i + " value " + v + " out of 0.." + fpMask);
+        }
+    }
+}

@@ -9,7 +9,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { Bloom, CountingBloom, BlockedBloom, Cuckoo, Quotient, XorFilter } from "../Filter.js";
+import { Bloom, CountingBloom, BlockedBloom, Cuckoo, Quotient, XorFilter, BinaryFuse } from "../Filter.js";
 import { validate, validateCounting, validateBlocked, validateCuckoo } from "./validate.mjs";
 
 function filled(opts) {
@@ -582,6 +582,13 @@ const CHK_MEMBERS = [
         name: "XorFilter",
         Ctor: XorFilter,
         build: () => { const keys = []; for (let i = 0; i < 2000; i++) keys.push(i); return XorFilter.from(keys, { keys: "int" }); },
+        present: (g) => { for (let i = 0; i < 2000; i++) if (!g.mightContain(i)) return false; return true; },
+        store: (s) => s.fp, wordMask: 0xff,
+    },
+    {
+        name: "BinaryFuse",
+        Ctor: BinaryFuse,
+        build: () => { const keys = []; for (let i = 0; i < 2000; i++) keys.push(i); return BinaryFuse.from(keys, { keys: "int" }); },
         present: (g) => { for (let i = 0; i < 2000; i++) if (!g.mightContain(i)) return false; return true; },
         store: (s) => s.fp, wordMask: 0xff,
     },

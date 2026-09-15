@@ -1,8 +1,8 @@
 {
   "name": "@zakkster/lite-filter",
   "author": "Zahary Shinikchiev <shinikchiev@yahoo.com>",
-  "version": "0.6.0",
-  "description": "Zero-dependency, zero-GC approximate-membership filter family under one LiteFilter<K> surface. Ships the Bloom reference member and the deletable CountingBloom member (blocked and space-optimal static members to come), with a shipped bench that measures actual vs theoretical false-positive rate on your own keys.",
+  "version": "1.0.0",
+  "description": "Zero-dependency, zero-GC approximate-membership filter family under one LiteFilter<K> surface. Seven members: Bloom (reference), CountingBloom (deletable), BlockedBloom (cache-local), Cuckoo (fingerprint), Quotient (mergeable/resizable), XorFilter (static, space-optimal) and BinaryFuse (static, smallest -- ~9 bits/item), with a shipped bench that measures actual vs theoretical false-positive rate on your own keys.",
   "type": "module",
   "main": "./Filter.js",
   "module": "./Filter.js",

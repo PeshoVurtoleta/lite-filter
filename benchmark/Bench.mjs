@@ -27,7 +27,7 @@
  * @license MIT
  */
 
-import { Bloom, CountingBloom, BlockedBloom, Cuckoo, Quotient, XorFilter, VERSION } from "../Filter.js";
+import { Bloom, CountingBloom, BlockedBloom, Cuckoo, Quotient, XorFilter, BinaryFuse, VERSION } from "../Filter.js";
 
 /** Seeded xorshift32 -- byte-reproducible from its seed. */
 export function makePrng(seed) {
@@ -396,6 +396,53 @@ export function measureXor(name, gen, cap, fpp, seed) {
 }
 
 /**
+ * Measure one workload against a fresh BinaryFuse BUILT from (cap, fpp). Same row shape as
+ * `measure` so it prints into the same side-by-side table. Binary Fuse is STATIC and reuses
+ * the XOR peel with tighter OVERLAPPING geometry: it is built ONCE from the deduped key set,
+ * so `addNs` reports the amortized BUILD ns/key. Its FPR is the width-quantized `2^-fw`,
+ * independent of fill, typically UNDER the configured target. bits/item is the ACTUAL store
+ * ((sc+2)*sl slots byte-aligned to fw), ~1.13x the key count -- LEANER than XOR's ~1.23x.
+ * `from()` DEDUPES the input, so `distinct` drives every rate.
+ */
+export function measureBinaryFuse(name, gen, cap, fpp, seed) {
+    const { keys, probes } = gen(cap, Math.max(cap * 10, 100000), seed);
+    const truth = new Set(keys);
+
+    const t0 = performance.now();
+    const filter = BinaryFuse.from(keys, { fpp, keys: "int" });
+    const distinct = filter.size;
+    const addNs = distinct === 0 ? 0 : ((performance.now() - t0) * 1e6) / distinct;
+
+    let falseNeg = 0;
+    for (const key of truth) if (!filter.mightContain(key)) falseNeg++;
+
+    const t1 = performance.now();
+    let acc = 0;
+    for (let i = 0; i < probes.length; i++) acc += filter.mightContain(probes[i]) ? 1 : 0;
+    const queryNs = ((performance.now() - t1) * 1e6) / probes.length;
+    if (acc === -1) process.stdout.write(""); // keep acc observable
+    let falsePos = 0, probed = 0;
+    for (let i = 0; i < probes.length; i++) {
+        if (truth.has(probes[i])) continue;
+        probed++;
+        if (filter.mightContain(probes[i])) falsePos++;
+    }
+
+    // The fingerprint width fw is the row's "k" column (a Binary Fuse filter has no k probes).
+    const k = filter._fw;
+    const measuredFpr = probed === 0 ? 0 : falsePos / probed;
+    const theoretical = Math.pow(2, -filter._fw);
+    const overPct = theoretical === 0 ? 0 : ((measuredFpr - theoretical) / theoretical) * 100;
+    // ACTUAL store: (sc+2)*sl slots byte-aligned to fw bits per slot.
+    const bitsPerItem = distinct === 0 ? 0 : (filter._fp.byteLength * 8) / distinct;
+
+    return {
+        name, added: distinct, distinct, bitsPerItem, k,
+        measuredFpr, theoretical, overPct, addNs, queryNs, falseNeg,
+    };
+}
+
+/**
  * The remove/churn workload (CountingBloom only): add N distinct keys, remove HALF,
  * then requery -- the still-present half MUST show 0 false negatives, and the removed
  * half should mostly read absent. Reports remove ns/op and the two counts. This is the
@@ -510,6 +557,20 @@ export function runBenchXor(opts) {
     rows.push(measureXor("zipfian", zipfian, cap, fpp, seed ^ 0x11));
     rows.push(measureXor("sequential", sequential, cap, fpp, seed ^ 0x22));
     rows.push(measureXor("adversarial", (n, p, s) => adversarial(Math.floor(cap * 1.5), p, s),
+        cap, fpp, seed ^ 0x33));
+    return rows;
+}
+
+/** Run the BinaryFuse workload matrix (FPR-vs-theory across the 4 workloads). */
+export function runBenchBinaryFuse(opts) {
+    const cap = (opts && opts.cap) || 100000;
+    const fpp = (opts && opts.fpp) || 0.01;
+    const seed = (opts && opts.seed) || 0xC0FFEE;
+    const rows = [];
+    rows.push(measureBinaryFuse("uniform", uniform, cap, fpp, seed));
+    rows.push(measureBinaryFuse("zipfian", zipfian, cap, fpp, seed ^ 0x11));
+    rows.push(measureBinaryFuse("sequential", sequential, cap, fpp, seed ^ 0x22));
+    rows.push(measureBinaryFuse("adversarial", (n, p, s) => adversarial(Math.floor(cap * 1.5), p, s),
         cap, fpp, seed ^ 0x33));
     return rows;
 }
@@ -724,6 +785,44 @@ function printXorTable(bloomRows, xfRows, cap, fpp) {
         "aligned fingerprint width -- MEASURE your own keys.\n\n");
 }
 
+/**
+ * XOR vs BinaryFuse SIDE BY SIDE across the four workloads: bits/item (BinaryFuse packs
+ * TIGHTER -- ~1.13x vs XOR's ~1.23x, so at fw=8 it runs ~9.0 bits/item vs XOR's ~9.8),
+ * measured FPR and its theoretical closed form (both width-quantized `2^-fw`), and the
+ * amortized build ns/key (BinaryFuse peels an overlapping-segment hypergraph, typically
+ * FASTER than XOR). Both are STATIC and immutable; the choice between them is space/simplicity
+ * (see GUIDE.md) -- Binary Fuse is smaller and faster; XOR is simpler geometry.
+ */
+function printBinaryFuseTable(xorRows, bfRows, cap, fpp) {
+    process.stdout.write(
+        "@zakkster/lite-filter v" + VERSION + " -- XOR vs BinaryFuse (cap=" + cap +
+        ", target fpp=" + fpp + ")\n" +
+        "Both are STATIC (built once, no add/remove); FPR is width-quantized to 2^-fw. Binary\n" +
+        "Fuse swaps XOR's 3 disjoint segments for 3 OVERLAPPING ones (multiply-shift selection),\n" +
+        "packing to ~1.13x (vs ~1.23x) -- smaller AND faster to build (Graf & Lemire 2022).\n\n");
+    process.stdout.write(
+        pad("workload", 12) + pad("Xf b/item", 11) + pad("Bf b/item", 11) +
+        pad("Xor FPR", 12) + pad("Bf FPR", 12) + pad("Bf theoFPR", 12) +
+        pad("Xf build", 10) + pad("Bf build", 10) + pad("distinct", 10) + "\n");
+    for (let i = 0; i < xorRows.length; i++) {
+        const xf = xorRows[i];
+        const bf = bfRows[i];
+        process.stdout.write(
+            pad(bf.name, 12) +
+            pad(xf.bitsPerItem.toFixed(2), 11) +
+            pad(bf.bitsPerItem.toFixed(2), 11) +
+            pad(xf.measuredFpr.toFixed(5), 12) +
+            pad(bf.measuredFpr.toFixed(5), 12) +
+            pad(bf.theoretical.toFixed(5), 12) +
+            pad(xf.addNs.toFixed(1), 10) +
+            pad(bf.addNs.toFixed(1), 10) +
+            pad(bf.distinct, 10) + "\n");
+    }
+    process.stdout.write(
+        "\nBf b/item < Xf b/item is the WIN (the space headline of the family). Both DEDUPE their\n" +
+        "input (keys are a SET) and cannot delete or grow -- MEASURE your own keys.\n\n");
+}
+
 // Runnable entry: `node benchmark/Bench.mjs`.
 if (import.meta.url === "file://" + process.argv[1] ||
     import.meta.url === new URL("file://" + process.argv[1]).href) {
@@ -735,5 +834,7 @@ if (import.meta.url === "file://" + process.argv[1] ||
     printBlockedTable(bloomRows, runBenchBlocked({ cap, fpp }), cap, fpp);
     printCuckooTable(bloomRows, runBenchCuckoo({ cap, fpp }), cap, fpp);
     printQuotientTable(bloomRows, runBenchQuotient({ cap, fpp }), cap, fpp);
-    printXorTable(bloomRows, runBenchXor({ cap, fpp }), cap, fpp);
+    const xorRows = runBenchXor({ cap, fpp });
+    printXorTable(bloomRows, xorRows, cap, fpp);
+    printBinaryFuseTable(xorRows, runBenchBinaryFuse({ cap, fpp }), cap, fpp);
 }
