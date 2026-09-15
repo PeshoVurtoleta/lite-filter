@@ -1,0 +1,321 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>lite-filter -- membership-filter visualization</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #050a08;
+    --panel: #0c1512;
+    --edge: #1d2b25;
+    --text: #cfe8d8;
+    --dim: #7fa591;
+    --accent: #9fe3bf;
+    --hi: #ffcf5a;
+    --set: #37e08a;
+    --theo: #46b0ff;
+    --bad: #ff6a6a;
+    --ok: #37e08a;
+    --btn: #12261c;
+    --btn-edge: #2b5a44;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 0.9rem/1.55 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    display: flex; flex-direction: column; align-items: center;
+    padding: 1.5rem 1rem 4rem;
+  }
+  h1 { font-size: 1.2rem; margin: 0 0 0.25rem; color: #eafff2; letter-spacing: 0.03rem; }
+  .sub { color: var(--dim); margin: 0 0 0.75rem; text-align: center; max-width: 58rem; }
+  .sub code, code { color: var(--accent); }
+  .controls {
+    display: flex; flex-wrap: wrap; gap: 0.5rem 0.75rem; align-items: center;
+    justify-content: center; width: 100%; max-width: 62rem;
+    border: 1px solid var(--edge); border-radius: 0.6rem; padding: 0.75rem 1rem;
+    background: var(--panel); margin-bottom: 1rem;
+  }
+  label { color: var(--dim); display: inline-flex; gap: 0.35rem; align-items: center; }
+  select, input[type="number"] {
+    font: inherit; background: #07110c; color: var(--accent);
+    border: 1px solid var(--btn-edge); border-radius: 0.35rem; padding: 0.2rem 0.4rem;
+  }
+  input[type="number"] { width: 5.5rem; }
+  button {
+    font: inherit; font-size: 0.82rem; background: var(--btn); color: var(--accent);
+    border: 1px solid var(--btn-edge); border-radius: 0.35rem; padding: 0.3rem 0.75rem;
+    cursor: pointer;
+  }
+  button.on { background: #113355; border-color: #4466ff; color: #bcd0ff; }
+  @media (hover: hover) {
+    button:hover { background: #17301f; }
+    button.on:hover { background: #16305a; }
+  }
+  .phase {
+    display: inline-flex; gap: 0.35rem; align-items: center; color: var(--dim);
+    border: 1px solid var(--edge); border-radius: 0.35rem; padding: 0.2rem 0.5rem;
+  }
+  .phase b { color: var(--hi); }
+  .grid {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(30rem, 1fr));
+    gap: 1rem; width: 100%; max-width: 64rem;
+  }
+  .panel { border: 1px solid var(--edge); border-radius: 0.6rem; background: var(--panel); padding: 0.6rem 0.75rem 0.75rem; }
+  .phead { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 0.25rem; }
+  .pname { color: #eafff2; font-size: 1rem; }
+  .pkind { color: var(--dim); font-size: 0.72rem; }
+  canvas { display: block; width: 100%; height: auto; border-radius: 0.4rem; border: 1px solid var(--edge); background: #04120c; }
+  .readout { display: grid; grid-template-columns: 1fr auto; gap: 0.2rem 0.75rem; margin-top: 0.45rem; font-size: 0.76rem; }
+  .fprwrap { grid-column: 1 / -1; }
+  .fprlabel { color: var(--dim); display: flex; justify-content: space-between; }
+  .fprlabel .meas { color: var(--set); }
+  .fprlabel .theo { color: var(--theo); }
+  .bar { position: relative; height: 0.65rem; background: #07110c; border: 1px solid var(--edge); border-radius: 0.3rem; overflow: hidden; margin-top: 0.15rem; }
+  .bar .meas { position: absolute; inset: 0 auto 0 0; width: var(--meas, 0%); background: var(--set); opacity: 0.8; }
+  .bar .theo { position: absolute; top: 0; bottom: 0; left: var(--theo, 0%); width: 2px; background: var(--theo); }
+  .space { color: var(--dim); }
+  .space b { color: var(--accent); }
+  .fn { justify-self: end; padding: 0.05rem 0.45rem; border-radius: 0.3rem; font-weight: 700; }
+  .fn.ok { background: #0d2c1c; color: var(--ok); border: 1px solid #235c3f; }
+  .fn.bad { background: #331414; color: var(--bad); border: 1px solid #7a2b2b; }
+  .status { color: var(--dim); margin: 0.5rem 0; min-height: 1.2rem; text-align: center; max-width: 58rem; }
+  .status b { color: var(--accent); }
+  .foot { margin-top: 1.5rem; color: #46604f; font-size: 0.7rem; text-align: center; max-width: 54rem; }
+</style>
+</head>
+<body>
+  <h1>lite-filter &mdash; approximate membership, side by side</h1>
+  <p class="sub">
+    ONE shared add-set fed to all seven members, then a DISJOINT probe-set (the
+    false-positive oracle). Each panel is drawn STRICTLY from that member's live
+    <code>dump()</code> &mdash; occupancy only, no shadow state. Three honesty axes per
+    panel: <b>measured vs theoretical FPR</b>, <b>bits/item vs the log2(1/fpp) floor</b>,
+    and the one-sided <b>FN=0</b> guarantee. Served by <code>demo/serve.mjs</code>;
+    imports only <code>../Filter.js</code>.
+  </p>
+
+  <div class="controls">
+    <label>workload
+      <select id="kind">
+        <option value="uniform">uniform (random)</option>
+        <option value="zipfian">zipfian (skewed)</option>
+        <option value="sequential">sequential (0..n-1)</option>
+        <option value="adversarial">adversarial (clustered)</option>
+      </select>
+    </label>
+    <label>seed <input id="seed" type="number" min="1" step="1"></label>
+    <label>n <input id="n" type="number" min="1" step="500"></label>
+    <label>fpp <input id="fpp" type="number" min="0.0001" max="0.5" step="0.001"></label>
+    <button id="load">load</button>
+    <span class="phase">phase <b id="phase">--</b></span>
+    <button id="play">play</button>
+    <button id="stepBtn">step</button>
+    <label>speed <input id="speed" type="number" min="1" max="2000" step="1"></label>
+  </div>
+
+  <p class="status" id="status">loading...</p>
+
+  <div class="grid" id="grid"></div>
+
+  <p class="foot">
+    Repo-only dev artifact; never in the npm tarball. Occupancy only: the panels draw
+    which store cells hold set bits / counters / fingerprints / metadata &mdash; never a
+    query's probe positions (re-deriving a key's hash slots would re-implement the
+    member's mechanics, which this demo forbids). The two static members (Xor,
+    BinaryFuse) have no incremental add; they show <code>building...</code> during the
+    BUILD phase, then snap to their peeled store.
+  </p>
+
+<script type="module">
+import {
+  createEngine, step, frameModel, renderSummary, MEMBER_NAMES, MEMBER_DEFS,
+  PHASE_BUILD, fetchWorkload,
+} from './Visualize.mjs';
+import { RENDERERS } from './renderers.mjs';
+
+// --- element refs cached once at init (lite-law: $-prefixed consts) ----------
+const $kind = document.getElementById('kind');
+const $seed = document.getElementById('seed');
+const $n = document.getElementById('n');
+const $fpp = document.getElementById('fpp');
+const $load = document.getElementById('load');
+const $phase = document.getElementById('phase');
+const $play = document.getElementById('play');
+const $step = document.getElementById('stepBtn');
+const $speed = document.getElementById('speed');
+const $status = document.getElementById('status');
+const $grid = document.getElementById('grid');
+
+const CANVAS_W = 900;
+const CANVAS_H = 300;
+
+// Which members are static (drawn "building..." during the BUILD phase).
+const IS_STATIC = {};
+for (let i = 0; i < MEMBER_DEFS.length; i++) IS_STATIC[MEMBER_DEFS[i].name] = MEMBER_DEFS[i].isStatic;
+
+// --- initial control values (not hardcoded in HTML) --------------------------
+const DEFAULTS = { kind: 'uniform', seed: 1, n: 5000, fpp: 0.01, speed: 200 };
+$kind.value = DEFAULTS.kind;
+$seed.value = DEFAULTS.seed;
+$n.value = DEFAULTS.n;
+$fpp.value = DEFAULTS.fpp;
+$speed.value = DEFAULTS.speed;
+
+// --- one panel (header + canvas + readouts) per member -----------------------
+const panels = {};
+for (let i = 0; i < MEMBER_NAMES.length; i++) {
+  const name = MEMBER_NAMES[i];
+  const panel = document.createElement('div');
+  panel.className = 'panel';
+
+  const head = document.createElement('div');
+  head.className = 'phead';
+  const nm = document.createElement('span');
+  nm.className = 'pname';
+  nm.textContent = name;
+  const kd = document.createElement('span');
+  kd.className = 'pkind';
+  kd.textContent = IS_STATIC[name] ? 'static (built once)' : 'mutable (incremental add)';
+  head.appendChild(nm);
+  head.appendChild(kd);
+
+  const cv = document.createElement('canvas');
+  cv.width = CANVAS_W;
+  cv.height = CANVAS_H;
+
+  const readout = document.createElement('div');
+  readout.className = 'readout';
+  readout.innerHTML =
+    '<div class="fprwrap">' +
+      '<div class="fprlabel"><span class="meas">measured FPR</span>' +
+      '<span class="theo">theoretical</span></div>' +
+      '<div class="bar"><span class="meas"></span><span class="theo"></span></div>' +
+    '</div>' +
+    '<div class="space"></div>' +
+    '<div class="fn ok">FN 0</div>';
+
+  panel.appendChild(head);
+  panel.appendChild(cv);
+  panel.appendChild(readout);
+  $grid.appendChild(panel);
+
+  panels[name] = {
+    ctx: cv.getContext('2d'),
+    barMeas: readout.querySelector('.bar .meas'),
+    barTheo: readout.querySelector('.bar .theo'),
+    space: readout.querySelector('.space'),
+    fn: readout.querySelector('.fn'),
+  };
+}
+
+let engine = null;
+let playing = false;
+const REDRAW_MS = 80; // ~12.5 Hz full redraw cadence
+let lastDrawT = 0;
+
+// The FPR bar scale: fix the meter to 4x the configured fpp so 1x sits at 25%.
+function fprScale() { return Math.max(1e-6, 4 * (engine ? engine.fpp : 0.01)); }
+
+function draw() {
+  const frame = frameModel(engine);
+  // renderSummary reuses the frame's dumps + the hot-path FP counts (no re-probe of the
+  // probe-set every redraw); FN is measured once at the first PROBE render and cached.
+  const rows = renderSummary(engine, frame);
+  const rowByName = {};
+  for (let i = 0; i < rows.length; i++) rowByName[rows[i].name] = rows[i];
+  const scale = fprScale();
+
+  for (let i = 0; i < MEMBER_NAMES.length; i++) {
+    const name = MEMBER_NAMES[i];
+    const p = panels[name];
+    const g = p.ctx;
+    g.clearRect(0, 0, CANVAS_W, CANVAS_H);
+    g.fillStyle = '#04120c';
+    g.fillRect(0, 0, CANVAS_W, CANVAS_H);
+    const building = IS_STATIC[name] && !frame.builtStatic && frame.phase === PHASE_BUILD;
+    RENDERERS[name].draw(g, frame.members[name], { x: 14, y: 10, w: CANVAS_W - 28, h: CANVAS_H - 20, building });
+
+    const r = rowByName[name];
+    const measPct = Math.min(100, (r.measFpr / scale) * 100);
+    const theoPct = Math.min(100, (r.theoFpr / scale) * 100);
+    p.barMeas.style.setProperty('--meas', measPct.toFixed(1) + '%');
+    p.barTheo.style.setProperty('--theo', theoPct.toFixed(1) + '%');
+    p.space.innerHTML = 'bits/item <b>' + r.bitsPerItem.toFixed(2) + '</b> &middot; ' +
+      r.overOptimalPct.toFixed(0) + '% over floor (' + r.bound.toFixed(1) + ')';
+    // fn === -1 means "not measured yet" (still building); 0 is the green guarantee.
+    if (r.fn < 0) { p.fn.className = 'fn'; p.fn.textContent = 'FN --'; }
+    else if (r.fn === 0) { p.fn.className = 'fn ok'; p.fn.textContent = 'FN 0'; }
+    else { p.fn.className = 'fn bad'; p.fn.textContent = 'FN ' + r.fn; }
+  }
+
+  const phaseName = frame.phase === PHASE_BUILD ? 'BUILD' : 'PROBE';
+  $phase.textContent = phaseName;
+  $status.innerHTML = 'phase <b>' + phaseName + '</b> &middot; build <b>' +
+    frame.buildIdx + ' / ' + frame.buildTotal + '</b> &middot; probe <b>' +
+    frame.probeIdx + ' / ' + frame.probeTotal + '</b> &middot; last key <b>' +
+    frame.lastKey + '</b> &middot; fpp <b>' + engine.fpp + '</b>';
+}
+
+function stepMany() {
+  const speed = Math.max(1, Number($speed.value) | 0);
+  let more = true;
+  for (let i = 0; i < speed && more; i++) more = step(engine);
+  return more;
+}
+
+function loop(now) {
+  if (!playing) return;
+  const more = stepMany();
+  if (now - lastDrawT >= REDRAW_MS) { draw(); lastDrawT = now; }
+  if (!more) {
+    playing = false;
+    $play.textContent = 'play';
+    $play.classList.remove('on');
+    draw();
+    return;
+  }
+  requestAnimationFrame(loop);
+}
+
+async function loadWorkload() {
+  playing = false;
+  $play.textContent = 'play';
+  $play.classList.remove('on');
+  $status.textContent = 'loading workload...';
+  const kind = $kind.value;
+  const seed = Math.max(1, Number($seed.value) | 0);
+  const n = Math.max(1, Number($n.value) | 0);
+  const fpp = Math.min(0.5, Math.max(0.0001, Number($fpp.value) || 0.01));
+  const url = '/workload.json?kind=' + encodeURIComponent(kind) +
+    '&seed=' + seed + '&n=' + n + '&fpp=' + fpp;
+  // Fail CLOSED: a rejected fetch or a non-OK status (static file / IDE preview /
+  // server down) renders the actionable hint into the status area and stops.
+  const result = await fetchWorkload(url);
+  if (!result.ok) { $status.textContent = result.message; return; }
+  const data = result.data;
+  try {
+    engine = createEngine({ keys: data.keys, probes: data.probes, fpp: data.fpp, seed: data.seed, kind: data.kind, n: data.n });
+  } catch (err) {
+    $status.textContent = 'could not build engine: ' + (err && err.message ? err.message : String(err));
+    return;
+  }
+  lastDrawT = 0;
+  draw();
+}
+
+$load.addEventListener('click', loadWorkload);
+$step.addEventListener('click', () => { if (engine) { step(engine); draw(); } });
+$play.addEventListener('click', () => {
+  if (!engine) return;
+  playing = !playing;
+  $play.textContent = playing ? 'pause' : 'play';
+  $play.classList.toggle('on', playing);
+  if (playing) { lastDrawT = 0; requestAnimationFrame(loop); }
+});
+
+loadWorkload();
+</script>
+</body>
+</html>

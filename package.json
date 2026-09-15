@@ -32,6 +32,8 @@
     "torture:controls": "node test/controls.mjs",
     "test:perf": "node --expose-gc --max-semi-space-size=4 --test test/perf/PerfGate.test.mjs",
     "bench": "node benchmark/Bench.mjs",
+    "demo": "node demo/Visualize.mjs",
+    "demo:serve": "node demo/serve.mjs",
     "verify": "npm test && npm run test:types && npm run torture && npm run torture:controls && npm run test:perf"
   },
   "keywords": [
