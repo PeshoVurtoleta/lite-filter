@@ -6,7 +6,7 @@
  *
  * Test-only; not in files[]. ASCII-only.
  */
-import Bloom, { VERSION, CountingBloom, BlockedBloom, Quotient } from "../../Filter.js";
+import Bloom, { VERSION, CountingBloom, BlockedBloom, Quotient, XorFilter } from "../../Filter.js";
 import type { LiteFilter, FilterOptions, FilterSnapshot } from "../../Filter.js";
 
 type Equal<A, B> =
@@ -108,3 +108,28 @@ expectTrue<Equal<typeof got4, boolean>>();
 const qfSnap: FilterSnapshot = qf.dump();
 const qfRestored: Quotient<number> = Quotient.restore(qfSnap);
 void qfRestored;
+
+// ---- XOR: the space-optimal STATIC member (from()/build(), no mutation) -------
+const xf = XorFilter.from<number>([1, 2, 3], { fpp: 0.01, keys: "int" });
+expectTrue<Equal<ReturnType<typeof xf.mightContain>, boolean>>();
+expectTrue<Equal<ReturnType<typeof xf.has>, boolean>>();
+expectTrue<Equal<ReturnType<typeof xf.fpp>, number>>();
+expectTrue<Equal<typeof xf.size, number>>();
+expectTrue<Equal<typeof xf.capacity, number>>();
+
+// static: add / remove / clear are all `never` (a static filter has no mutation).
+expectTrue<Equal<ReturnType<typeof xf.add>, never>>();
+expectTrue<Equal<ReturnType<typeof xf.remove>, never>>();
+expectTrue<Equal<ReturnType<typeof xf.clear>, never>>();
+
+// the .build alias has the same shape as from().
+const xf2: XorFilter<number> = XorFilter.build<number>([4, 5, 6], { keys: "int" });
+void xf2;
+
+// @ts-expect-error -- there is no public constructor (build via the factory).
+void new XorFilter<number>();
+
+// snapshot round-trips through the typed surface.
+const xfSnap: FilterSnapshot = xf.dump();
+const xfRestored: XorFilter = XorFilter.restore(xfSnap);
+void xfRestored;

@@ -7,13 +7,16 @@ rest of the family (XOR, Binary Fuse) will improve
 on, one member per release. v0.2.0 adds CountingBloom (deletable); v0.3.0 adds
 BlockedBloom (one 512-bit cache-line block per key); v0.4.0 adds Cuckoo (deletable,
 fingerprint-based, fail-closed at capacity); v0.5.0 adds Quotient (deletable,
-mergeable + resizable, fail-closed at the 0.90 load ceiling). Every member exposes the SAME
+mergeable + resizable, fail-closed at the 0.90 load ceiling); v0.6.0 adds XorFilter (the
+FIRST static member -- built once from a known key set, immutable, ~1.23x space-optimal at
+~9.84 bits/item, fail-closed on an unpeelable set). Every mutable member exposes the SAME
 add/mightContain/has/size/count/capacity/fpp/clear API, so the filter is a one-line
-constructor swap. Single-file ESM, zero runtime dependencies, node:test only. Ships
+constructor swap; the static XorFilter shares the query surface but is built via
+XorFilter.from(keys) and throws on add/remove/clear. Single-file ESM, zero runtime dependencies, node:test only. Ships
 a runnable + importable bench (Bench.mjs) that measures ACTUAL vs THEORETICAL
 false-positive rate on your own keys, checked against a real Set oracle.
 
-## Status: 0.5.0 - Bloom (reference) + CountingBloom (deletable) + BlockedBloom (cache-local) + Cuckoo (fingerprint) + Quotient (mergeable/resizable).
+## Status: 0.6.0 - Bloom (reference) + CountingBloom (deletable) + BlockedBloom (cache-local) + Cuckoo (fingerprint) + Quotient (mergeable/resizable) + XorFilter (static, space-optimal).
 
 The problem it solves: "have I seen this key?" -- dedup, set membership, cache
 admission -- at a handful of BITS per entry instead of the tens of bytes a Set costs
@@ -59,7 +62,17 @@ Cross-cutting, mirrored from lite-lru:
   corruption (REJECT, never truncate). Bloom emits { bits }; CountingBloom emits
   { w:4, cnts } and validates every byte 0..255 (so every nibble 0..15) before build;
   BlockedBloom emits { bb:512, nb, bits }; Cuckoo emits { fw, b:4, nb, fp } (fw is the
-  fingerprint width -- f is the format tag) and validates every slot 0..fpMask before build.
+  fingerprint width -- f is the format tag) and validates every slot 0..fpMask before build;
+  XorFilter emits { fw, bl, fp } and re-derives fw from fpp, bl from count, fp.length == 3*bl,
+  and every slot 0..(1<<fw)-1 before build (REJECT, never truncate).
+  SNAPSHOT FORMAT v2 (litefilter/2, decisions/0021): every dump() also carries a 32-bit
+  integrity checksum `chk` over the tag, mem, keys-mode, seed, every sizing/width field,
+  count, and every store word. restore() recomputes it (after the structural checks, before
+  any write) and REJECTS a mismatch fail-closed. This closes a real fail-OPEN: keys-mode and
+  seed cannot be re-derived from the stored bytes, so a flipped keys ("int" <-> null) or seed
+  used to silently reconstruct under the wrong hash path (1990/2000 false negatives). `chk`
+  is an INTEGRITY check against accidental corruption, NOT a MAC (a forger who recomputes chk
+  is out of scope). A v1 snapshot has no chk and is REJECTED (re-dump to migrate).
 
 ## Members
 
@@ -137,6 +150,27 @@ Cross-cutting, mirrored from lite-lru:
   untrusted keys, duplicate-heavy streams (multiplicity fills toward the ceiling), the
   tightest space (Bloom is lower), growing quotient entropy past q0 (resize adds headroom,
   not new quotient bits -- decisions/0016), or the smallest static space (XOR / Binary Fuse).
+- XorFilter (decisions/0018..0020): the FIRST STATIC member -- built ONCE from a KNOWN key
+  set via XorFilter.from(iterable, options) (or the .build alias), then FROZEN. It approaches
+  the ~1.23x information-theoretic space lower bound by peeling a 3-uniform hypergraph: the
+  fingerprint array is 3 equal SEGMENTS of length bl = ceil(1.23*n/3)+32 (total 3*bl ~=
+  1.23*n+96 slots), each key touches one slot per segment, and slots are assigned in REVERSE
+  peel order so a key's three slots XOR to its fingerprint. Query: fingerprint(key) ==
+  fp[h0]^fp[h1]^fp[h2] -- zero allocation, no branch on build state. It DEDUPES its input
+  (keys are a SET, not multiplicity -- contrast Cuckoo / Quotient); size == capacity ==
+  |Set(keys)|. It is IMMUTABLE (decisions/0019): add / remove / clear and new XorFilter() all
+  throw a [lite-filter] Error (rebuild with XorFilter.from(newKeys) to change membership).
+  Fingerprint width fw = 8 when fpp >= 2^-8 (~0.0039), else 16; fpp < 2^-16 throws (the 16-bit
+  floor, inclusive). Delivered FPR is the width-quantized 2^-fw, typically UNDER target (fpp()
+  reports it): MEASURED ~0.0039 at fw=8, ~9.84 bits/item at n=1e6 -- LEANER than Cuckoo (~21) /
+  Quotient (~23), competitive with Bloom (~9.6) at a lower FPR. Build is a cold path (peeling
+  scaffold allocates); on a peel failure it RESEEDS deterministically (seed ^ attempt*
+  0x9e3779b1) up to 100 times, then THROWS [lite-filter] -- NEVER a partial build (the
+  fail-OPEN guard asserts the peel stack reached n before any fingerprint is assigned).
+  Exhaustion is expected only for a DEGENERATE set (many keys that String()-encode
+  identically -> duplicate edges no reseed can separate). Good for: a large, KNOWN, read-only
+  key set where the smallest space at a given FPR matters (e.g. a shipped dictionary / URL
+  blocklist). Not for: incremental adds, deletes, or a set that changes (use a mutable member).
 
 ## Construction
 
@@ -145,6 +179,7 @@ new CountingBloom(capacity, { fpp = 0.01, seed?, keys?: 'int', stats?: true })
 new BlockedBloom(capacity, { fpp = 0.01, seed?, keys?: 'int', stats?: true })
 new Cuckoo(capacity, { fpp = 0.01, seed?, keys?: 'int', stats?: true })
 new Quotient(capacity, { fpp = 0.01, seed?, keys?: 'int', stats?: true })
+XorFilter.from(iterable, { fpp = 0.01, seed?, keys?: 'int', stats?: true })  // static; .build alias
 
 Sizing (decisions/0002): m = ceil(-n * ln(fpp) / ln(2)^2), k = round((m/n) * ln(2)),
 k clamped to >= 1. All Bloom-family members share the sizing; CountingBloom stores
@@ -156,10 +191,14 @@ nb*4 slots (Uint8Array or Uint16Array); real slot capacity is nb*4, headroom via
 capacity. Quotient sizes differently (decisions/0016): remainder width r = ceil(log2(1/fpp)),
 slot word r+3 bits byte-aligned to 8 or 16 bits, slot count nslots = pow2 >= ceil(capacity/
 0.90), plus GUARD spillover slots (max(1024, nslots>>3)); q+r must fit one 32-bit hash.
+XorFilter sizes differently (decisions/0018): 3 segments of bl = ceil(1.23*n/3)+32 slots
+(n = deduped key count), fingerprint fw = 8 or 16 bits byte-aligned, store 3*bl slots
+(Uint8Array or Uint16Array); it takes the whole key set up front (no incremental capacity).
 Fail-closed doors: fpp not in (0,1), capacity < 1, an overflowing store, (for Cuckoo) a
-fingerprint width > 16 bits, or (for Quotient) a slot word > 16 bits or a q+r budget > 32
-bits all throw a [lite-filter] Error at construction. null is not zero: an unsized filter is
-never a zero-capacity one.
+fingerprint width > 16 bits, (for Quotient) a slot word > 16 bits or a q+r budget > 32 bits,
+or (for XorFilter) an empty key set, fpp < 2^-16, or 100 exhausted peel attempts all throw a
+[lite-filter] Error at construction. null is not zero: an unsized filter is never a
+zero-capacity one.
 
 ## The honesty hook (the bench's whole point)
 
@@ -200,6 +239,15 @@ is a hypothesis, not your filter's behavior on your keys -- MEASURE.
   small over-filled filter PROVABLY THROWS at the 0.90 load ceiling and a thrown add is a
   byte-identical no-op (torture, decisions/0016). metadata-set-slot count == size and
   per-cluster #homes == #runs after churn (validateQuotient -- the shift-back repair proof).
+- XorFilter static + space-optimal + fail-closed: mightContain on keys:'int' is 0 scavenges
+  at N=200000 and 8N=1600000 (perf-gate; 3 hashes, 3 modulo reductions, an XOR-compare, no
+  scratch); a filter built from 1e6 distinct keys reads back with EXACTLY 0 false negatives
+  (which can hold ONLY if the peel was complete -- the fail-OPEN regression gate); n=1e5,
+  fpp=0.01 (fw=8) over 1e6 disjoint probes -> measured FPR <= 0.0050 (~0.0039, UNDER the
+  configured 0.01 -- width quantization) AND > 0 (non-vacuous); a DEGENERATE set exhausts 100
+  reseeds and THROWS [lite-filter]; add/remove/clear/new all THROW [lite-filter]; 50
+  build-then-drop cycles leave the leak tracker at 0 (torture, decisions/0018..0020).
+  fp.length == 3*bl and bl == ceil(1.23*count/3)+32 (validateXor).
 - Fail closed on every unverified state; [lite-filter]-tagged errors throughout.
 
 ## Testing

@@ -34,7 +34,9 @@ export interface FilterStats {
  * `dump()` and consumed by the static `restore()`. The bit store is a plain Array so
  * the snapshot round-trips through `structuredClone` AND JSON. The shared fail-closed
  * tag is always present:
- *   - `f`     -- the format tag, `"litefilter/1"`. `restore()` rejects any other value.
+ *   - `f`     -- the format tag, `"litefilter/2"`. `restore()` rejects any other value.
+ *   - `chk`   -- a 32-bit integrity checksum (decisions/0021). `restore()` recomputes it and
+ *               rejects a mismatch fail-closed (catches a flipped keys-mode / seed).
  *   - `mem`   -- the member name (`"Bloom"`). A mismatch fails closed.
  *   - `m`     -- the bit count. A mismatch vs the re-derived sizing fails closed.
  *   - `k`     -- the hash count. A mismatch fails closed.
@@ -53,7 +55,10 @@ export interface FilterStats {
  * accepts its own shape and rejects a foreign one via the `mem` tag.
  */
 export interface FilterSnapshot {
-  f: "litefilter/1";
+  f: "litefilter/2";
+  /** Family-wide 32-bit integrity checksum (decisions/0021); `restore()` recomputes and
+   *  rejects a mismatch fail-closed. An integrity check against corruption, not a MAC. */
+  chk: number;
   mem: string;
   m: number;
   k: number;
@@ -76,8 +81,10 @@ export interface FilterSnapshot {
   fw?: number;
   /** Cuckoo: the bucket size (4). */
   b?: number;
-  /** Cuckoo: the fingerprint store as a plain array of slots (0 = empty). */
+  /** Cuckoo / XOR: the fingerprint store as a plain array of slots. */
   fp?: number[];
+  /** XOR: the per-segment length (`bl`; the fingerprint array is `3*bl` slots). */
+  bl?: number;
   /** Quotient: the remainder width in bits (r = ceil(log2(1/fpp))). */
   r?: number;
   /** Quotient: the quotient width in bits (q; nslots === 2^q; tracks a resize). */
@@ -305,6 +312,62 @@ export class Quotient<K = unknown> implements LiteFilter<K> {
   merge(other: Quotient<K>): Quotient<K>;
   /** Reconstruct a fresh Quotient from a snapshot. Fail closed on any mismatch. */
   static restore(snap: FilterSnapshot, opts?: FilterRestoreOptions): Quotient;
+}
+
+/**
+ * XOR filter (Graf & Lemire, ACM JEA 2020) -- the space-optimal STATIC member
+ * (decisions/0018, 0019, 0020). The FIRST immutable member: built ONCE from a KNOWN key
+ * set via the static `XorFilter.from(iterable, options)` (or the `.build` alias), then
+ * FROZEN. It approaches the ~1.23x information-theoretic space lower bound by peeling a
+ * 3-uniform hypergraph -- each key touches 3 fingerprint slots (one per segment), assigned
+ * so a key's three slots XOR to its fingerprint. Three defining traits:
+ *   - STATIC: there is no public constructor (`new XorFilter()` throws) and no mutation --
+ *     `add` / `remove` / `clear` all throw a `[lite-filter]`-tagged Error (decisions/0019).
+ *     Rebuild with `XorFilter.from(newKeys)` to change membership.
+ *   - KEYS ARE A SET: `from()` DEDUPES its input (contrast Cuckoo / Quotient, which store
+ *     multiplicity); `size` is the deduped key count.
+ *   - WIDTH: the fingerprint is byte-aligned -- 8 bits when `fpp >= 2^-8` (~0.0039), else
+ *     16 bits; `fpp < 2^-16` throws (the 16-bit floor). `fpp()` reports the width-quantized
+ *     `2^-fw`, typically BELOW the configured target -- MEASURE with the bench.
+ * A build over a DEGENERATE key set (many keys that String()-encode identically ->
+ * duplicate hypergraph edges) exhausts 100 reseeds and throws `[lite-filter]` fail-closed;
+ * it never ships a partial build.
+ */
+export class XorFilter<K = unknown> {
+  private constructor();
+  /** Query membership. NO false negatives for a key in the built set; false positives
+   *  bounded by the width-quantized `2^-fw`. Zero allocation on the int + string paths. */
+  mightContain(key: K): boolean;
+  /** The sole alias of `mightContain`, same one-sided semantics. */
+  has(key: K): boolean;
+  /** A static filter has no incremental add: this always throws a `[lite-filter]` Error. */
+  add(key: K): never;
+  /** A static filter cannot delete: this always throws a `[lite-filter]` Error. */
+  remove(key: K): never;
+  /** A static filter has nothing to clear to: this always throws a `[lite-filter]` Error. */
+  clear(): never;
+  /** The deduped key count the filter was built from (a plain counter, not an estimate). */
+  readonly size: number;
+  /** Alias of `size`. */
+  readonly count: number;
+  /** The deduped key count (== size; an XOR filter is built from exactly its set). */
+  readonly capacity: number;
+  /** The width-quantized `2^-fw` (typically below the configured target). MEASURE. */
+  fpp(): number;
+  /** The live per-instance stats holder. Throws without `{ stats: true }`. */
+  stats(): FilterStats;
+  /** Zero the stats counters in place. Throws without `{ stats: true }`. */
+  resetStats(): void;
+  /** Serialize to a plain, structurally-cloneable snapshot. Cold; may allocate. */
+  dump(): FilterSnapshot;
+  /** Build a frozen XOR filter from a known key set (deduped internally). Peels the
+   *  3-uniform hypergraph with up to 100 deterministic reseeds; throws `[lite-filter]`
+   *  fail-closed on an unpeelable (degenerate) set -- never a partial build. Cold. */
+  static from<K = unknown>(iterable: Iterable<K>, options?: FilterOptions): XorFilter<K>;
+  /** The `.build` alias of `from` -- the family's static-build verb, same contract. */
+  static build<K = unknown>(iterable: Iterable<K>, options?: FilterOptions): XorFilter<K>;
+  /** Reconstruct a fresh XorFilter from a snapshot. Fail closed on any mismatch. */
+  static restore(snap: FilterSnapshot, opts?: FilterRestoreOptions): XorFilter;
 }
 
 export const VERSION: string;

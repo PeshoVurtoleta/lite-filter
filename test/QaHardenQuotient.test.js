@@ -298,22 +298,17 @@ test("QAH restore: rejects an unsorted run (in-range words, homes==runs, but rem
 });
 
 // wrong seed on restore (fails via the structural/metadata-set check, not silently loaded).
-test("QAH restore: a wrong (but validly-shaped) seed still constructs, but the resulting instance's queries are simply wrong for the ORIGINAL keys -- documents that seed is trusted from the snapshot, not cross-checked against the store", () => {
+test("QAH restore: a wrong (but validly-shaped) seed is REJECTED by the integrity checksum (decisions/0021) -- it can no longer silently reconstruct a desynced filter", () => {
     const f = new Quotient(1000, { fpp: 0.01, keys: "int", seed: 111 });
     for (let i = 0; i < 50; i++) f.add(i);
     const snap = f.dump();
-    const bad = Object.assign({}, snap, { seed: 222 });
-    // This does NOT throw (seed cannot be cross-checked against opaque slot data), but the
-    // documented contract is: the caller is responsible for round-tripping the correct seed.
-    // We record this as an OBSERVED, not asserted-safe, behavior.
-    const g = Quotient.restore(bad, { keys: "int" });
-    let fn = 0;
-    for (let i = 0; i < 50; i++) if (!g.mightContain(i)) fn++;
-    // This is EXPECTED to corrupt membership (documents that restore trusts snap.seed
-    // uncritically -- consistent with Bloom/CountingBloom/Cuckoo, all of which have the
-    // identical limitation; not a NEW Quotient-specific defect).
-    assert.ok(fn > 0, "test setup: a wrong seed is expected to desync membership (documents an existing, " +
-        "shared-across-members limitation, not a regression)");
+    const bad = Object.assign({}, snap, { seed: 222 }); // valid uint32, but not the one that built the store
+    // Before v0.6.0 this SILENTLY reconstructed a desynced filter (seed cannot be cross-
+    // checked against opaque slot data). The family-wide snapshot checksum (decisions/0021)
+    // folds the seed into `chk`, so a flipped seed now fails closed rather than shipping a
+    // wrong filter -- the fix for the QA-reported fail-open (same class as the keys-mode flip).
+    assert.throws(() => Quotient.restore(bad, { keys: "int" }), /\[lite-filter\].*checksum/,
+        "a wrong seed must be rejected by the integrity checksum, not silently trusted");
 });
 
 // wrong r on merge (mismatched fpp -> mismatched r) must reject, even though q/nslots differ too.

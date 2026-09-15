@@ -1,6 +1,6 @@
 # @zakkster/lite-filter
 
-> A zero-GC approximate-membership filter FAMILY under one `LiteFilter<K>` surface: `Bloom` (the add-only reference), `CountingBloom` (deletable, ~4x space), `BlockedBloom` (one cache miss per query, at a higher measured FPR), `Cuckoo` (deletable, fingerprint-based, fail-closed at capacity), and `Quotient` (deletable, mergeable + resizable, fail-closed at the load ceiling) ship today, with the space-optimal static members (XOR, Binary Fuse) to come -- one-line swappable, tree-shakeable to a single filter, with a shipped bench that measures ACTUAL vs THEORETICAL false-positive rate on your own keys instead of trusting a formula.
+> A zero-GC approximate-membership filter FAMILY under one `LiteFilter<K>` surface: `Bloom` (the add-only reference), `CountingBloom` (deletable, ~4x space), `BlockedBloom` (one cache miss per query, at a higher measured FPR), `Cuckoo` (deletable, fingerprint-based, fail-closed at capacity), `Quotient` (deletable, mergeable + resizable, fail-closed at the load ceiling), and `XorFilter` (the space-optimal STATIC member, ~9.84 bits/item, built once + immutable) ship today, with `Binary Fuse` (the last static member) to come -- one-line swappable, tree-shakeable to a single filter, with a shipped bench that measures ACTUAL vs THEORETICAL false-positive rate on your own keys instead of trusting a formula.
 
 [![npm version](https://img.shields.io/npm/v/@zakkster/lite-filter.svg?style=for-the-badge&color=latest)](https://www.npmjs.com/package/@zakkster/lite-filter)
 [![sponsor](https://img.shields.io/badge/sponsor-PeshoVurtoleta-ea4aaa.svg?logo=github)](https://github.com/sponsors/PeshoVurtoleta)
@@ -38,7 +38,7 @@ seen.size;                      // 2     -- adds recorded
 seen.fpp();                     // the fill-derived FPR estimate (a formula, not a measurement)
 ```
 
-One `LiteFilter<K>` surface, `add`/`mightContain`/`has`/`size`/`capacity`/`fpp`/`clear`, zero allocation on every hot path after construction. Integer keys opt into a strict-zero-alloc backing. `Bloom`, `CountingBloom`, `BlockedBloom`, `Cuckoo`, and `Quotient` are shipped named exports today; the remaining static members (XOR, Binary Fuse) ship as further named exports (`sideEffects: false` drops whichever you do not import).
+One `LiteFilter<K>` surface, `add`/`mightContain`/`has`/`size`/`capacity`/`fpp`/`clear`, zero allocation on every hot path after construction. Integer keys opt into a strict-zero-alloc backing. `Bloom`, `CountingBloom`, `BlockedBloom`, `Cuckoo`, `Quotient`, and `XorFilter` are shipped named exports today (`XorFilter` is static -- built via `XorFilter.from(keys)`, sharing the query surface); the last static member (Binary Fuse) ships as a further named export (`sideEffects: false` drops whichever you do not import).
 
 Then measure, do not guess:
 
@@ -58,6 +58,7 @@ npm run bench     # measured vs theoretical FPR (% over), bits/item, add/query n
   - [BlockedBloom -- the cache-local member](#the-members)
   - [Cuckoo -- the fingerprint member](#the-members)
   - [Quotient -- the mergeable + resizable member](#the-members)
+  - [XorFilter -- the space-optimal static member](#the-members)
 - [API reference](#api-reference)
   - [Construction](#construction)
   - [The surface](#the-surface)
@@ -145,10 +146,14 @@ so `remove()` throws (use `CountingBloom` when you need deletes).
 | `BlockedBloom` | no (`remove` throws) | 1x Bloom (one 512-bit cache line per key) | SHIPPED (v0.3.0) | `import { BlockedBloom } from '@zakkster/lite-filter'` |
 | `Cuckoo` | **yes** (`remove -> boolean`) | ~2x Bloom at fpp 0.01 (byte-aligned fingerprints) | SHIPPED (v0.4.0) | `import { Cuckoo } from '@zakkster/lite-filter'` |
 | `Quotient` | **yes** (`remove -> boolean`; also `merge` + `resize`) | ~23 bits/item at fpp 0.01 (byte-aligned slot words + guard) | SHIPPED (v0.5.0) | `import { Quotient } from '@zakkster/lite-filter'` |
+| `XorFilter` | no (STATIC: `add`/`remove`/`clear` throw) | ~9.84 bits/item at fpp 0.01 (~1.23x the space bound) | SHIPPED (v0.6.0) | `import { XorFilter } from '@zakkster/lite-filter'` |
 
-All five implement the same `LiteFilter<K>` surface, so a member is a one-line
-constructor swap; the only surface differences are `remove` (member-specific) and
-`Quotient`'s extra `merge` / `resize` cold paths.
+The five MUTABLE members implement the same `LiteFilter<K>` surface, so a member is a
+one-line constructor swap; the only surface differences are `remove` (member-specific)
+and `Quotient`'s extra `merge` / `resize` cold paths. `XorFilter` is the FIRST STATIC
+member: it shares the query surface (`mightContain` / `has` / `size` / `fpp` / `dump`)
+but is built via `XorFilter.from(keys)` and throws on `add` / `remove` / `clear`
+(a static filter has no mutation surface -- rebuild to change membership).
 
 <details>
 <summary>CountingBloom -- the deletable member (and its two honest caveats)</summary>
@@ -312,6 +317,50 @@ Bloom vs Quotient side by side. Below `fpp = 1/2^13 (~0.000122)` the slot word w
 
 </details>
 
+<details>
+<summary>XorFilter -- the space-optimal static member (built once, immutable, ~1.23x the space bound)</summary>
+
+`XorFilter` (Graf & Lemire, ACM JEA 2020) is the family's FIRST STATIC member: it is built
+ONCE from a KNOWN key set and frozen. It approaches the ~1.23x information-theoretic space
+lower bound by peeling a 3-uniform hypergraph -- each key touches 3 fingerprint slots (one
+per equal segment), and the slots are assigned so a key's three slots XOR to its fingerprint.
+
+```js
+import { XorFilter } from '@zakkster/lite-filter';
+
+const keys = [];
+for (let i = 0; i < 1_000_000; i++) keys.push(i);
+const f = XorFilter.from(keys, { fpp: 0.01, keys: 'int' }); // build once (or .build)
+f.mightContain(42);        // true  -- 0 false negatives, guaranteed by the complete peel
+f.mightContain(9_999_999); // usually false; a true is a false positive (~2^-8)
+f.size;                    // 1000000 (the deduped key count)
+f.add(1);                  // throws [lite-filter] -- a static filter has no mutation
+```
+
+**It is IMMUTABLE** (decisions/0019). There is no public constructor (`new XorFilter()`
+throws), and `add` / `remove` / `clear` all throw a `[lite-filter]`-tagged Error. Rebuild
+with `XorFilter.from(newKeys)` to change membership. It shares the query surface
+(`mightContain` / `has` / `size` / `count` / `capacity` / `fpp` / `stats` / `dump`).
+
+**Keys are a SET** (decisions/0018). `from()` DEDUPES its input (contrast `Cuckoo` /
+`Quotient`, which store multiplicity), so `size === capacity === |Set(keys)|`.
+
+**The measure-vs-configured hook.** The fingerprint is byte-aligned: `fw = 8` when
+`fpp >= 2^-8 (~0.0039)`, else `16`; `fpp < 2^-16` throws (the 16-bit floor, inclusive at
+`2^-16`). The delivered FPR is the width-quantized `2^-fw` -- BELOW the configured 0.01 at
+`fw = 8` (MEASURED ~0.0039 over 1e6 disjoint probes), at ~9.84 bits/item for n=1e6 (LEANER
+than `Cuckoo` ~21 / `Quotient` ~23, competitive with `Bloom` ~9.6 at a lower FPR). `fpp()`
+reports the quantized rate; `npm run bench` prints Bloom vs XOR side by side.
+
+**Fail-closed build** (decisions/0018). On a peel failure the build RESEEDS deterministically
+(`seed ^ (attempt * 0x9e3779b1)`) up to 100 times, then throws `[lite-filter]` -- NEVER a
+partial build. A partial build would fail OPEN (silent false negatives on real keys), so the
+build asserts the peel stack reached `n` BEFORE any fingerprint is assigned. Exhaustion is
+expected only for a DEGENERATE set (many keys that `String()`-encode identically). Build is a
+cold path (the peeling scaffold allocates); the query is strictly zero-alloc.
+
+</details>
+
 ## API reference
 
 ### Construction
@@ -325,27 +374,42 @@ new Bloom(capacity: number, options?: {
 })
 ```
 
+The five MUTABLE members share this `new Member(capacity, options)` shape. The static
+`XorFilter` is built from a key set instead, taking the same options (minus `capacity`,
+which it derives from the deduped set):
+
+```ts
+XorFilter.from(iterable: Iterable<K>, options?: {
+  fpp?: number;      // target FPP; fw = 8 (fpp >= 2^-8) or 16; fpp < 2^-16 throws.
+  seed?: number;     // hash seed. Default is a fixed constant.
+  keys?: 'int';      // opt into the strict-zero-alloc 32-bit-integer backing.
+  stats?: boolean;   // mint the per-instance stats holder. OFF by default.
+})            // -> XorFilter;  .build is an alias.  new XorFilter() throws.
+```
+
 Fail-closed doors (all throw a `[lite-filter]`-tagged Error): `capacity` non-integer
 or `< 1`; `fpp` not in the open interval `(0, 1)` (so `<= 0` and `>= 1` both throw);
 a bit count that would overflow a safe typed-array length; an unknown `keys` or
-`stats` value (with a did-you-mean hint).
+`stats` value (with a did-you-mean hint). For `XorFilter` also: an empty key set,
+`fpp < 2^-16`, and 100 exhausted peel attempts (a degenerate key set).
 
 ### The surface
 
 | Method | Returns | Notes |
 | --- | --- | --- |
-| `add(key)` | `void` | Record a key. Zero-alloc on int + string keys. |
+| `add(key)` | `void` / `never` | Record a key. Zero-alloc on int + string keys. **XorFilter**: static, **throws** `[lite-filter]`. |
 | `mightContain(key)` | `boolean` | The query. NO false negatives; false positives bounded by `fpp`. |
 | `has(key)` | `boolean` | The sole alias of `mightContain`, same semantics. |
-| `remove(key)` | `never` / `boolean` | **Bloom** + **BlockedBloom**: add-only, **throw** `[lite-filter]`. **CountingBloom** + **Cuckoo** + **Quotient**: a real delete, returns `boolean` (member-specific). |
+| `remove(key)` | `never` / `boolean` | **Bloom** + **BlockedBloom** + **XorFilter**: **throw** `[lite-filter]`. **CountingBloom** + **Cuckoo** + **Quotient**: a real delete, returns `boolean` (member-specific). |
 | `resize(n)` / `merge(other)` | `Quotient` | **Quotient only**: cold-path rebuild (grow/shrink) and union with an identical filter; preserve membership. |
-| `size` / `count` | `number` | Adds recorded (a plain counter, not a distinct-key count). |
-| `capacity` | `number` | The item count the filter was sized for. |
-| `fpp()` | `number` | Configured target while empty, else the fill-derived estimate. |
-| `clear()` | `void` | Reset to empty. Allocates nothing (zeroes the store in place). |
+| `size` / `count` | `number` | Adds recorded (a plain counter, not a distinct-key count). **XorFilter**: the deduped key count. |
+| `capacity` | `number` | The item count the filter was sized for (**XorFilter**: == size). |
+| `fpp()` | `number` | Configured target while empty, else the fill-derived estimate (**Cuckoo** / **Quotient** / **XorFilter**: the width-quantized rate). |
+| `clear()` | `void` / `never` | Reset to empty (zeroes the store in place). **XorFilter**: static, **throws** `[lite-filter]`. |
 | `stats()` / `resetStats()` | -- | Require `{ stats: true }`; fail closed otherwise. |
 | `dump()` | snapshot | Serialize. Cold; may allocate. |
-| `Bloom.restore(snap, opts?)` | `Bloom` | Static. Rebuild; fail closed on any mismatch. |
+| `Member.from(iterable, opts?)` | `XorFilter` | **XorFilter only** (static factory; `.build` alias). Build from a key set; throws on a degenerate set. |
+| `Member.restore(snap, opts?)` | member | Static. Rebuild; fail closed on any mismatch. |
 
 ### Integer keys -- strict zero-alloc
 
@@ -383,7 +447,22 @@ const g = Bloom.restore(JSON.parse(json));   // bit-identical membership
 
 The `Uint32Array` store IS the serial form. `restore()` re-derives `(m, k)` from the
 recorded `(cap, fpp)` and REJECTS -- never truncates -- on any tag, member, capacity,
-fpp, seed, bit-count, or count mismatch.
+fpp, seed, bit-count, or count mismatch. Each member's `restore()` is member-specific
+(`CountingBloom.restore`, `Cuckoo.restore`, `Quotient.restore`, `XorFilter.restore`, ...)
+and rejects a foreign snapshot via the `mem` tag. `XorFilter.restore` re-derives the
+fingerprint width from `fpp`, the segment length `bl` from `count`, checks
+`fp.length === 3*bl`, and validates every word in `0..(1<<fw)-1` before building.
+
+**Snapshot format v2 -- integrity checksum (decisions/0021).** As of v0.6.0 the format tag
+is `"litefilter/2"` and every `dump()` carries a 32-bit integrity checksum `chk` over the
+tag, member, keys-mode, seed, every sizing/width field, count, and every store word.
+`restore()` recomputes it (after the structural checks, before any write) and REJECTS a
+mismatch fail-closed. This closes a real fail-OPEN: the keys-mode and seed CANNOT be
+re-derived from the stored bytes, so a flipped `keys` (`"int"` <-> `null`) or `seed` used to
+silently reconstruct under the wrong hash path (1990/2000 false negatives on a 2000-key XOR
+dump in the QA repro). `chk` is an INTEGRITY check against accidental corruption, NOT a MAC:
+a determined forger who recomputes `chk` is out of scope, the same as any checksum. A v1
+snapshot has no `chk` and is rejected -- re-`dump()` from a live filter to migrate.
 
 ### The bench tool
 
@@ -397,12 +476,13 @@ const rows = runBench({ cap: 100000, fpp: 0.01 });
 
 | Export | Meaning |
 | --- | --- |
-| `VERSION` | the package version string (`"0.5.0"`) |
+| `VERSION` | the package version string (`"0.6.0"`) |
 | `Bloom` | the reference member (also the default export) |
 | `CountingBloom` | the deletable member (4-bit saturating counters; a real `remove`) |
 | `BlockedBloom` | the cache-local member (one 512-bit block per key; one cache miss per query, at a higher measured FPR) |
 | `Cuckoo` | the fingerprint member (b=4 buckets; deletable, fail-closed at capacity; FPR width-quantized to `2b/2^f`) |
 | `Quotient` | the mergeable + resizable member (linear quotient filter; deletable, fail-closed at the 0.90 load ceiling; FPR remainder-quantized to `load * 2^-r`) |
+| `XorFilter` | the space-optimal static member (3-uniform hypergraph peeling; built once via `from`/`build`, immutable, ~1.23x the space bound; FPR width-quantized to `2^-fw`) |
 
 ## Composability
 
@@ -473,8 +553,14 @@ configured 0.01 -- decisions/0014) and a PROVEN fail-closed overload throw. Quot
 split + shift, preallocated cluster scratch on remove), with a remainder-quantized measured
 FPR **<= 0.0090** (~0.0060, under the configured 0.01 -- decisions/0016), resize + merge
 round-trips at **0 false negatives** with preserved/additive size, and a PROVEN fail-closed
-load-ceiling throw that is a byte-identical no-op. ns/op figures are machine-local -- run
-`npm run bench`.
+load-ceiling throw that is a byte-identical no-op. XorFilter `mightContain` on `keys:'int'`
+is **0 scavenges** at N=200000 and 8N=1600000 (3 hashes, 3 modulo reductions, an XOR-compare,
+no scratch); a filter built from **1e6 distinct keys reads back with exactly 0 false
+negatives** (which can hold ONLY if the peel was complete -- the fail-open regression gate),
+with a width-quantized measured FPR **<= 0.0050** (~0.0039, under the configured 0.01 --
+decisions/0020) that is strictly **> 0** (non-vacuous) at **~9.84 bits/item**, plus a PROVEN
+fail-closed 100-attempt exhaustion throw on a degenerate set. ns/op figures are
+machine-local -- run `npm run bench`.
 
 </details>
 
@@ -490,7 +576,9 @@ load-ceiling throw that is a byte-identical no-op. ns/op figures are machine-loc
 - **`fpp()` is an estimate, labeled as one** (decisions/0004). Measure your own keys.
 - **The snapshot rejects, never truncates** (decisions/0005). A corrupt or foreign
   snapshot is an error, not a silently-wrong filter.
-- **The static-build API is deferred** (decisions/0006) to the first static member.
+- **The static-build API is `Member.from(iterable)`** (decisions/0006, resolved in v0.6.0
+  with `XorFilter`): a static factory, not add-then-freeze -- so a static member is honest
+  about its nature and the mutable members' `add` stays un-gated.
 - **CountingBloom counters are 4-bit nibbles, two per byte** (decisions/0007) -- ~4x
   Bloom's space for a real `remove`, chosen over 8-bit for space at a 1% fpp.
 - **Counters saturate at 15, never wrap** (decisions/0008). A wrap would turn a present
@@ -530,6 +618,18 @@ load-ceiling throw that is a byte-identical no-op. ns/op figures are machine-loc
 - **Quotient delete has the same never-added caveat** (decisions/0017): removing a
   NEVER-INSERTED key whose `(quotient, remainder)` collides with a real key clears that
   other key's slot -> a false negative for it. Only remove keys you inserted.
+- **XorFilter is a static build with a fail-open guard** (decisions/0018): 3-segment
+  hypergraph peeling, `bl = ceil(1.23*n/3)+32`, reverse-order assignment, deterministic
+  reseed up to 100 times. The peel stack MUST reach `n` before any fingerprint is assigned
+  -- a short stack is a peel failure (reseed / throw), never assigned from (a partial build
+  would fail OPEN with silent false negatives).
+- **XorFilter is immutable** (decisions/0019): `add` / `remove` / `clear` / `new XorFilter()`
+  all throw `[lite-filter]`. `clear()` throws rather than producing an undefined all-zero
+  build; rebuild via `XorFilter.from(newKeys)` to change membership.
+- **XorFilter byte-aligns the fingerprint and revalidates on restore** (decisions/0020):
+  `fw = 8` (`fpp >= 2^-8`) or `16`, `fpp < 2^-16` throws; positions are `hash % bl` (exact,
+  no multiply-shift precision loss); `restore()` re-derives fw from fpp, bl from count, and
+  the length from bl, rejecting any corruption (never truncates).
 
 ## Testing
 
@@ -540,7 +640,9 @@ load-ceiling throw that is a byte-identical no-op. ns/op figures are machine-loc
 - `npm run test:types` -- `tsc --noEmit` proves `Bloom`, `CountingBloom`,
   `BlockedBloom`, `Cuckoo`, and `Quotient` satisfy `LiteFilter<K>`, that `CountingBloom`,
   `Cuckoo`, and `Quotient` `remove` are a real `boolean` (and `Quotient.resize`/`merge`
-  return the filter), and that `Bloom`/`BlockedBloom` `remove` is `never`.
+  return the filter), that `Bloom`/`BlockedBloom` `remove` is `never`, and that
+  `XorFilter` is static (`from`/`build`/`restore`; `add`/`remove`/`clear` are `never`; no
+  public constructor).
 - `npm run torture` -- `node --expose-gc`: the leak tracker (retention returns to 0)
   + the GC profiler (maxMajor 0) + the Set-differential oracle (no false negatives,
   bounded FPR) + a CountingBloom add/remove churn oracle + a BlockedBloom oracle (0
@@ -548,14 +650,16 @@ load-ceiling throw that is a byte-identical no-op. ns/op figures are machine-loc
   theory) + a Cuckoo oracle (0 false negatives, delete-churn, and a PROVEN fail-closed
   overload throw) + a Quotient oracle (0 false negatives; delete-churn with size==present;
   resize + merge round-trips; a PROVEN byte-identical fail-closed ceiling throw; and
-  `validateQuotient` structure after churn) + the `clear()` ArrayBuffer-identity check for
-  all five members.
+  `validateQuotient` structure after churn) + an XOR oracle (a 1e6-key static build with 0
+  false negatives -- the fail-open regression gate; a non-vacuous width-quantized FPR;
+  PROVEN fail-closed exhaustion + immutability throws; 50 build-then-drop retention cycles)
+  + the `clear()` ArrayBuffer-identity check for the five mutable members.
 - `npm run torture:controls` -- the must-fail proof: a broken build MUST fail.
 - `npm run test:perf` -- the `@zakkster/lite-perf-gate` zero-alloc scenarios on
   `keys:'int'` (Bloom add-churn + query-hit; CountingBloom add-churn + query-hit +
   remove-churn; BlockedBloom add-churn + query-hit; Cuckoo add-churn + query-hit +
-  remove-churn; Quotient add-churn + query-hit + remove-churn), with an allocating
-  mustFail for teeth.
+  remove-churn; Quotient add-churn + query-hit + remove-churn; XorFilter query-hit), with
+  an allocating mustFail for teeth.
 - `npm run bench` -- the measurement tool.
 
 ## What this is not

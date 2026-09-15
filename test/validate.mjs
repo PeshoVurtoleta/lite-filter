@@ -373,3 +373,58 @@ export function validateQuotient(filter) {
         p = ce;
     }
 }
+
+/**
+ * Assert the CONSERVATION invariant for an XOR filter (test/debug only, O(slots)). An XOR
+ * filter is STATIC (decisions/0018): built once, no fill counter to reconcile. The teeth
+ * here are STRUCTURAL soundness -- a store whose geometry does not tie back to the deduped
+ * key count is a corrupt build:
+ *
+ *   fw is 8 or 16                              (a byte-aligned fingerprint width)
+ *   bl >= 1 && fp.length === 3 * bl            (three equal segments)
+ *   bl === ceil(1.23 * count / 3) + 32         (the segment length is derived from count)
+ *   count >= 1 && count === capacity           (built over >= 1 key; cap == count)
+ *   every slot is in 0..(1<<fw)-1              (each word fits the fingerprint width)
+ *
+ * The "every present key resolves" law is proven at scale by the torture differential (0
+ * false negatives, which can ONLY hold if the peel was COMPLETE), so it is not re-derived
+ * here. Throws an Error naming the first violation, or returns void.
+ */
+export function validateXor(filter) {
+    const fw = filter._fw;
+    const bl = filter._bl;
+    const fp = filter._fp;
+    const count = filter._count;
+    const cap = filter._cap;
+
+    if (fw !== 8 && fw !== 16) {
+        throw new Error("[validate] XOR fingerprint width fw=" + fw + " is not 8 or 16");
+    }
+    if (!(bl >= 1)) {
+        throw new Error("[validate] XOR segment length bl=" + bl + " out of range");
+    }
+    const expectedLen = 3 * bl;
+    if (!fp || fp.length !== expectedLen) {
+        throw new Error(
+            "[validate] XOR store length " + (fp ? fp.length : String(fp)) +
+            " != 3*bl=" + expectedLen);
+    }
+    if (!(count >= 1)) {
+        throw new Error("[validate] XOR count=" + count + " must be >= 1 (a static filter over a non-empty set)");
+    }
+    if (count !== cap) {
+        throw new Error("[validate] XOR count=" + count + " != capacity=" + cap);
+    }
+    const expectedBl = Math.ceil((1.23 * count) / 3) + 32;
+    if (bl !== expectedBl) {
+        throw new Error(
+            "[validate] XOR segment length bl=" + bl + " != ceil(1.23*count/3)+32=" + expectedBl);
+    }
+    const fpMask = (1 << fw) - 1;
+    for (let i = 0; i < fp.length; i++) {
+        const v = fp[i];
+        if (v < 0 || v > fpMask) {
+            throw new Error("[validate] XOR slot " + i + " value " + v + " out of 0.." + fpMask);
+        }
+    }
+}

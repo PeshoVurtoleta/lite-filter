@@ -27,7 +27,7 @@
  * @license MIT
  */
 
-import { Bloom, CountingBloom, BlockedBloom, Cuckoo, Quotient, VERSION } from "../Filter.js";
+import { Bloom, CountingBloom, BlockedBloom, Cuckoo, Quotient, XorFilter, VERSION } from "../Filter.js";
 
 /** Seeded xorshift32 -- byte-reproducible from its seed. */
 export function makePrng(seed) {
@@ -347,6 +347,55 @@ export function measureQuotient(name, gen, cap, fpp, seed) {
 }
 
 /**
+ * Measure one workload against a fresh XorFilter BUILT from (cap, fpp). Same row shape as
+ * `measure` so it prints into the same side-by-side table. An XOR filter is STATIC: it is
+ * built ONCE from the deduped key set (not incrementally), so there is no per-add timing --
+ * `addNs` reports the amortized BUILD ns/key instead. Its FPR is the width-quantized `2^-fw`
+ * (fw=8 or 16, byte-aligned), independent of fill, typically UNDER the configured target --
+ * the measure-vs-configured honesty hook. bits/item is the ACTUAL store (3*bl slots byte-
+ * aligned to fw), which is close to the ~1.23x information-theoretic space bound. `from()`
+ * DEDUPES the input (contrast Cuckoo / Quotient), so `distinct` drives every rate.
+ */
+export function measureXor(name, gen, cap, fpp, seed) {
+    const { keys, probes } = gen(cap, Math.max(cap * 10, 100000), seed);
+    const truth = new Set(keys);
+
+    const t0 = performance.now();
+    const filter = XorFilter.from(keys, { fpp, keys: "int" });
+    const distinct = filter.size;
+    const addNs = distinct === 0 ? 0 : ((performance.now() - t0) * 1e6) / distinct;
+
+    let falseNeg = 0;
+    for (const key of truth) if (!filter.mightContain(key)) falseNeg++;
+
+    const t1 = performance.now();
+    let acc = 0;
+    for (let i = 0; i < probes.length; i++) acc += filter.mightContain(probes[i]) ? 1 : 0;
+    const queryNs = ((performance.now() - t1) * 1e6) / probes.length;
+    if (acc === -1) process.stdout.write(""); // keep acc observable
+    let falsePos = 0, probed = 0;
+    for (let i = 0; i < probes.length; i++) {
+        if (truth.has(probes[i])) continue;
+        probed++;
+        if (filter.mightContain(probes[i])) falsePos++;
+    }
+
+    // The fingerprint width fw is the row's "k" column (an XOR filter has no k probes).
+    const k = filter._fw;
+    const measuredFpr = probed === 0 ? 0 : falsePos / probed;
+    // XOR FPR is width-quantized: 2^-fw, independent of fill.
+    const theoretical = Math.pow(2, -filter._fw);
+    const overPct = theoretical === 0 ? 0 : ((measuredFpr - theoretical) / theoretical) * 100;
+    // ACTUAL store: 3*bl slots byte-aligned to fw bits per slot.
+    const bitsPerItem = distinct === 0 ? 0 : (filter._fp.byteLength * 8) / distinct;
+
+    return {
+        name, added: distinct, distinct, bitsPerItem, k,
+        measuredFpr, theoretical, overPct, addNs, queryNs, falseNeg,
+    };
+}
+
+/**
  * The remove/churn workload (CountingBloom only): add N distinct keys, remove HALF,
  * then requery -- the still-present half MUST show 0 false negatives, and the removed
  * half should mostly read absent. Reports remove ns/op and the two counts. This is the
@@ -447,6 +496,20 @@ export function runBenchQuotient(opts) {
     rows.push(measureQuotient("zipfian", zipfian, cap, fpp, seed ^ 0x11));
     rows.push(measureQuotient("sequential", sequential, cap, fpp, seed ^ 0x22));
     rows.push(measureQuotient("adversarial", (n, p, s) => adversarial(Math.floor(cap * 1.5), p, s),
+        cap, fpp, seed ^ 0x33));
+    return rows;
+}
+
+/** Run the XOR workload matrix (FPR-vs-theory across the 4 workloads). */
+export function runBenchXor(opts) {
+    const cap = (opts && opts.cap) || 100000;
+    const fpp = (opts && opts.fpp) || 0.01;
+    const seed = (opts && opts.seed) || 0xC0FFEE;
+    const rows = [];
+    rows.push(measureXor("uniform", uniform, cap, fpp, seed));
+    rows.push(measureXor("zipfian", zipfian, cap, fpp, seed ^ 0x11));
+    rows.push(measureXor("sequential", sequential, cap, fpp, seed ^ 0x22));
+    rows.push(measureXor("adversarial", (n, p, s) => adversarial(Math.floor(cap * 1.5), p, s),
         cap, fpp, seed ^ 0x33));
     return rows;
 }
@@ -620,6 +683,47 @@ function printQuotientTable(bloomRows, qfRows, cap, fpp) {
         "its FPR is remainder-quantized by the byte-aligned width -- MEASURE your own keys.\n\n");
 }
 
+/**
+ * Bloom vs XOR SIDE BY SIDE across the four workloads: bits/item (an XOR filter approaches
+ * the ~1.23x information-theoretic space bound -- fw bits/item plus the ~1.23x factor, so at
+ * fw=8 it runs ~9.8 bits/item, LEANER than Cuckoo/Quotient and competitive with Bloom while
+ * delivering a LOWER FPR), measured FPR and its THEORETICAL closed form (Bloom's fill-derived
+ * `(1-e^(-kn/m))^k` vs XOR's width-quantized `2^-fw`). The XOR measured FPR typically lands
+ * BELOW its configured target because fw is byte-aligned UP -- the measure-vs-configured
+ * honesty hook. The `k` column is Bloom's hash count / the XOR fingerprint width fw. XOR is
+ * STATIC: `add ns` reports the amortized BUILD ns/key (it is built once, not incrementally).
+ */
+function printXorTable(bloomRows, xfRows, cap, fpp) {
+    process.stdout.write(
+        "@zakkster/lite-filter v" + VERSION + " -- Bloom vs XOR (cap=" + cap +
+        ", target fpp=" + fpp + ")\n" +
+        "An XOR filter is STATIC: built ONCE from a known key set (peeling a 3-uniform\n" +
+        "hypergraph), no add/remove. Its FPR is width-quantized to 2^-fw, typically UNDER\n" +
+        "target; it approaches the ~1.23x space lower bound. add ns = amortized build ns/key.\n\n");
+    process.stdout.write(
+        pad("workload", 12) + pad("Bl b/item", 11) + pad("Xf b/item", 11) +
+        pad("Bloom FPR", 12) + pad("Xor FPR", 12) + pad("Xf theoFPR", 12) +
+        pad("Bl add", 9) + pad("Xf build", 10) + pad("distinct", 10) + "\n");
+    for (let i = 0; i < bloomRows.length; i++) {
+        const bl = bloomRows[i];
+        const xf = xfRows[i];
+        process.stdout.write(
+            pad(bl.name, 12) +
+            pad(bl.bitsPerItem.toFixed(2), 11) +
+            pad(xf.bitsPerItem.toFixed(2), 11) +
+            pad(bl.measuredFpr.toFixed(5), 12) +
+            pad(xf.measuredFpr.toFixed(5), 12) +
+            pad(xf.theoretical.toFixed(5), 12) +
+            pad(bl.addNs.toFixed(1), 9) +
+            pad(xf.addNs.toFixed(1), 10) +
+            pad(xf.distinct, 10) + "\n");
+    }
+    process.stdout.write(
+        "\nAn XOR filter DEDUPES its input (keys are a SET, not multiplicity -- contrast\n" +
+        "Cuckoo / Quotient); it cannot delete or grow. Its FPR is quantized by the byte-\n" +
+        "aligned fingerprint width -- MEASURE your own keys.\n\n");
+}
+
 // Runnable entry: `node benchmark/Bench.mjs`.
 if (import.meta.url === "file://" + process.argv[1] ||
     import.meta.url === new URL("file://" + process.argv[1]).href) {
@@ -631,4 +735,5 @@ if (import.meta.url === "file://" + process.argv[1] ||
     printBlockedTable(bloomRows, runBenchBlocked({ cap, fpp }), cap, fpp);
     printCuckooTable(bloomRows, runBenchCuckoo({ cap, fpp }), cap, fpp);
     printQuotientTable(bloomRows, runBenchQuotient({ cap, fpp }), cap, fpp);
+    printXorTable(bloomRows, runBenchXor({ cap, fpp }), cap, fpp);
 }

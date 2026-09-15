@@ -86,7 +86,7 @@
  * @license MIT
  */
 
-export const VERSION = "0.5.0";
+export const VERSION = "0.6.0";
 
 /* -------------------------------------------------------------------------- *
  * Constants + fail-closed messages (built ONCE, thrown only on misuse).
@@ -118,10 +118,12 @@ const STATS_OFF_MSG =
     "[lite-filter] stats()/resetStats() require the filter to be constructed with " +
     "{ stats: true }; this instance has no stats configured";
 
-/** The snapshot format tag (decisions/0005). A `dump()` carries it; `restore()`
- *  rejects any other value fail-closed. Versioned so a future layout change is a
- *  clean, detectable break rather than a silent misread. */
-const SNAP_TAG = "litefilter/1";
+/** The snapshot format tag (decisions/0005, 0021). A `dump()` carries it; `restore()`
+ *  rejects any other value fail-closed. Versioned so a layout change is a clean,
+ *  detectable break rather than a silent misread. Bumped to `litefilter/2` in v0.6.0:
+ *  every snapshot now carries an integrity checksum (`chk`, decisions/0021), and a v1
+ *  snapshot (which has none) cannot be integrity-verified -- so it is REJECTED. */
+const SNAP_TAG = "litefilter/2";
 
 /** CountingBloom counter width (decisions/0007): 4 bits per counter (a nibble),
  *  two counters packed per byte. The saturation ceiling is MAX_COUNT = 15 -- a
@@ -246,6 +248,97 @@ const DEFAULT_FPP = 0.01;
 /** Default hash seed (decisions/0001). A fixed constant so a filter's behavior is
  *  deterministic across runs; overridable via `{ seed }` for A/B hashing. */
 const DEFAULT_SEED = 0x9e3779b1;
+
+/* -------------------------------------------------------------------------- *
+ * XOR filter constants (decisions/0018, 0019, 0020; Graf & Lemire, "Xor Filters:
+ * Faster and Smaller Than Bloom and Cuckoo Filters", ACM JEA 2020). The FIRST static
+ * member: built ONCE from a KNOWN key set by peeling a 3-uniform hypergraph, then
+ * frozen. No add/remove/clear -- membership is fixed at construction.
+ * -------------------------------------------------------------------------- */
+
+/** The XOR filter is 3-uniform: every key touches exactly 3 fingerprint slots, one in
+ *  each of 3 equal SEGMENTS (decisions/0018). PINNED (the peeling threshold and the
+ *  ~1.23x space factor are both tied to arity 3). */
+const XOR_ARITY = 3;
+
+/** The ~1.23x space factor (decisions/0018): the segment length is
+ *  `ceil(1.23 * n / 3) + 32`, so the total array is `3*bl ~= 1.23*n + 96` slots. 1.23
+ *  is just above the 3-uniform peeling threshold (~1.222 slots/key), and the +32 per
+ *  segment gives small-n slack; together they keep a random key set peelable in one or
+ *  two attempts. PINNED. */
+const XOR_LOAD = 1.23;
+
+/** Per-segment additive padding (decisions/0018): +32 slots per segment (=+96 total)
+ *  so small key sets sit comfortably above the peeling threshold. PINNED. */
+const XOR_SEGMENT_PAD = 32;
+
+/** The peeling reseed ceiling (decisions/0018): try up to 100 deterministic reseeds
+ *  `seed ^ (attempt * 0x9e3779b1)` before giving up. A random key set peels on the
+ *  first attempt with overwhelming probability; exhaustion means a DEGENERATE key set
+ *  (e.g. many keys that encode to the same string -> duplicate hypergraph edges that no
+ *  reseed can separate), which THROWS fail-closed rather than shipping a partial build. */
+const XOR_MAX_ATTEMPTS = 100;
+
+/** The 8-bit fingerprint's characteristic FPR, 2^-8 (decisions/0020). `fpp >= 2^-8`
+ *  (~0.0039) admits an 8-bit fingerprint (a `Uint8Array`); a tighter target widens to
+ *  16 bits. Byte-aligned like Cuckoo/Quotient. */
+const XOR_FP8_FPP = 0.00390625;
+
+/** The 16-bit fingerprint's characteristic FPR, 2^-16 (decisions/0020). This is the
+ *  floor: `fpp < 2^-16` (~0.0000153) would need a wider-than-16-bit fingerprint and
+ *  THROWS fail-closed (parallel to Cuckoo's / Quotient's 16-bit floor). */
+const XOR_FP16_FPP = 0.0000152587890625;
+
+/** The largest fingerprint array the too-large door admits (decisions/0020). `3*bl`
+ *  must fit a typed-array length AND keep the position math (`hash % bl`) exact; capped
+ *  well below the typed-array limit so the allocation never throws an opaque RangeError. */
+const XOR_MAX_SLOTS = 0x3fffffff; // ~1.07e9 slots
+
+/** Fail-closed message: `new XorFilter()` is forbidden -- a static member is built via
+ *  the factory, never incrementally (decisions/0018). Built once, thrown only on misuse. */
+const XOR_CTOR_MSG =
+    "[lite-filter] XorFilter is a STATIC member built from a known key set: use " +
+    "XorFilter.from(iterable, options) (or the .build alias), not new XorFilter().";
+
+/** Fail-closed message: a static filter has no mutation surface (decisions/0019).
+ *  add/remove/clear all throw this -- membership is fixed at construction. Rebuild with
+ *  XorFilter.from(newKeys) to change the set. Built once, thrown only on misuse. */
+const XOR_STATIC_MSG =
+    "[lite-filter] XorFilter is immutable: a static filter is built once from a fixed " +
+    "key set and has no add()/remove()/clear(). Rebuild with XorFilter.from(newKeys) to " +
+    "change membership (a deletable member -- Counting Bloom / Cuckoo / Quotient -- mutates in place).";
+
+/** Fail-closed message: an XOR filter over ZERO keys is undefined (decisions/0018);
+ *  null is not zero. Built once, thrown only on an empty key set. */
+const XOR_EMPTY_MSG =
+    "[lite-filter] XorFilter.from() requires a non-empty key set; a filter over zero keys " +
+    "is undefined (null is not zero).";
+
+/** Fail-closed message when the requested fpp needs a fingerprint wider than 16 bits
+ *  (decisions/0020): `fpp < 2^-16`. Built once, thrown only at construction. */
+const XOR_FPP_MSG =
+    "[lite-filter] XOR fpp too small: the fingerprint width would exceed 16 bits; the " +
+    "smallest supported fpp is 2^-16 (~0.0000153). Raise the fpp.";
+
+/** Fail-closed message when peeling exhausts every reseed (decisions/0018). Expected
+ *  ONLY for a degenerate key set (duplicate-encoding keys -> parallel hypergraph edges
+ *  no reseed can separate). Built once, thrown only on a genuinely unpeelable set. */
+const XOR_CONSTRUCT_MSG =
+    "[lite-filter] XorFilter.from() could not construct after 100 peeling attempts: the " +
+    "key set produced an unpeelable 3-uniform hypergraph under every reseed. This is " +
+    "expected only for a DEGENERATE set -- e.g. many distinct keys that encode to the same " +
+    "string (String(key) collision -> duplicate edges). Check for duplicate-encoding keys.";
+
+/** Fail-closed message when the derived array would exceed the too-large cap
+ *  (decisions/0020). Built once, thrown only at construction for very large key sets. */
+const XOR_TOO_LARGE_MSG =
+    "[lite-filter] requested XOR filter is too large (would need > " + XOR_MAX_SLOTS +
+    " fingerprint slots); lower the key count.";
+
+/** Module-private build brand (decisions/0018). The constructor throws on any token but
+ *  this one, so `new XorFilter()` fails closed while the static `from`/`build`/`restore`
+ *  factories construct a bare instance internally. Never exported. */
+const XOR_BUILD_TOKEN = Symbol("lite-filter/xor.build");
 
 /** ln(2) and ln(2)^2 precomputed (decisions/0002): the Bloom sizing constants.
  *  Cold path -- used only in the constructor -- but computed once regardless. */
@@ -498,6 +591,241 @@ function _qfStructureError(store, len) {
 }
 
 /* -------------------------------------------------------------------------- *
+ * XOR filter doors + peeling scaffold (decisions/0018, 0020). ALL cold: called only
+ * by the static from()/build()/restore() factories, never by the query hot path.
+ * -------------------------------------------------------------------------- */
+
+/**
+ * Select the XOR fingerprint width for a target fpp, or throw fail-closed (decisions/0020).
+ * Byte-aligned like Cuckoo/Quotient: `fpp >= 2^-8` -> an 8-bit fingerprint; `2^-16 <= fpp
+ * < 2^-8` -> 16-bit; `fpp < 2^-16` THROWS (the 16-bit floor). Fails closed on any fpp
+ * outside the open interval (0, 1). Cold. Returns the width in bits (8 or 16).
+ */
+function _xorSizeError(fpp) {
+    if (typeof fpp !== "number" || !(fpp > 0) || !(fpp < 1)) {
+        throw new RangeError(
+            "[lite-filter] fpp must be a number in the open interval (0, 1), got " + String(fpp));
+    }
+    if (fpp >= XOR_FP8_FPP) return 8;
+    if (fpp >= XOR_FP16_FPP) return 16;
+    throw new RangeError(XOR_FPP_MSG);
+}
+
+/**
+ * The XOR segment length `bl` for a deduped key count `n`, with the empty-set and
+ * too-large doors (decisions/0018, 0020). `bl = ceil(1.23 * n / 3) + 32`; the total
+ * array is `3*bl`. Fails closed on `n < 1` (an XOR filter over zero keys is undefined;
+ * null is not zero) and on a request whose array would exceed the too-large cap. Cold.
+ * Returns `bl` (the per-segment length; the store is `3*bl`).
+ */
+function _xorGuard(n) {
+    if (!Number.isInteger(n) || n < 1) {
+        throw new RangeError(XOR_EMPTY_MSG);
+    }
+    const bl = Math.ceil((XOR_LOAD * n) / XOR_ARITY) + XOR_SEGMENT_PAD;
+    if (!Number.isFinite(bl) || bl < 1 || XOR_ARITY * bl > XOR_MAX_SLOTS) {
+        throw new RangeError(XOR_TOO_LARGE_MSG);
+    }
+    return bl;
+}
+
+/* -------------------------------------------------------------------------- *
+ * Snapshot integrity checksum (decisions/0021). Family-wide, COLD -- computed only by
+ * dump()/restore(), never on a hot path. It closes a real fail-OPEN: keys-mode and seed
+ * are free construction inputs that CANNOT be re-derived from the stored bytes, so a
+ * flipped `keys` ("int" <-> null) or `seed` would silently reconstruct under the wrong
+ * hash path (1990/2000 false negatives in the QA repro). A 32-bit checksum over the
+ * provenance (tag, mem, keys-mode, seed), every sizing/width field, the count, and every
+ * store word -- recomputed at restore and compared to the stored `chk` -- turns that (and
+ * any single-bit store corruption) into a fail-closed throw. It is an INTEGRITY check
+ * against accidental corruption, NOT a MAC: a determined forger who recomputes `chk` is
+ * out of scope (same as any checksum). Reuses the murmur3 fmix32 substrate; no new deps.
+ * -------------------------------------------------------------------------- */
+
+/** One shared 8-byte scratch view for folding a JS number by its EXACT 64-bit bit
+ *  pattern (so ints, floats like fpp/load, seed > 2^31, and -0 all fold canonically).
+ *  Module-level, allocated ONCE; only ever touched on the cold snapshot path.
+ *  NOTE: the two u32 halves are read in the HOST byte order, so the checksum assumes a
+ *  little-endian host (every supported Node/V8 target: x64, arm64). A snapshot dumped on
+ *  a big-endian host and restored on a little-endian one (or vice versa) FAILS CLOSED --
+ *  the checksum mismatches and restore() throws; it can never accept corruption. */
+const _CHK_BUF = new ArrayBuffer(8);
+const _CHK_F64 = new Float64Array(_CHK_BUF);
+const _CHK_U32 = new Uint32Array(_CHK_BUF);
+
+/** Fold one number into the running 32-bit checksum by its 64-bit bit pattern. Cold. */
+function _chkNum(h, x) {
+    _CHK_F64[0] = +x;
+    h = fmix32((h ^ _CHK_U32[0]) >>> 0);
+    h = fmix32((h ^ _CHK_U32[1]) >>> 0);
+    return h >>> 0;
+}
+
+/** Fold one ASCII token (the tag, the member name, the keys-mode) into the checksum,
+ *  length included so a truncation cannot collide. Cold. */
+function _chkStr(h, s) {
+    h = fmix32((h ^ hashStr(s, 0x9e3779b9)) >>> 0);
+    h = fmix32((h ^ (s.length >>> 0)) >>> 0);
+    return h >>> 0;
+}
+
+/**
+ * Compute the family-wide snapshot checksum (decisions/0021) in a FIXED deterministic
+ * order: the format tag, the member name, the keys-mode, the seed, the member's sizing/
+ * width fields (`dims`, member-specific order), the count, then the store length and
+ * every store word. `keys` is folded as the token "int" or "null" so the two legal values
+ * check DISTINCT (the whole point). Returns an unsigned 32-bit integer. Cold; the caller
+ * (dump/restore) supplies the SNAPSHOT's own field values so a tampered field is caught.
+ *
+ * @param {string} mem     the member name ("Bloom", "Xor", ...)
+ * @param {"int"|null} keys the keys-mode
+ * @param {number} seed    the 32-bit hash seed
+ * @param {number} count   the recorded size/count
+ * @param {number[]} dims  the member's sizing/width fields, in a fixed member-specific order
+ * @param {number[]} store the serialized store array (bits / cnts / fp / store)
+ * @returns {number} the unsigned 32-bit checksum
+ */
+function snapChecksum(mem, keys, seed, count, dims, store) {
+    let h = 0x811c9dc5 >>> 0;                 // a nonzero fold seed
+    h = _chkStr(h, SNAP_TAG);
+    h = _chkStr(h, mem);
+    h = _chkStr(h, keys === "int" ? "int" : "null");
+    h = _chkNum(h, seed);
+    h = _chkNum(h, count);
+    for (let i = 0; i < dims.length; i++) h = _chkNum(h, dims[i]);
+    h = _chkNum(h, store.length);
+    for (let i = 0; i < store.length; i++) h = _chkNum(h, store[i]);
+    return h >>> 0;
+}
+
+/**
+ * Recompute the checksum from a (possibly tampered) snapshot and throw fail-closed if it
+ * does not match the stored `chk` (decisions/0021). Runs AFTER a member's structural checks
+ * (so `store` is already a validated array of in-range words) and BEFORE any field is
+ * assigned or any array is built into the new instance -- REJECT, never truncate. Catches a
+ * keys-mode flip, a seed flip, and any single-bit store/field corruption.
+ */
+function verifySnapChecksum(snap, mem, dims, store) {
+    if (!Number.isInteger(snap.chk) || snap.chk < 0 || snap.chk > 0xffffffff) {
+        throw new Error(
+            "[lite-filter] restore(): missing or corrupt integrity checksum chk " +
+            String(snap.chk) + " (a litefilter/2 snapshot must carry a 32-bit chk)");
+    }
+    const actual = snapChecksum(mem, snap.keys, snap.seed, snap.count, dims, store);
+    if (actual !== (snap.chk >>> 0)) {
+        throw new Error(
+            "[lite-filter] restore(): integrity checksum mismatch (snapshot chk=" +
+            String(snap.chk) + ", recomputed=" + actual + ") -- the snapshot's provenance " +
+            "(keys-mode / seed) or store has been altered; reconstructing would build a wrong " +
+            "filter (silent false negatives). Rejected fail-closed (decisions/0021).");
+    }
+}
+
+/**
+ * ONE peeling attempt (decisions/0018). Builds the 3-uniform hypergraph for `keys` under
+ * `seed`, peels degree-1 vertices onto a stack, and -- ONLY if the peel is COMPLETE
+ * (stack length === n) -- assigns the fingerprint array in REVERSE peel order so every
+ * key's three slots XOR to its fingerprint. Returns the fingerprint typed array on a
+ * complete peel, or `null` on a peel FAILURE (a 2-core remains). Cold; allocates its own
+ * scaffold each attempt.
+ *
+ * THE SIGNATURE FAIL-OPEN CATCH (the charter's flagged risk): a peeling loop that exits
+ * WITHOUT a full peel and still assigns fingerprints ships a PARTIAL build -- silent false
+ * negatives on real keys. The `if (sp !== n) return null` guard BEFORE assignment is the
+ * only thing between a short stack and a fail-OPEN filter; it treats a short stack as a
+ * peel failure (the caller reseeds, or throws on exhaustion), never assigning from it.
+ *
+ * @param {Array} keys   the deduped keys (int32 numbers when int, else arbitrary)
+ * @param {boolean} int  the keys:'int' backing (no String encode)
+ * @param {number} seed  the attempt seed (32-bit unsigned)
+ * @param {number} seed2 the derived second seed word (fmix32(seed ^ 0x9e3779b9))
+ * @param {number} n     the deduped key count (edge count)
+ * @param {number} bl    the per-segment length
+ * @param {number} fw    the fingerprint width (8 or 16)
+ * @returns {Uint8Array|Uint16Array|null}
+ */
+function _xorTryBuild(keys, int, seed, seed2, n, bl, fw) {
+    const m = XOR_ARITY * bl;
+    const fpMask = (1 << fw) - 1;
+
+    // Per-edge geometry: the three ABSOLUTE slot positions (one per segment) and the
+    // fingerprint. Computed with EXACTLY the same math the query hot path uses, so a key
+    // in the set always reads true. `hash % bl` is the range reduction: exact for any
+    // 32-bit hash and any bl < 2^53 (no multiply-shift precision loss), zero-branch.
+    const eh0 = new Uint32Array(n);
+    const eh1 = new Uint32Array(n);
+    const eh2 = new Uint32Array(n);
+    const efp = new Uint16Array(n);
+    for (let e = 0; e < n; e++) {
+        const key = keys[e];
+        let h, g;
+        if (int) {
+            h = fmix32((key ^ seed) | 0);
+            g = fmix32((Math.imul(key | 0, 0x9e3779b1) ^ seed2) | 0);
+        } else {
+            h = (typeof key === "string") ? hashStr(key, seed) : hashStr(String(key), seed);
+            g = fmix32((h ^ seed2) | 0);
+        }
+        const t = fmix32((h ^ g) | 0);
+        eh0[e] = h % bl;
+        eh1[e] = bl + (g % bl);
+        eh2[e] = 2 * bl + (t % bl);
+        efp[e] = fmix32((h + g) | 0) & fpMask;
+    }
+
+    // Incidence: per-vertex edge COUNT and XOR-of-edge-indices. When a vertex's count is
+    // 1, its single remaining edge index IS its xor accumulator (the standard peeling
+    // trick). The three positions of an edge live in three DISTINCT segments (h0 < bl <=
+    // h1 < 2*bl <= h2), so an edge never touches the same vertex twice -- the XOR trick is
+    // never corrupted by a self-collision.
+    const tcount = new Uint32Array(m);
+    const txor = new Uint32Array(m);
+    for (let e = 0; e < n; e++) {
+        let v = eh0[e]; tcount[v]++; txor[v] ^= e;
+        v = eh1[e]; tcount[v]++; txor[v] ^= e;
+        v = eh2[e]; tcount[v]++; txor[v] ^= e;
+    }
+
+    // Peel: repeatedly take a degree-1 vertex, record (vertex, edge) on the stack, and
+    // remove that edge from all three of its vertices (which may create new degree-1
+    // vertices). The queue is a plain array (cold path -- allocation is fine here); the
+    // `tcount[v] !== 1` guard drops stale queue entries.
+    const stackV = new Uint32Array(n);
+    const stackE = new Uint32Array(n);
+    let sp = 0;
+    const queue = [];
+    for (let v = 0; v < m; v++) if (tcount[v] === 1) queue.push(v);
+    while (queue.length > 0) {
+        const v = queue.pop();
+        if (tcount[v] !== 1) continue;
+        const e = txor[v];
+        stackV[sp] = v;
+        stackE[sp] = e;
+        sp++;
+        let p = eh0[e]; tcount[p]--; txor[p] ^= e; if (tcount[p] === 1) queue.push(p);
+        p = eh1[e]; tcount[p]--; txor[p] ^= e; if (tcount[p] === 1) queue.push(p);
+        p = eh2[e]; tcount[p]--; txor[p] ^= e; if (tcount[p] === 1) queue.push(p);
+    }
+
+    // FAIL-OPEN GUARD: a short stack means a 2-core survived -- an INCOMPLETE peel. Do NOT
+    // assign; return null so the caller reseeds (or throws on exhaustion). Assigning from a
+    // partial stack would leave real keys unsatisfied -> silent false negatives.
+    if (sp !== n) return null;
+
+    // Assign in REVERSE peel order: when an edge is assigned at its owning slot, that slot
+    // is still 0 (each slot is owned by exactly one edge) and the OTHER two slots are
+    // already final (their edges peeled later -> higher stack index -> assigned earlier
+    // here). So fp[v] = efp ^ fp[a] ^ fp[b] ^ fp[c] makes the three slots XOR to efp.
+    const arr = fw <= 8 ? new Uint8Array(m) : new Uint16Array(m);
+    for (let i = sp - 1; i >= 0; i--) {
+        const e = stackE[i];
+        const v = stackV[i];
+        arr[v] = (efp[e] ^ arr[eh0[e]] ^ arr[eh1[e]] ^ arr[eh2[e]]) & fpMask;
+    }
+    return arr;
+}
+
+/* -------------------------------------------------------------------------- *
  * Snapshot helpers (decisions/0005). Cold: dump()/restore() never touch the hot
  * body. The Uint32Array store IS the serial form -- emitted as a plain Array so the
  * snapshot round-trips through structuredClone AND JSON.
@@ -723,6 +1051,8 @@ export class Bloom {
      * DEFERRED to the first static member and does not change this snapshot shape.
      */
     dump() {
+        const keys = this._int ? "int" : null;
+        const bits = Array.from(this._words);
         return {
             f: SNAP_TAG,
             mem: "Bloom",
@@ -731,9 +1061,11 @@ export class Bloom {
             cap: this._cap,
             fpp: this._fpp,
             seed: this._seed,
-            keys: this._int ? "int" : null,
+            keys: keys,
             count: this._count,
-            bits: Array.from(this._words),
+            bits: bits,
+            chk: snapChecksum("Bloom", keys, this._seed, this._count,
+                [this._m, this._k, this._cap, this._fpp], bits),
         };
     }
 
@@ -817,6 +1149,11 @@ export class Bloom {
                     " (" + String(w) + "); each word must be a 32-bit unsigned integer");
             }
         }
+        // Integrity gate (decisions/0021): the seed + keys-mode CANNOT be re-derived from
+        // the bytes, so a flipped `keys` / `seed` (or any store-word bit flip) is caught
+        // here -- recompute the checksum over the snapshot's own fields and REJECT on a
+        // mismatch, BEFORE any word is written into the instance store.
+        verifySnapChecksum(snap, "Bloom", [snap.m, snap.k, snap.cap, snap.fpp], bits);
         for (let i = 0; i < bits.length; i++) inst._words[i] = bits[i];
         inst._count = snap.count;
         return inst;
@@ -1051,6 +1388,8 @@ export class CountingBloom {
      * fail-closed tag lets `restore()` reject any mismatch or corruption.
      */
     dump() {
+        const keys = this._int ? "int" : null;
+        const cnts = Array.from(this._cnts);
         return {
             f: SNAP_TAG,
             mem: "CountingBloom",
@@ -1060,9 +1399,11 @@ export class CountingBloom {
             cap: this._cap,
             fpp: this._fpp,
             seed: this._seed,
-            keys: this._int ? "int" : null,
+            keys: keys,
             count: this._count,
-            cnts: Array.from(this._cnts),
+            cnts: cnts,
+            chk: snapChecksum("CountingBloom", keys, this._seed, this._count,
+                [this._m, this._k, this._cap, this._fpp, COUNTER_WIDTH], cnts),
         };
     }
 
@@ -1143,6 +1484,9 @@ export class CountingBloom {
                     " (" + String(v) + "); each element must be an integer 0..255");
             }
         }
+        // Integrity gate (decisions/0021): reject a flipped keys-mode / seed / store byte.
+        verifySnapChecksum(snap, "CountingBloom",
+            [snap.m, snap.k, snap.cap, snap.fpp, snap.w], cnts);
         for (let i = 0; i < cnts.length; i++) inst._cnts[i] = cnts[i];
         inst._count = snap.count;
         return inst;
@@ -1354,6 +1698,8 @@ export class BlockedBloom {
      * reject any mismatch or corruption (REJECT, never truncate).
      */
     dump() {
+        const keys = this._int ? "int" : null;
+        const bits = Array.from(this._words);
         return {
             f: SNAP_TAG,
             mem: "BlockedBloom",
@@ -1364,9 +1710,11 @@ export class BlockedBloom {
             cap: this._cap,
             fpp: this._fpp,
             seed: this._seed,
-            keys: this._int ? "int" : null,
+            keys: keys,
             count: this._count,
-            bits: Array.from(this._words),
+            bits: bits,
+            chk: snapChecksum("BlockedBloom", keys, this._seed, this._count,
+                [this._m, this._k, this._cap, this._fpp, BLOCK_BITS, this._nb], bits),
         };
     }
 
@@ -1449,6 +1797,9 @@ export class BlockedBloom {
                     " (" + String(w) + "); each word must be a 32-bit unsigned integer");
             }
         }
+        // Integrity gate (decisions/0021): reject a flipped keys-mode / seed / store word.
+        verifySnapChecksum(snap, "BlockedBloom",
+            [snap.m, snap.k, snap.cap, snap.fpp, snap.bb, snap.nb], bits);
         for (let i = 0; i < bits.length; i++) inst._words[i] = bits[i];
         inst._count = snap.count;
         return inst;
@@ -1761,6 +2112,8 @@ export class Cuckoo {
      * separate field) to avoid colliding with it.
      */
     dump() {
+        const keys = this._int ? "int" : null;
+        const fp = Array.from(this._store);
         return {
             f: SNAP_TAG,
             mem: "Cuckoo",
@@ -1770,9 +2123,11 @@ export class Cuckoo {
             cap: this._cap,
             fpp: this._fpp,
             seed: this._seed,
-            keys: this._int ? "int" : null,
+            keys: keys,
             count: this._count,
-            fp: Array.from(this._store),
+            fp: fp,
+            chk: snapChecksum("Cuckoo", keys, this._seed, this._count,
+                [this._f, this._b, this._nb, this._cap, this._fpp], fp),
         };
     }
 
@@ -1854,6 +2209,9 @@ export class Cuckoo {
                     "); each slot must be an integer in 0.." + fpMask);
             }
         }
+        // Integrity gate (decisions/0021): reject a flipped keys-mode / seed / store slot.
+        verifySnapChecksum(snap, "Cuckoo",
+            [snap.fw, snap.b, snap.nb, snap.cap, snap.fpp], fp);
         for (let i = 0; i < fp.length; i++) inst._store[i] = fp[i];
         inst._count = snap.count;
         return inst;
@@ -2370,6 +2728,8 @@ export class Quotient {
      * budget). NOTE: `f` is the shared FORMAT tag; `fpp` is the configured target.
      */
     dump() {
+        const keys = this._int ? "int" : null;
+        const store = Array.from(this._store);
         return {
             f: SNAP_TAG,
             mem: "Quotient",
@@ -2381,9 +2741,11 @@ export class Quotient {
             cap: this._cap,
             fpp: this._fpp,
             seed: this._seed,
-            keys: this._int ? "int" : null,
+            keys: keys,
             count: this._count,
-            store: Array.from(this._store),
+            store: store,
+            chk: snapChecksum("Quotient", keys, this._seed, this._count,
+                [this._r, this._q, this._p, this._nslots, QF_LOAD, this._cap, this._fpp], store),
         };
     }
 
@@ -2504,6 +2866,10 @@ export class Quotient {
         if (structErr !== null) {
             throw new Error("[lite-filter] restore(): corrupt slot structure -- " + structErr);
         }
+        // Integrity gate (decisions/0021): reject a flipped keys-mode / seed / store word --
+        // recompute over the snapshot's own fields, BEFORE any instance geometry is mutated.
+        verifySnapChecksum(snap, "Quotient",
+            [snap.r, snap.q, snap.p, snap.nslots, snap.load, snap.cap, snap.fpp], store);
         // Repoint geometry to the snapshot's (a resized filter differs from the cap default).
         if (inst._len !== physLen) {
             inst._store = inst._store.BYTES_PER_ELEMENT === 1
@@ -2521,6 +2887,356 @@ export class Quotient {
         inst._pMask = snap.p >= 32 ? 0xffffffff : (((1 << snap.p) >>> 0) - 1) >>> 0;
         for (let i = 0; i < store.length; i++) inst._store[i] = store[i];
         inst._count = snap.count;
+        return inst;
+    }
+}
+
+/* -------------------------------------------------------------------------- *
+ * XorFilter -- the space-optimal STATIC member (decisions/0018, 0019, 0020; Graf &
+ * Lemire, "Xor Filters", ACM JEA 2020). The FIRST immutable member: built ONCE from a
+ * KNOWN key set via the static `XorFilter.from(iterable, options)` (or the `.build`
+ * alias), then FROZEN. It approaches the ~1.23x information-theoretic space lower bound
+ * by peeling a 3-uniform hypergraph -- each key touches 3 fingerprint slots (one per
+ * segment), and the slots are assigned so a key's three slots XOR to its fingerprint.
+ *
+ * QUERY (the hot body, decisions/0018): compute the key's fingerprint and its 3 slot
+ * positions, then `fp === (arr[h0] ^ arr[h1] ^ arr[h2])`. Zero allocation, no branch on
+ * build state (the instance is always fully built once `from()` returns). One-sided: a
+ * key in the set ALWAYS reads true (0 false negatives, guaranteed by the complete-peel
+ * assignment); a never-added key reads true only on a fingerprint collision (~2^-fw).
+ *
+ * NO MUTATION (decisions/0019): a static filter is built once and has no add/remove/
+ * clear -- all three throw `[lite-filter]` fail-closed, as does `new XorFilter()` (use
+ * the factory). Rebuild with `XorFilter.from(newKeys)` to change membership.
+ *
+ * WIDTH (decisions/0020): the fingerprint is byte-aligned -- 8 bits when `fpp >= 2^-8`
+ * (~0.0039), else 16 bits; `fpp < 2^-16` throws (the 16-bit floor, parallel to Cuckoo /
+ * Quotient). The delivered FPR is the width-quantized `2^-fw`, typically UNDER the
+ * configured target -- `fpp()` reports it (the measure-vs-configured honesty hook).
+ *
+ * KEYS ARE A SET (decisions/0018): `from()` DEDUPES its input (contrast Cuckoo / Quotient,
+ * which store multiplicity). `size` is the deduped key count.
+ * -------------------------------------------------------------------------- */
+
+export class XorFilter {
+    /**
+     * NOT a public constructor (decisions/0018). A static member is built via the
+     * factory; `new XorFilter()` throws `[lite-filter]`. The static `from`/`build`/
+     * `restore` factories construct a bare instance internally via the private brand.
+     */
+    constructor(token) {
+        if (token !== XOR_BUILD_TOKEN) {
+            throw new Error(XOR_CTOR_MSG);
+        }
+        // Bare instance: the factory fills every field before returning. Initialized to
+        // fail-closed sentinels so a half-built instance can never read as valid.
+        this._fp = null;      // the fingerprint array (Uint8Array | Uint16Array), length 3*bl
+        this._seed = 0;       // the winning hash seed (32-bit unsigned)
+        this._seed2 = 0;      // the derived second seed word
+        this._bl = 0;         // per-segment length; the array is 3*bl slots
+        this._fw = 0;         // fingerprint width in bits (8 or 16)
+        this._fpMask = 0;     // fingerprint value mask ((1<<fw)-1)
+        this._int = false;    // keys:'int' backing (strict zero-alloc query)
+        this._count = 0;      // the deduped key count (a SET, not multiplicity)
+        this._cap = 0;        // capacity == count (built from exactly this set)
+        this._fpp = 0;        // the CONFIGURED target fpp (decisions/0004)
+        this._stats = null;   // opt-in stats holder (null when off)
+    }
+
+    /**
+     * Build a frozen XOR filter from a known key set (decisions/0018). DEDUPES the input
+     * to a Set (XOR keys are a SET, not multiplicity), sizes the array to `3*(ceil(1.23*
+     * n/3)+32)` slots, then PEELS the 3-uniform hypergraph. On a peel failure it RESEEDS
+     * deterministically (`seed ^ (attempt * 0x9e3779b1)`) up to 100 times; if every
+     * attempt fails (a degenerate key set) it THROWS `[lite-filter]` -- never a partial
+     * build (fail closed). Cold; allocates the peeling scaffold. Returns a new XorFilter.
+     *
+     * @param {Iterable} iterable  the key set (deduped internally)
+     * @param {{ fpp?: number, seed?: number, keys?: 'int', stats?: boolean }} [options]
+     * @returns {XorFilter}
+     */
+    static from(iterable, options) {
+        if (iterable === null || iterable === undefined || typeof iterable[Symbol.iterator] !== "function") {
+            throw new TypeError(
+                "[lite-filter] XorFilter.from(iterable): the first argument must be iterable");
+        }
+        const fpp = (options && options.fpp !== undefined) ? options.fpp : DEFAULT_FPP;
+        const fw = _xorSizeError(fpp);                     // width door (decisions/0020)
+        const int = validateKeys(options && options.keys); // keys door (decisions/0001)
+        const baseSeed = validateSeed(options && options.seed);
+        const stats = validateStats(options && options.stats);
+
+        // Dedupe to a Set (decisions/0018). On the int backing every key is validated to
+        // the 32-bit signed domain FIRST (fail closed) -- a bad key never enters the set.
+        const set = new Set();
+        for (const key of iterable) {
+            if (int && (!Number.isInteger(key) || key < INT_MIN || key > INT_MAX)) {
+                throw new TypeError(INT_KEY_MSG + String(key));
+            }
+            set.add(key);
+        }
+        const n = set.size;
+        const bl = _xorGuard(n);                           // empty-set + too-large door
+        const keys = Array.from(set);
+
+        // Peel with deterministic reseed (decisions/0018). Only a COMPLETE peel returns a
+        // fingerprint array; a short stack returns null and we reseed. 100 exhausted throws.
+        let arr = null;
+        let seed = baseSeed;
+        let seed2 = 0;
+        for (let attempt = 0; attempt < XOR_MAX_ATTEMPTS; attempt++) {
+            const trySeed = (baseSeed ^ Math.imul(attempt, 0x9e3779b1)) >>> 0;
+            const trySeed2 = fmix32(trySeed ^ 0x9e3779b9);
+            const built = _xorTryBuild(keys, int, trySeed, trySeed2, n, bl, fw);
+            if (built !== null) { arr = built; seed = trySeed; seed2 = trySeed2; break; }
+        }
+        if (arr === null) {
+            throw new Error(XOR_CONSTRUCT_MSG);
+        }
+
+        const inst = new XorFilter(XOR_BUILD_TOKEN);
+        inst._fp = arr;
+        inst._seed = seed;
+        inst._seed2 = seed2;
+        inst._bl = bl;
+        inst._fw = fw;
+        inst._fpMask = (1 << fw) - 1;
+        inst._int = int;
+        inst._count = n;
+        inst._cap = n;
+        inst._fpp = fpp;
+        inst._stats = stats;
+        return inst;
+    }
+
+    /** The `.build` alias of `from` (decisions/0018): the family's static-build verb, same
+     *  contract. Some callers prefer "build" for the peeling connotation. */
+    static build(iterable, options) {
+        return XorFilter.from(iterable, options);
+    }
+
+    get size() { return this._count; }
+    get count() { return this._count; }
+    get capacity() { return this._cap; }
+
+    // --- hot path (zero allocation; strict on keys:'int') ---------------------
+
+    /**
+     * The query (decisions/0018). Computes the key's fingerprint and its 3 slot positions
+     * (one per segment), then tests `fp === (arr[h0] ^ arr[h1] ^ arr[h2])`. One-sided: a
+     * key in the built set ALWAYS reads true (the complete-peel assignment guarantees it --
+     * 0 false negatives); a never-added key reads true only on a fingerprint collision
+     * (~2^-fw). Zero allocation on the int + string paths; NO branch on build state (a
+     * returned instance is always fully built).
+     */
+    mightContain(key) {
+        const bl = this._bl;
+        let h, g;
+        if (this._int) {
+            if (!Number.isInteger(key) || key < INT_MIN || key > INT_MAX) {
+                throw new TypeError(INT_KEY_MSG + String(key));
+            }
+            h = fmix32((key ^ this._seed) | 0);
+            g = fmix32((Math.imul(key | 0, 0x9e3779b1) ^ this._seed2) | 0);
+        } else {
+            h = this._hashKey(key);
+            g = fmix32((h ^ this._seed2) | 0);
+        }
+        const t = fmix32((h ^ g) | 0);
+        const fp = fmix32((h + g) | 0) & this._fpMask;
+        const arr = this._fp;
+        const h0 = h % bl;
+        const h1 = bl + (g % bl);
+        const h2 = 2 * bl + (t % bl);
+        const hit = fp === (arr[h0] ^ arr[h1] ^ arr[h2]);
+        if (this._stats !== null) {
+            this._stats.queries++;
+            if (hit) this._stats.hits++; else this._stats.misses++;
+        }
+        return hit;
+    }
+
+    /** The SOLE alias of `mightContain` (decisions/0003), same one-sided semantics. */
+    has(key) { return this.mightContain(key); }
+
+    /** A static filter has no incremental add (decisions/0019). THROWS `[lite-filter]`
+     *  fail-closed -- rebuild with XorFilter.from(newKeys) to change membership. */
+    add(key) { throw new Error(XOR_STATIC_MSG); }
+
+    /** A static filter cannot delete (decisions/0019). THROWS `[lite-filter]` fail-closed. */
+    remove(key) { throw new Error(XOR_STATIC_MSG); }
+
+    /** A static filter has nothing to clear TO (decisions/0019): its identity IS its key
+     *  set. THROWS `[lite-filter]` fail-closed rather than silently emptying a member whose
+     *  whole contract is "the set it was built from" -- a cleared XOR filter is undefined. */
+    clear() { throw new Error(XOR_STATIC_MSG); }
+
+    /**
+     * Hash an arbitrary key to a 32-bit base (decisions/0001). A string hashes over its
+     * code units (alloc-free); any other type is `String()`-encoded first (the honest
+     * amortized caveat). Never called on the keys:'int' path.
+     */
+    _hashKey(key) {
+        if (typeof key === "string") return hashStr(key, this._seed);
+        return hashStr(String(key), this._seed);
+    }
+
+    // --- cold inspection ------------------------------------------------------
+
+    /**
+     * The false-positive probability (decisions/0004, 0020). The width-quantized `2^-fw`
+     * using the ACTUAL stored fingerprint width. Because `fw` is byte-aligned, this is
+     * typically BELOW the configured target -- the family's measure-vs-configured honesty
+     * hook, surfaced not hidden. It is a formula, NOT a measurement -- MEASURE with the
+     * bench (`npm run bench`). Cold, O(1). Does not vary with fill (an XOR filter is
+     * always fully built from its set).
+     */
+    fpp() {
+        return Math.pow(2, -this._fw);
+    }
+
+    // --- opt-in stats (decisions/0004) ----------------------------------------
+
+    /** The live per-instance counter holder BY REFERENCE. Requires `{ stats: true }`;
+     *  throws fail-closed otherwise (null is not zero). */
+    stats() {
+        if (this._stats === null) throw new Error(STATS_OFF_MSG);
+        return this._stats;
+    }
+
+    /** Zero the counters IN PLACE. Requires `{ stats: true }`; else fail closed. NOTE: a
+     *  static filter has no `adds` (build is not add()); adds stays 0. */
+    resetStats() {
+        if (this._stats === null) throw new Error(STATS_OFF_MSG);
+        this._stats.adds = 0;
+        this._stats.queries = 0;
+        this._stats.hits = 0;
+        this._stats.misses = 0;
+    }
+
+    // --- snapshot / restore (decisions/0005, 0018) ----------------------------
+
+    /**
+     * Serialize to a plain, structurally-cloneable snapshot (decisions/0018). COLD -- never
+     * a hot path -- and MAY allocate. The fingerprint array IS the serial form, emitted as
+     * a plain Array (`fp`) so it round-trips through structuredClone AND JSON. `fw` records
+     * the fingerprint width, `bl` the per-segment length (the array is 3*bl). The
+     * fail-closed tag lets `restore()` reject any mismatch or corruption (REJECT, never
+     * truncate). `f` is the shared FORMAT tag; the fingerprint WIDTH is `fw` (a separate
+     * field) to avoid colliding with it.
+     */
+    dump() {
+        const keys = this._int ? "int" : null;
+        const fp = Array.from(this._fp);
+        return {
+            f: SNAP_TAG,
+            mem: "Xor",
+            fw: this._fw,
+            bl: this._bl,
+            cap: this._cap,
+            fpp: this._fpp,
+            seed: this._seed,
+            keys: keys,
+            count: this._count,
+            fp: fp,
+            chk: snapChecksum("Xor", keys, this._seed, this._count,
+                [this._fw, this._bl, this._cap, this._fpp], fp),
+        };
+    }
+
+    /**
+     * Reconstruct a FRESH XorFilter from a snapshot (decisions/0018). Fail closed on ANY
+     * tag / member / seed / keys / fingerprint-width / segment-length / count mismatch AND
+     * on a corrupt or wrong-length fingerprint array OR an out-of-range fingerprint word
+     * (REJECT, never truncate -- null is not zero). Every consistency tie is re-derived and
+     * cross-checked BEFORE any instance is populated: the width from the fpp, the segment
+     * length from the count (`bl === ceil(1.23*count/3)+32`), the array length (`=== 3*bl`),
+     * and every word (`0 <= word <= fpMask`). A coercion would silently turn a garbled value
+     * into a wrong fingerprint and cause a false negative. `opts` re-derives runtime-only
+     * options (stats); everything structural comes FROM the snapshot.
+     */
+    static restore(snap, opts) {
+        if (snap === null || typeof snap !== "object") {
+            throw new TypeError("[lite-filter] restore(snap): snapshot must be an object");
+        }
+        if (snap.f !== SNAP_TAG) {
+            throw new Error(
+                "[lite-filter] restore(): bad format tag " + String(snap.f) +
+                " (expected " + SNAP_TAG + ")");
+        }
+        if (snap.mem !== "Xor") {
+            throw new Error(
+                "[lite-filter] restore(): member mismatch " + String(snap.mem) +
+                " (this is XorFilter.restore)");
+        }
+        if (!Number.isInteger(snap.seed) || snap.seed < 0 || snap.seed > 0xffffffff) {
+            throw new Error(
+                "[lite-filter] restore(): corrupt seed " + String(snap.seed) +
+                " (must be a 32-bit unsigned integer)");
+        }
+        if (snap.keys !== "int" && snap.keys !== null) {
+            throw new Error(
+                "[lite-filter] restore(): corrupt keys mode " + String(snap.keys) +
+                " (must be 'int' or null)");
+        }
+        // The fingerprint width must be exactly the one the fpp re-derives (decisions/0020):
+        // a tampered fw is caught here rather than silently trusted.
+        const fw = _xorSizeError(snap.fpp);
+        if (snap.fw !== fw) {
+            throw new Error(
+                "[lite-filter] restore(): fingerprint-width mismatch (snapshot fw=" +
+                String(snap.fw) + ", derived fw=" + fw + ")");
+        }
+        if (!Number.isInteger(snap.count) || snap.count < 1) {
+            throw new Error(
+                "[lite-filter] restore(): corrupt count " + String(snap.count) +
+                " (an XOR filter is built over >= 1 key)");
+        }
+        // The segment length is a deterministic function of the count (decisions/0018): a
+        // tampered bl (or count) is caught by re-deriving and comparing.
+        const bl = _xorGuard(snap.count);
+        if (snap.bl !== bl) {
+            throw new Error(
+                "[lite-filter] restore(): segment-length mismatch (snapshot bl=" +
+                String(snap.bl) + ", derived bl=" + bl + ")");
+        }
+        const m = XOR_ARITY * bl;
+        const fp = snap.fp;
+        if (!Array.isArray(fp) || fp.length !== m) {
+            throw new Error(
+                "[lite-filter] restore(): corrupt fingerprint store (expected " + m +
+                " slots, got " + (Array.isArray(fp) ? fp.length : String(fp)) + ")");
+        }
+        // Validate EVERY word BEFORE mutating (REJECT never truncate; null is not zero). A
+        // word is an integer in 0..fpMask; anything else is a corrupt or foreign store and
+        // is rejected rather than coerced to garbage (a coercion would be a false negative).
+        const fpMask = (1 << fw) - 1;
+        for (let i = 0; i < m; i++) {
+            const v = fp[i];
+            if (!Number.isInteger(v) || v < 0 || v > fpMask) {
+                throw new Error(
+                    "[lite-filter] restore(): corrupt fingerprint at slot " + i + " (" + String(v) +
+                    "); each slot must be an integer in 0.." + fpMask);
+            }
+        }
+        // Integrity gate (decisions/0021): the seed + keys-mode CANNOT be re-derived from
+        // the fingerprint array, so a flipped `keys` ("int" <-> null) or `seed` -- the QA
+        // fail-open repro -- is caught here. Recompute over the snapshot's own fields and
+        // REJECT on a mismatch, BEFORE any instance is built.
+        verifySnapChecksum(snap, "Xor", [snap.fw, snap.bl, snap.cap, snap.fpp], fp);
+        const inst = new XorFilter(XOR_BUILD_TOKEN);
+        inst._fp = fw <= 8 ? new Uint8Array(m) : new Uint16Array(m);
+        for (let i = 0; i < m; i++) inst._fp[i] = fp[i];
+        inst._seed = snap.seed >>> 0;
+        inst._seed2 = fmix32(inst._seed ^ 0x9e3779b9);
+        inst._bl = bl;
+        inst._fw = fw;
+        inst._fpMask = fpMask;
+        inst._int = snap.keys === "int";
+        inst._count = snap.count;
+        inst._cap = snap.count;
+        inst._fpp = snap.fpp;
+        inst._stats = validateStats(opts && opts.stats);
         return inst;
     }
 }

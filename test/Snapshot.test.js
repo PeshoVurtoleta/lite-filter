@@ -9,7 +9,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { Bloom, CountingBloom, BlockedBloom, Cuckoo } from "../Filter.js";
+import { Bloom, CountingBloom, BlockedBloom, Cuckoo, Quotient, XorFilter } from "../Filter.js";
 import { validate, validateCounting, validateBlocked, validateCuckoo } from "./validate.mjs";
 
 function filled(opts) {
@@ -60,7 +60,7 @@ test("dump: the snapshot round-trips through JSON and structuredClone", () => {
 
 test("dump: the tag shape is stable and self-describing", () => {
     const snap = filled({ fpp: 0.01, keys: "int" }).dump();
-    assert.equal(snap.f, "litefilter/1");
+    assert.equal(snap.f, "litefilter/2");
     assert.equal(snap.mem, "Bloom");
     assert.equal(snap.keys, "int");
     assert.equal(Array.isArray(snap.bits), true);
@@ -72,7 +72,7 @@ test("dump: the tag shape is stable and self-describing", () => {
 
 test("restore door: bad format tag fails closed", () => {
     const snap = filled({ keys: "int" }).dump();
-    snap.f = "litefilter/2";
+    snap.f = "litefilter/1";
     assert.throws(() => Bloom.restore(snap), /\[lite-filter\].*format tag/);
 });
 
@@ -206,7 +206,7 @@ test("CountingBloom dump: round-trips through JSON and structuredClone", () => {
 
 test("CountingBloom dump: the tag shape is stable and self-describing (mem + w:4 + cnts)", () => {
     const snap = filledCounting({ fpp: 0.01, keys: "int" }).dump();
-    assert.equal(snap.f, "litefilter/1");
+    assert.equal(snap.f, "litefilter/2");
     assert.equal(snap.mem, "CountingBloom");
     assert.equal(snap.w, 4);
     assert.equal(snap.keys, "int");
@@ -250,7 +250,7 @@ test("CountingBloom restore door: a short / oversized counter store is REJECTED"
 });
 
 test("CountingBloom restore door: bad format tag / seed / keys / count fail closed", () => {
-    const s1 = filledCounting({ keys: "int" }).dump(); s1.f = "litefilter/2";
+    const s1 = filledCounting({ keys: "int" }).dump(); s1.f = "litefilter/1";
     assert.throws(() => CountingBloom.restore(s1), /\[lite-filter\].*format tag/);
     const s2 = filledCounting({ keys: "int" }).dump(); s2.seed = 1.5;
     assert.throws(() => CountingBloom.restore(s2), /\[lite-filter\].*seed/);
@@ -287,7 +287,7 @@ test("BlockedBloom dump: round-trips through JSON and structuredClone", () => {
 
 test("BlockedBloom dump: the tag shape is stable and self-describing (mem + bb:512 + nb + bits)", () => {
     const snap = filledBlocked({ fpp: 0.01, keys: "int" }).dump();
-    assert.equal(snap.f, "litefilter/1");
+    assert.equal(snap.f, "litefilter/2");
     assert.equal(snap.mem, "BlockedBloom");
     assert.equal(snap.bb, 512);
     assert.equal(typeof snap.nb, "number");
@@ -334,7 +334,7 @@ test("BlockedBloom restore door: an out-of-range / corrupt bit-store word is REJ
 });
 
 test("BlockedBloom restore door: bad format tag / seed / keys / count fail closed", () => {
-    const s1 = filledBlocked({ keys: "int" }).dump(); s1.f = "litefilter/2";
+    const s1 = filledBlocked({ keys: "int" }).dump(); s1.f = "litefilter/1";
     assert.throws(() => BlockedBloom.restore(s1), /\[lite-filter\].*format tag/);
     const s2 = filledBlocked({ keys: "int" }).dump(); s2.seed = 1.5;
     assert.throws(() => BlockedBloom.restore(s2), /\[lite-filter\].*seed/);
@@ -388,7 +388,7 @@ test("Cuckoo dump: round-trips through JSON and structuredClone", () => {
 
 test("Cuckoo dump: the tag shape is stable and self-describing (mem + fw + b:4 + nb + fp)", () => {
     const snap = filledCuckoo({ fpp: 0.01, keys: "int" }).dump();
-    assert.equal(snap.f, "litefilter/1");
+    assert.equal(snap.f, "litefilter/2");
     assert.equal(snap.mem, "Cuckoo");
     assert.equal(snap.b, 4);
     assert.equal(typeof snap.fw, "number");
@@ -461,7 +461,7 @@ test("Cuckoo restore door: an out-of-range / impossible fingerprint is REJECTED,
 });
 
 test("Cuckoo restore door: bad format tag / seed / keys / count fail closed", () => {
-    const s1 = filledCuckoo({ keys: "int" }).dump(); s1.f = "litefilter/2";
+    const s1 = filledCuckoo({ keys: "int" }).dump(); s1.f = "litefilter/1";
     assert.throws(() => Cuckoo.restore(s1), /\[lite-filter\].*format tag/);
     const s2 = filledCuckoo({ keys: "int" }).dump(); s2.seed = 1.5;
     assert.throws(() => Cuckoo.restore(s2), /\[lite-filter\].*seed/);
@@ -529,3 +529,102 @@ test("Cuckoo restore opts: stats can be re-derived on restore", () => {
     g.mightContain(1);
     assert.equal(g.stats().queries, 1);
 });
+
+/* ============================================================================
+ * Family-wide snapshot integrity checksum (decisions/0021, format litefilter/2).
+ *
+ * The QA-reported fail-open: keys-mode and seed are free construction inputs that
+ * CANNOT be re-derived from the stored bytes, so a flipped `keys` ("int" <-> null) or
+ * `seed` silently reconstructed a wrong filter (1990/2000 false negatives). Every
+ * member now folds provenance (tag, mem, keys-mode, seed), sizing/width fields, count,
+ * and every store word into a 32-bit `chk`; restore recomputes it and REJECTS a
+ * mismatch fail-closed. One positive matrix per member: pristine round-trips with 0
+ * false negatives; keys-flip / seed-flip / one-store-word-flip each THROW.
+ * ========================================================================== */
+
+const CHK_MEMBERS = [
+    {
+        name: "Bloom",
+        Ctor: Bloom,
+        build: () => { const f = new Bloom(1000, { keys: "int" }); for (let i = 0; i < 500; i++) f.add(i); return f; },
+        present: (g) => { for (let i = 0; i < 500; i++) if (!g.mightContain(i)) return false; return true; },
+        store: (s) => s.bits, wordMask: 0xffffffff,
+    },
+    {
+        name: "CountingBloom",
+        Ctor: CountingBloom,
+        build: () => { const f = new CountingBloom(1000, { keys: "int" }); for (let i = 0; i < 500; i++) f.add(i); return f; },
+        present: (g) => { for (let i = 0; i < 500; i++) if (!g.mightContain(i)) return false; return true; },
+        store: (s) => s.cnts, wordMask: 0xff,
+    },
+    {
+        name: "BlockedBloom",
+        Ctor: BlockedBloom,
+        build: () => { const f = new BlockedBloom(1000, { keys: "int" }); for (let i = 0; i < 500; i++) f.add(i); return f; },
+        present: (g) => { for (let i = 0; i < 500; i++) if (!g.mightContain(i)) return false; return true; },
+        store: (s) => s.bits, wordMask: 0xffffffff,
+    },
+    {
+        name: "Cuckoo",
+        Ctor: Cuckoo,
+        build: () => { const f = new Cuckoo(1000, { keys: "int" }); for (let i = 0; i < 300; i++) f.add(i); return f; },
+        present: (g) => { for (let i = 0; i < 300; i++) if (!g.mightContain(i)) return false; return true; },
+        store: (s) => s.fp, wordMask: 0xffff,
+    },
+    {
+        name: "Quotient",
+        Ctor: Quotient,
+        build: () => { const f = new Quotient(1000, { keys: "int" }); for (let i = 0; i < 300; i++) f.add(i); return f; },
+        present: (g) => { for (let i = 0; i < 300; i++) if (!g.mightContain(i)) return false; return true; },
+        store: (s) => s.store, wordMask: null, // structural-sensitive; flip is handled specially
+    },
+    {
+        name: "XorFilter",
+        Ctor: XorFilter,
+        build: () => { const keys = []; for (let i = 0; i < 2000; i++) keys.push(i); return XorFilter.from(keys, { keys: "int" }); },
+        present: (g) => { for (let i = 0; i < 2000; i++) if (!g.mightContain(i)) return false; return true; },
+        store: (s) => s.fp, wordMask: 0xff,
+    },
+];
+
+for (const m of CHK_MEMBERS) {
+    test("chk " + m.name + ": every dump carries a 32-bit integrity checksum + the v2 tag", () => {
+        const snap = m.build().dump();
+        assert.equal(snap.f, "litefilter/2");
+        assert.equal(Number.isInteger(snap.chk) && snap.chk >= 0 && snap.chk <= 0xffffffff, true,
+            "chk must be a 32-bit unsigned integer");
+    });
+
+    test("chk " + m.name + ": a pristine dump round-trips with 0 false negatives", () => {
+        const f = m.build();
+        const g = m.Ctor.restore(JSON.parse(JSON.stringify(f.dump())));
+        assert.equal(m.present(g), true, "pristine restore must preserve every present key");
+    });
+
+    test("chk " + m.name + ": flipping keys-mode is REJECTED by the checksum (the QA fail-open)", () => {
+        const snap = m.build().dump();
+        snap.keys = snap.keys === "int" ? null : "int"; // int -> null (the QA repro direction)
+        assert.throws(() => m.Ctor.restore(snap), /\[lite-filter\]/,
+            "a keys-mode flip must fail closed (silently building the wrong hash path is a fail-open)");
+    });
+
+    test("chk " + m.name + ": flipping the seed is REJECTED by the checksum", () => {
+        const snap = m.build().dump();
+        snap.seed = (snap.seed ^ 0x5a5a5a5a) >>> 0; // a different valid uint32
+        assert.throws(() => m.Ctor.restore(snap), /\[lite-filter\]/,
+            "a seed flip must fail closed (the seed cannot be re-derived from the store)");
+    });
+
+    test("chk " + m.name + ": flipping ONE store word is REJECTED (checksum, or structure for Quotient)", () => {
+        const snap = m.build().dump();
+        const arr = m.store(snap);
+        const idx = arr.length >> 1;
+        // A change that stays a legal integer for the store's element width, so the per-word
+        // range check passes and the flip is caught by the checksum (for Quotient a raw
+        // change may instead trip the structural check first -- both are a fail-closed throw).
+        if (m.wordMask !== null) arr[idx] = (arr[idx] ^ 1) & m.wordMask;
+        else arr[idx] = arr[idx] ^ 8; // Quotient word: perturb a metadata/remainder bit
+        assert.throws(() => m.Ctor.restore(snap), /\[lite-filter\]/,
+            "a single store-word flip must fail closed (integrity checksum or structure)");
+    });
+}

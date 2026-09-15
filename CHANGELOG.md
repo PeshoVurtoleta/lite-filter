@@ -7,6 +7,83 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The `VERSION` constant, `package.json` `version`, and `llms.txt` are bumped
 together (three-place version sync) at release.
 
+## [0.6.0] - 2026-09-15
+
+The 6th member -- `XorFilter`, the space-optimal STATIC one (built once, immutable, ~9.84 bits/item).
+
+### Added
+
+- **`XorFilter` -- the space-optimal static member** (Graf & Lemire, "Xor Filters", ACM JEA
+  2020; decisions/0018, 0019, 0020). The family's FIRST immutable member: a new class IN
+  `Filter.js`, built ONCE from a known key set and frozen. It resolves the static-build API
+  deferred in decisions/0006.
+  - **Static factory `XorFilter.from(iterable, options)`** (with a `.build` alias): there is
+    no public constructor (`new XorFilter()` throws `[lite-filter]`), and `add` / `remove` /
+    `clear` all throw `[lite-filter]` fail-closed (decisions/0019) -- a static filter has no
+    mutation surface. `from()` DEDUPES its input (keys are a SET, not multiplicity -- contrast
+    Cuckoo / Quotient); `size == capacity == |Set(keys)|`.
+  - **3-uniform hypergraph peeling** (decisions/0018): the array is 3 equal segments of length
+    `bl = ceil(1.23 * n / 3) + 32` (total `3*bl ~= 1.23*n + 96` slots). Each key touches one
+    slot per segment; slots are assigned in REVERSE peel order so a key's three slots XOR to
+    its fingerprint. On a peel failure the build RESEEDS deterministically
+    (`seed ^ (attempt * 0x9e3779b1)`) up to 100 times, then THROWS `[lite-filter]` -- never a
+    partial build. The **fail-OPEN guard** (the charter's signature catch) asserts the peel
+    stack reached `n` BEFORE any fingerprint is assigned; a short stack is a peel failure
+    (reseed / throw), never assigned from.
+  - **Byte-aligned fingerprint width** (decisions/0020): `fw = 8` when `fpp >= 2^-8` (~0.0039),
+    else `fw = 16`; `fpp < 2^-16` throws (the 16-bit floor, inclusive at `2^-16`). The
+    delivered FPR is the width-quantized `2^-fw`, typically UNDER the configured target;
+    `fpp()` reports it. At the default `fpp = 0.01`: `fw = 8`, MEASURED FPR ~0.0039 (torture
+    differential, n=1e5 over 1e6 disjoint probes), bits/item ~9.84 at n=1e6 -- LEANER than
+    Cuckoo (~21) / Quotient (~23) and competitive with Bloom (~9.6) at a lower FPR. Position
+    reduction is `hash % bl` (exact for a 32-bit hash; multiply-shift would lose precision).
+  - **0 false negatives, proven at scale**: differentialStaticInt(XorFilter, n=1e6) reads back
+    with exactly 0 false negatives (which can hold ONLY if the peel was complete -- it doubles
+    as the fail-open regression gate).
+  - Hot path `mightContain` / `has` is strictly zero-alloc on `keys:'int'` (3 hashes, 3 modulo
+    reductions, an XOR-compare, no scratch): 0 scavenges at N=200000 and 8N=1600000 under the
+    pinned 4MB semi-space (perf-gate `xfQueryHit`). Build is a cold path (allocation there is
+    fine); ~168ms to build n=1e6.
+  - `dump()` / static `XorFilter.restore(snap, opts?)` with a `{ f, mem:"Xor", fw, bl, cap,
+    fpp, seed, keys, count, fp }` tag. `restore()` re-derives every consistency tie BEFORE
+    populating (fw from fpp, `bl == ceil(1.23*count/3)+32` from count, `fp.length == 3*bl`,
+    every word in `0..(1<<fw)-1`) and REJECTS any corruption -- never truncates.
+- **`Filter.d.ts`** -- `XorFilter<K>` with static `from` / `build` / `restore`, `add` /
+  `remove` / `clear` typed `never`, and a private constructor; `FilterSnapshot` extended with
+  the optional `bl` field (the `fp` field is shared with Cuckoo).
+- **Gates extended** -- the conservation + structure invariant `validateXor` (fw in {8,16};
+  `fp.length == 3*bl`; `bl == ceil(1.23*count/3)+32`; count == capacity >= 1; every word in
+  range); a `differentialStaticInt` Set-oracle differential; a `test/Xor.test.js` boundary
+  suite and a `test/QaAuditXor.test.js` stub; an `xfQueryHit` perf-gate scenario; a
+  `measureXor` / `printXorTable` / `runBenchXor` bench column (Bloom vs XOR, measured-vs-theory
+  FPR, amortized build ns/key); the torture GATE line grows `xf` terms (`fn=0`, `fpr`,
+  `buildThrew=true`, `mutThrew=true`).
+
+### Changed
+
+- **Snapshot format v2 with a family-wide integrity checksum** (decisions/0021) -- BREAKING
+  snapshot-format change (0.x line; nothing published depends on cross-version restore). The
+  format tag is bumped `litefilter/1` -> `litefilter/2`, and every member's `dump()` (Bloom,
+  CountingBloom, BlockedBloom, Cuckoo, Quotient, XorFilter) now emits a 32-bit integrity
+  checksum `chk` computed over -- in a fixed order -- the tag, member name, keys-mode, seed,
+  every sizing/width field, the count, and every store word (reuses the murmur3 `fmix32`
+  substrate; no new deps; cold path only, hot paths untouched).
+  - **`restore()` now rejects provenance + store corruption, including a keys-mode or seed
+    flip.** This closes a real FAIL-OPEN (QA-reported): the keys-mode and seed are free
+    construction inputs that CANNOT be re-derived from the stored bytes, so a snapshot whose
+    `keys` was flipped `"int"` <-> `null` (or whose `seed` was changed to another valid
+    uint32) previously reconstructed under the wrong hash path and read back with silent false
+    negatives (1990/2000 on a 2000-key XOR dump). Every member's `restore()` runs its
+    structural checks FIRST, THEN recomputes the checksum and REJECTS a mismatch fail-closed,
+    all before any field assignment or array build (REJECT, never truncate).
+  - `chk` is an INTEGRITY check against accidental corruption, NOT a MAC: a determined forger
+    who recomputes `chk` is out of scope (the same limitation as any non-keyed checksum). A v1
+    snapshot carries no `chk` and is rejected -- re-`dump()` from a live filter to migrate.
+  - `Filter.d.ts` `FilterSnapshot` gains an optional `chk: number`; the torture GATE line
+    grows a `snapChk=ok` term (a keys-mode flip and a store-bit flip rejected for Bloom + XOR);
+    positive per-member checksum tests added (pristine round-trip 0 FN; keys-flip / seed-flip /
+    one-store-word-flip each throw).
+
 ## [0.5.0] - 2026-09-14
 
 The 5th member -- `Quotient`, the mergeable + resizable one (deletable, fail-closed at the load ceiling).

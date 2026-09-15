@@ -169,6 +169,67 @@ export function differentialResizeInt(Ctor, opts) {
 }
 
 /**
+ * The STATIC-build differential (XOR): the two falsifiable laws for an IMMUTABLE member
+ * built ONCE from a known key set (decisions/0018). Generic over the static member (its
+ * factory is `Ctor.from(keys, options)`, NOT incremental `add`), so a future static member
+ * (Binary Fuse) passes through unchanged.
+ *
+ *   1. NO FALSE NEGATIVES. Every key in the built set MUST read `true`, always -- the
+ *      complete-peel assignment guarantees it. A single `false` voids the one-sided law.
+ *   2. BOUNDED FALSE-POSITIVE RATE. Probe a large DISJOINT set of never-added keys (the
+ *      negative int32 half, verified disjoint via the Set oracle) and count `mightContain`
+ *      trues. The measured FPR must sit within the member's width-quantized ceiling (~2^-fw).
+ *
+ * The keys are n distinct 32-bit ints from the LOW half; probes are NEGATIVE (high bit set),
+ * disjoint by construction. Seeded + deterministic: the same seed replays byte-for-byte.
+ *
+ * @param {Function} Ctor  a static member with a `.from(iterable, options)` factory (XorFilter)
+ * @param {{ n:number, fpp:number, probes:number, seed:number }} opts
+ * @returns {{ falseNegatives:number, falsePositives:number, fpr:number,
+ *             target:number, added:number, probed:number }}
+ */
+export function differentialStaticInt(Ctor, opts) {
+    const n = opts.n;
+    const fpp = opts.fpp;
+    const probes = opts.probes;
+    const rng = makePrng(opts.seed >>> 0);
+
+    const truth = new Set();
+    while (truth.size < n) {
+        const key = (rng() >>> 1); // [0, 2^31) -- the low half
+        truth.add(key);
+    }
+    const filter = Ctor.from(Array.from(truth), { fpp: fpp, keys: "int", seed: opts.seed >>> 0 });
+
+    // Law 1: no false negatives -- every key in the built set must read true.
+    let falseNegatives = 0;
+    for (const key of truth) {
+        if (!filter.mightContain(key)) falseNegatives++;
+    }
+
+    // Law 2: bounded FPR -- probe never-added keys (the negative half, disjoint) and count
+    // trues. The oracle Set double-checks disjoint, so any true is unambiguously a false
+    // positive.
+    let falsePositives = 0;
+    let probed = 0;
+    for (let i = 0; i < probes; i++) {
+        const key = -1 - (rng() >>> 1); // [-2^31, -1] -- the high half, all non-members
+        if (truth.has(key)) continue;   // impossible by construction, but assert it
+        probed++;
+        if (filter.mightContain(key)) falsePositives++;
+    }
+
+    return {
+        falseNegatives: falseNegatives,
+        falsePositives: falsePositives,
+        fpr: probed === 0 ? 0 : falsePositives / probed,
+        target: fpp,
+        added: truth.size,
+        probed: probed,
+    };
+}
+
+/**
  * The MERGE differential (Quotient): fill two identically-configured filters with DISJOINT
  * int key sets (A in the low quarter, B in the high quarter of the non-negative half),
  * `A.merge(B)`, then requery both sets -- membership MUST be preserved (0 false negatives)

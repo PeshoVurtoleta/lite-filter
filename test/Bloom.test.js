@@ -13,7 +13,7 @@ import { validate } from "./validate.mjs";
 import { differentialInt } from "./torture/oracle.mjs";
 
 test("exports: VERSION and both named + default export are Bloom", async () => {
-    assert.equal(VERSION, "0.5.0");
+    assert.equal(VERSION, "0.6.0");
     const mod = await import("../Filter.js");
     assert.equal(mod.Bloom, Bloom);
     assert.equal(mod.default, Bloom);

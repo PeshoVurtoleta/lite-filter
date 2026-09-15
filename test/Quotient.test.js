@@ -266,7 +266,7 @@ test("dump/restore: round-trips membership; restore emits a fresh independent fi
     for (let i = 0; i < 1500; i++) f.add(i);
     const snap = f.dump();
     assert.equal(snap.mem, "Quotient");
-    assert.equal(snap.f, "litefilter/1");
+    assert.equal(snap.f, "litefilter/2");
     const g = Quotient.restore(snap);
     assert.equal(g.size, f.size);
     for (let i = 0; i < 1500; i++) assert.equal(g.mightContain(i), true, "key " + i + " lost on restore");

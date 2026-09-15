@@ -52,10 +52,10 @@ async function main() {
         createOwnerCascadeOrphanKernel,
     } = await import("@zakkster/lite-leak");
     const { createRoot, effect, dispose } = await import("@zakkster/lite-signal");
-    const { Bloom, CountingBloom, BlockedBloom, Cuckoo, Quotient } = await import("../Filter.js");
-    const { validate, validateCounting, validateBlocked, validateCuckoo, validateQuotient } =
+    const { Bloom, CountingBloom, BlockedBloom, Cuckoo, Quotient, XorFilter } = await import("../Filter.js");
+    const { validate, validateCounting, validateBlocked, validateCuckoo, validateQuotient, validateXor } =
         await import("./validate.mjs");
-    const { differentialInt, differentialChurnInt, differentialResizeInt, differentialMergeInt } =
+    const { differentialInt, differentialChurnInt, differentialResizeInt, differentialMergeInt, differentialStaticInt } =
         await import("./torture/oracle.mjs");
 
     const SEED = (process.env.TORTURE_SEED >>> 0) || 0x1f2e3d4c;
@@ -117,6 +117,21 @@ async function main() {
             dispose(e); // disposing the owner untracks the filters -> collectable
         }
     });
+    // XOR build-then-drop retention (decisions/0018): the static member's peel scaffold
+    // (edge lists, degree counters, peel stack) is allocated inside from() and MUST NOT
+    // outlive the instance -- and the instance itself must be collectable once its owner
+    // scope disposes. 50 cycles is enough to surface a retained buffer; after gc the
+    // tracker returns to 0. The cleanup + tag are detached primitives (no capture of `xf`).
+    createRoot(() => {
+        for (let i = 0; i < 50; i++) {
+            const e = effect(() => {
+                const xf = XorFilter.from([i, i + 1, i + 2, i + 3, i + 4], { keys: "int" });
+                xf.mightContain(i | 0);
+                tracker.track(xf, () => {}, "xor", { audit: true });
+            });
+            dispose(e); // disposing the owner untracks the filter -> collectable
+        }
+    });
     globalThis.gc();
     await new Promise((r) => setTimeout(r, 50));
     const live = tracker.size();
@@ -146,6 +161,15 @@ async function main() {
     // remove). add-then-remove each op keeps occupancy near zero so no insert throws.
     const qinst = new Quotient(HOT_CAP, { keys: "int" });
     const qbufBefore = qinst._store.buffer;
+    // XOR steady-state instance: STATIC, built ONCE from the full [0, HOT_CAP) key set
+    // (the build is a cold path -- allocation there is fine and happens OUTSIDE the hot
+    // loop). The hot loop only QUERIES it: mightContain is strictly zero-alloc on keys:'int'
+    // (3 hashes, 3 modulo reductions, an XOR-compare -- no scratch). Every probed key is
+    // present, so it exercises the query-HIT path. XOR has no add/remove/clear (they throw),
+    // so it is not mutated in the loop and is excluded from the clear()-reuse check below.
+    const xkeys = new Array(HOT_CAP);
+    for (let i = 0; i < HOT_CAP; i++) xkeys[i] = i;
+    const xinst = XorFilter.from(xkeys, { keys: "int" });
 
     // The BREAK control: a retained sink the hot loop feeds one fresh object per op,
     // so heapUsed climbs and the major-GC / pause gate rejects the window.
@@ -175,6 +199,9 @@ async function main() {
         qinst.add(i & MASK);
         acc = (acc + (qinst.mightContain(i & MASK) ? 1 : 0)) | 0;
         qinst.remove(i & MASK);
+        // XOR: query-only hot path (the filter is static). Every probed key is present, so
+        // this is the zero-alloc query-hit path on keys:'int'.
+        acc = (acc + (xinst.mightContain(i & MASK) ? 1 : 0)) | 0;
         if (BREAK) sink.push({ i: i, acc: acc }); // retained: MUST trip the gate
         if ((i & 8191) === 0) {
             gc.sampleHeap(performance.now(), process.memoryUsage().heapUsed);
@@ -205,6 +232,7 @@ async function main() {
     validateBlocked(binst);
     validateCuckoo(kinst);
     validateQuotient(qinst);
+    validateXor(xinst);
 
     // allocPerOp is measured across the phase-2 HOT loop ONLY (heapBefore/heapAfter bracket
     // that loop, before any merge/resize law runs), so it reflects the genuinely zero-alloc
@@ -369,6 +397,62 @@ async function main() {
         validateQuotient(vq);
     }
 
+    // ---- XOR laws (decisions/0018, 0019, 0020) --------------------------------
+    // Law 17 (XOR): a static filter built from 1e6 distinct int keys -> EXACTLY 0 false
+    // negatives (the complete-peel assignment guarantees every key in the set reads true).
+    const xfLaw1 = differentialStaticInt(XorFilter, { n: 1000000, fpp: 0.01, probes: 1, seed: SEED });
+    // Law 18 (XOR): n=1e5, fpp=0.01 (fw=8), 1e6 disjoint probes -> measured FPR within the
+    // width-quantized ceiling 2^-8 (~0.0039) AND strictly > 0 (non-vacuous). The 0.0050
+    // ceiling sits above the ~0.0039 characteristic rate with margin; a broken query that
+    // never matches (fpr==0) or one running over the width would trip this.
+    const xfLaw2 = differentialStaticInt(XorFilter, { n: 100000, fpp: 0.01, probes: 1000000, seed: SEED ^ 0x55 });
+    const XF_FPR_LIMIT = 0.0050;   // above the ~0.0039 characteristic rate (fw=8), below any regression
+    // Law 19 (XOR build door): a DEGENERATE key set -- distinct objects that all encode to
+    // the same string ("[object Object]") -> duplicate hypergraph edges no reseed can
+    // separate -> peeling exhausts all 100 attempts and THROWS [lite-filter] (fail closed,
+    // never a partial build). Proven in-process.
+    let xfBuildThrew = false;
+    try { XorFilter.from([{}, {}, {}]); }
+    catch (e) { xfBuildThrew = e instanceof Error && /\[lite-filter\]/.test(e.message); }
+    // Law 20 (XOR immutability): add / remove / clear / new XorFilter each THROW
+    // [lite-filter] fail closed (a static filter has no mutation surface, decisions/0019).
+    let xfMutThrew = false;
+    {
+        const xf = XorFilter.from([1, 2, 3, 4, 5], { keys: "int" });
+        let a = false, r = false, c = false, ctor = false;
+        try { xf.add(6); } catch (e) { a = /\[lite-filter\]/.test(e.message); }
+        try { xf.remove(1); } catch (e) { r = /\[lite-filter\]/.test(e.message); }
+        try { xf.clear(); } catch (e) { c = /\[lite-filter\]/.test(e.message); }
+        try { new XorFilter(); } catch (e) { ctor = /\[lite-filter\]/.test(e.message); }
+        xfMutThrew = a && r && c && ctor;
+        validateXor(xf);
+    }
+    const xfFn = xfLaw1.falseNegatives + xfLaw2.falseNegatives;
+
+    // Law 21 (snapshot integrity checksum, decisions/0021): the family-wide `chk` (format
+    // litefilter/2) must REJECT a keys-mode flip and a store-bit flip fail-closed -- the QA
+    // fail-open. Proven for a representative MUTABLE member (Bloom) and the STATIC member
+    // (XorFilter): pristine dumps round-trip; a flipped keys-mode and a flipped store word
+    // each throw [lite-filter]. A pass here means the provenance/store corruption door holds.
+    let snapChkOk = false;
+    {
+        const isTag = (e) => e instanceof Error && /\[lite-filter\]/.test(e.message);
+        const b = new Bloom(4096, { keys: "int" });
+        for (let i = 0; i < 2000; i++) b.add(i);
+        const bPristine = Bloom.restore(JSON.parse(JSON.stringify(b.dump())));
+        let bOk = true; for (let i = 0; i < 2000; i++) if (!bPristine.mightContain(i)) bOk = false;
+        let bKeys = false; { const s = b.dump(); s.keys = null; try { Bloom.restore(s); } catch (e) { bKeys = isTag(e); } }
+        let bWord = false; { const s = b.dump(); const j = s.bits.length >> 1; s.bits[j] = (s.bits[j] ^ 1) >>> 0; try { Bloom.restore(s); } catch (e) { bWord = isTag(e); } }
+        // XorFilter -- the exact QA repro: flip keys->null on a 2000-int-key dump.
+        const xkeys2 = []; for (let i = 0; i < 2000; i++) xkeys2.push(i);
+        const xf2 = XorFilter.from(xkeys2, { keys: "int" });
+        const xPristine = XorFilter.restore(JSON.parse(JSON.stringify(xf2.dump())));
+        let xOk = true; for (let i = 0; i < 2000; i++) if (!xPristine.mightContain(i)) xOk = false;
+        let xKeys = false; { const s = xf2.dump(); s.keys = null; try { XorFilter.restore(s); } catch (e) { xKeys = isTag(e); } }
+        let xWord = false; { const s = xf2.dump(); const j = s.fp.length >> 1; s.fp[j] = (s.fp[j] ^ 1) & 0xff; try { XorFilter.restore(s); } catch (e) { xWord = isTag(e); } }
+        snapChkOk = bOk && bKeys && bWord && xOk && xKeys && xWord;
+    }
+
     // ---- verdict --------------------------------------------------------------
     const oracleOk =
         law1.falseNegatives === 0 &&
@@ -398,7 +482,13 @@ async function main() {
         qfMergeOk === true &&
         qfCeilingThrew === true &&
         qfCeilingFn === 0 &&
-        qfCeilingNoop === true;
+        qfCeilingNoop === true &&
+        xfFn === 0 &&
+        xfLaw2.fpr <= XF_FPR_LIMIT &&
+        xfLaw2.fpr > 0 &&
+        xfBuildThrew === true &&
+        xfMutThrew === true &&
+        snapChkOk === true;
     const ok =
         report.ok &&
         live === 0 &&
@@ -436,6 +526,10 @@ async function main() {
         " resizeFn=" + qfResizeFn + " mergeFn=" + qfMerge.falseNegatives +
         " mergeSize=" + qfMerge.mergedSize + "/" + qfMerge.expectedSize +
         " ceilingThrew=" + qfCeilingThrew + " ceilingNoop=" + qfCeilingNoop +
+        " | xf fn=" + xfFn +
+        " fpr=" + xfLaw2.fpr.toFixed(5) + " ceiling=" + XF_FPR_LIMIT.toFixed(5) +
+        " buildThrew=" + xfBuildThrew + " mutThrew=" + xfMutThrew +
+        " | snapChk=" + (snapChkOk ? "ok" : "FAIL") +
         " clearReuse=" + sameBuffer +
         " | " + (ok ? "ok" : "FAIL") + "\n");
 
@@ -486,6 +580,18 @@ async function main() {
                 " already-added key(s) -- FALSE NEGATIVE on overload (decisions/0016)\n");
         if (!qfCeilingNoop)
             process.stderr.write("  Quotient thrown add was NOT a byte-identical no-op\n");
+        if (xfFn > 0)
+            process.stderr.write("  XOR FALSE NEGATIVE -- a peeled key read false; the peel was INCOMPLETE (fail-open!) (decisions/0018)\n");
+        if (xfLaw2.fpr > XF_FPR_LIMIT)
+            process.stderr.write("  XOR FPR " + xfLaw2.fpr.toFixed(5) + " over ceiling " + XF_FPR_LIMIT + "\n");
+        if (!(xfLaw2.fpr > 0))
+            process.stderr.write("  XOR FPR is 0 -- vacuous (the query never matches a non-member; structure broken)\n");
+        if (!xfBuildThrew)
+            process.stderr.write("  XOR degenerate build did NOT throw -- the 100-attempt exhaustion door is broken (decisions/0018)\n");
+        if (!xfMutThrew)
+            process.stderr.write("  XOR mutation (add/remove/clear/new) did NOT throw fail-closed (decisions/0019)\n");
+        if (!snapChkOk)
+            process.stderr.write("  SNAPSHOT CHECKSUM: a keys-mode / store-bit flip was NOT rejected -- the fail-open door is broken (decisions/0021)\n");
         if (law2.fpr > FPR_LIMIT)
             process.stderr.write("  FPR " + law2.fpr.toFixed(5) + " over limit " + FPR_LIMIT + "\n");
         if (bbLaw2.fpr > BB_FPR_LIMIT)
