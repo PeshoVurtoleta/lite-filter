@@ -9,6 +9,9 @@
 > proposed are now recorded in `decisions/0001..0023`. Every number below was
 > either proven by the shipped seeded bench in this repo or is a paper citation --
 > read `decisions/` and the bench for the shipped values, not this charter's targets.
+>
+> NEXT (2026-09-23): shipped at 1.1.0; post-audit hardening H1 -> 1.2.0 is planned in
+> section 12 (audit record: `RESEARCH.md`).
 
 ASCII-only (`->`, `<=`, `>=`, `x`, "1.23x", never Unicode arrows or the
 multiplication sign). Suite law from `../CLAUDE.md` applies verbatim: npm scope
@@ -423,6 +426,54 @@ All six charter questions are now settled; the pointer after each is the shipped
    estimated `count()` stays deferred (it would be opt-in and clearly an estimate if added).
 
 ---
+
+## 12. Post-1.1 hardening -- H1 (1.2.0): the 2026-09-23 zero-GC audit close-out
+
+Source: the read-only adversarial audit of 2026-09-23 (RESEARCH.md). Verdict: the claim HOLDS for
+all seven members. Zero runtime deps, 0 B/op on every int hot path, a TRUE `maxScavenges: 0` perf
+floor, fail closed (no silent `>>> 0` / `| 0` truncation), and every measured FPR at or under its
+documented bound. There are no defects. The findings are integration constraints and introspection
+gaps, most surfaced by the planned consumer lite-hud M5 (`Bloom`, `keys:'int'`, first-seen error
+signatures on its hot path).
+
+Entry state: 1.1.0 (commit af08da4), git clean, 497/0 unit tests, torture ok, controls ok (3 break
+arms), perf 22/0, pack 8 files / 96 kB. Minor release: getters are additive, with no wire or snapshot
+format change. Pipeline: planner -> settle -> coder -> reviewer -> qa -> /release 1.2.0 ->
+/sync-card lite-filter.
+
+TASKS
+1. N1 (S2) -- `keys:'int'` accepts SIGNED int32 only (decisions/0001), so `add(2147483648)` and
+   `add(0xFFFFFFFF)` THROW. A consumer that folds a signature with `>>> 0` throws on the hot path
+   for half the domain. SETTLE: (a) document loudly and ship a signed-fold example in README +
+   llms.txt + d.ts (`((a << 20) | (b << 12) | c) | 0`), vs (b) also accept [2^31, 2^32) by
+   normalising with `| 0` inside the door (the domain widens; it must stay injective on the 32-bit
+   pattern). Lean: (a); the domain stays as decisions/0001 rules it. The error text names `| 0` as
+   the fix.
+2. N2 (S3) -- read-only getters `keysMode` ('int' | 'arbitrary') and `seed` on every member, so a
+   consumer detects config without catching an error or reading `_int` (today only `dump().keys`,
+   which is a full serialize). O(1), 0-alloc. d.ts + README.
+3. N3 (S3) -- `size` can exceed `capacity`: Cuckoo(cap=64) took 127 adds before throwing, and
+   Quotient(cap=64) took 115. The real ceiling is `nb*b` / `floor(0.9*nslots)`. Add getters
+   `maxLoad` (the real ceiling) and `remaining` (or `saturation` in [0, 1]) to Cuckoo and Quotient,
+   plus the same shape on every member where it is meaningful. Correct the overload error text,
+   which currently advises "size vs capacity" as a headroom check.
+4. N4 (S3) -- gate the M5 lane. Add a NEGATIVE-int32 lane (INT_MIN..-1, plus INT_MIN / INT_MAX edges)
+   to the torture oracle (fn = 0) and to PerfGate (maxScavenges 0). Add a default-backing lane for
+   fractional / large numbers under an explicit AMORTIZED byte budget (not 0; N5 is documented).
+   Audit measurement: negative int32 is already 0 heap growth, so this gate proves an existing
+   property.
+5. N6 (nit) -- add a `test:demo` script for `demo/Demo.test.mjs` (999 lines, not run by `npm test`);
+   drop the dead `XorFilter._hashKey` / `BinaryFuse._hashKey` (Filter.js:3471, 3844).
+
+GATES
+- `npm test` + new units: keysMode/seed values for every member x both modes; maxLoad/remaining
+  match the measured ceilings; a "size may exceed capacity" assertion; the N1 behavior as settled.
+- torture: alloc=0 B/op, gc major=0, plus the negative-int oracle lane (fn = 0).
+- perf: maxScavenges=0 on every int lane INCLUDING negatives; the amortized default-backing lane has
+  its own budget.
+- controls: the three break arms unchanged and still failing for their matched reason.
+- Version trinity (package.json / Filter.js VERSION / llms.txt), CHANGELOG head, README + llms.txt +
+  d.ts for the getters; pack still 8 files with demo/test/decisions absent.
 
 ## See also
 
