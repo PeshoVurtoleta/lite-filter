@@ -15,10 +15,10 @@ import { Cuckoo, VERSION } from "../Filter.js";
 import { validateCuckoo } from "./validate.mjs";
 import { differentialInt, differentialChurnInt } from "./torture/oracle.mjs";
 
-test("exports: Cuckoo is a named export; VERSION is 1.1.0", async () => {
+test("exports: Cuckoo is a named export; VERSION is 1.2.0", async () => {
     const mod = await import("../Filter.js");
     assert.equal(mod.Cuckoo, Cuckoo);
-    assert.equal(VERSION, "1.1.0");
+    assert.equal(VERSION, "1.2.0");
 });
 
 test("getters: size/count/capacity reflect state", () => {

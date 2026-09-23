@@ -7,6 +7,62 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The `VERSION` constant, `package.json` `version`, and `llms.txt` are bumped
 together (three-place version sync) at release.
 
+## [1.2.0] - 2026-09-23
+
+H1 hardening -- the close-out of the 2026-09-23 zero-GC audit (RESEARCH.md, ROADMAP section 12).
+The audit found NO defects; these are additive introspection getters, louder fail-closed text, and
+gated proofs for the lite-hud M5 integration constraints. No wire or snapshot change (stays
+`litefilter/3`); no hot-body byte change beyond the error-text constants.
+
+### Added
+
+- **`keysMode` and `seed` read-only getters on every member** (decisions/0025). `keysMode` returns
+  the module string constant `'int' | 'arbitrary'` (never built per call); `seed` returns the 32-bit
+  unsigned hash seed -- the validated constructor seed on the five dynamic members, the WINNING build
+  seed on `XorFilter` / `BinaryFuse` (a static instance is only reachable built). O(1), 0-alloc, off the hot path.
+  A consumer can now detect a `keys:'int'` filter without catching a `TypeError` or a full `dump()`.
+- **`maxLoad` and `saturation` read-only getters on every member** (decisions/0026). `maxLoad` is the
+  hard item ceiling documented as an UPPER BOUND: `Infinity` on Bloom / CountingBloom / BlockedBloom
+  (adds never fail; the FPR degrades), `nb*b` on Cuckoo, `floor(0.90*nslots)` on Quotient (tracks
+  `resize()`), `size` on a built static member (always built). `saturation = size / maxLoad` in
+  `[0, 1]`, 0 when `maxLoad` is `Infinity` or 0, never NaN. `capacity` keeps its meaning (the SIZING
+  input, not a cap): Cuckoo(64) takes 127 adds and Quotient(64) 115 before the fail-closed door.
+- **`test/Introspection.test.js`**: 7 members x 2 key modes x the 4 getters, pinned against MEASURED
+  ceilings (Cuckoo(64).maxLoad === 128 with exactly 127 adds before the 128th throws; Quotient(64) ===
+  115 and its post-`resize()` value measured, not assumed), the default seed read from the live code
+  path, an explicit-seed round-trip, the static build seed matching `dump().seed`, `restore()`
+  preserving all four getters, and the signed-fold door both ways. Test count 497 -> 516 (the
+  boundary matrix widened after QA: overload-message text asserts on both members, saturation
+  is swept in [0, 1] at every add to the throw point on Cuckoo and Quotient, and Quotient's
+  `maxLoad`/`saturation` are pinned live through `merge()`, not just `resize()`).
+- **A NEGATIVE int32 torture oracle lane** (audit N4): INT_MIN..-1 plus the INT_MIN / INT_MAX edges
+  on every int-capable member, 0 false negatives (`negFn=` on the GATE line). The steady-state hot
+  loop is unchanged and stays 0-alloc.
+- **PerfGate negative-int32 lanes** (audit N4): one `maxScavenges 0` lane per int-capable member on
+  the negative half of the `keys:'int'` domain, plus ONE amortized default-backing lane (fractional /
+  large numbers that `String()`-encode) under an explicit MEASURED byte budget of 104 B/op (measured
+  p95 ~51.6 B/op on `node --max-semi-space-size=4`, budget = p95 x2) and a floor of 8 B/op, so a
+  collapse to 0 fails the lane instead of passing it vacuously (median ~41 B/op at release).
+- **`test:demo` npm script** (audit N6): `demo/Demo.test.mjs` (previously not run by `npm test`).
+
+### Changed
+
+- **The `keys:'int'` fail-closed text names the fix** (decisions/0024): fold a composite signature
+  with `| 0`, never `>>> 0` (which yields `[2^31, 2^32)` and throws for half its domain). The domain
+  stays a SIGNED int32 `[-2^31, 2^31-1]`; a `>>> 0` fold still fails closed, but the message now says
+  how to fix it. README, `llms.txt`, and the `keys` option doc in `Filter.d.ts` carry the signed-fold
+  example `((a << 20) | (b << 12) | c) | 0`.
+- **The Cuckoo / Quotient overload messages** advise `saturation (size / maxLoad)` instead of the
+  wrong "size vs capacity" headroom check, and note that `maxLoad` is an upper bound (decisions/0026).
+- `Filter.d.ts`, `README.md`, `llms.txt`: the four getters documented (`maxLoad` as an UPPER BOUND,
+  the static `seed` semantics); the surface table and the API reference gain the getter entries.
+
+### Removed
+
+- **The dead `XorFilter._hashKey` / `BinaryFuse._hashKey`** (audit N6): the static members
+  never call an arbitrary-key hash helper (their build/query hash inline), so the two methods were
+  unreachable code. No behavior change.
+
 ## [1.1.0] - 2026-09-15
 
 ### Added

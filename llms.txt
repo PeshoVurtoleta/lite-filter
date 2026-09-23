@@ -18,7 +18,7 @@ via <Member>.from(keys) and throw on add/remove/clear. Single-file ESM, zero run
 dependencies, node:test only. Ships a runnable + importable bench (Bench.mjs) that measures
 ACTUAL vs THEORETICAL false-positive rate on your own keys, checked against a real Set oracle.
 
-## Status: 1.1.0 - fail-closed option doors + string-edge entropy fix + litefilter/3 snapshots. Family complete and API frozen since 1.0.0 - Bloom (reference) + CountingBloom (deletable) + BlockedBloom (cache-local) + Cuckoo (fingerprint) + Quotient (mergeable/resizable) + XorFilter (static, space-optimal) + BinaryFuse (static, smallest).
+## Status: 1.2.0 - introspection getters (keysMode, seed, maxLoad, saturation) + signed-fold int-key guidance; litefilter/3 snapshots unchanged. Family complete and API frozen since 1.0.0 - Bloom (reference) + CountingBloom (deletable) + BlockedBloom (cache-local) + Cuckoo (fingerprint) + Quotient (mergeable/resizable) + XorFilter (static, space-optimal) + BinaryFuse (static, smallest).
 
 The problem it solves: "have I seen this key?" -- dedup, set membership, cache
 admission -- at a handful of BITS per entry instead of the tens of bytes a Set costs
@@ -46,6 +46,19 @@ behavior on your keys, instead of copying a number from a paper.
 - size / count -> number: the number of adds recorded (a plain counter, not an
   estimate, not a distinct-key count -- Bloom cannot detect a duplicate add).
 - capacity -> number: the item count the filter was sized for at construction.
+- keysMode -> 'int' | 'arbitrary' (decisions/0025): the key mode the filter was constructed
+  in. O(1), 0-alloc -- detect a keys:'int' filter without catching a TypeError or a full dump().
+- seed -> number (decisions/0025): the 32-bit unsigned hash seed. Dynamic members: the validated
+  constructor seed. XorFilter / BinaryFuse: the WINNING build seed (reseeds until the peel
+  succeeds); a static instance is only reachable built (from() / restore()).
+- maxLoad -> number (decisions/0026): the item ceiling as an UPPER BOUND -- an add past it
+  CERTAINLY throws; an add below it MAY still throw on Cuckoo (500-kick budget) and Quotient
+  (cluster shift). Infinity on Bloom/CountingBloom/BlockedBloom (adds never fail; the FPR
+  degrades -- watch fpp()); nb*b on Cuckoo; floor(0.90*nslots) on Quotient (tracks resize());
+  size on a built static member (always built). NOT a promise of remaining room; capacity
+  is the SIZING input, not the cap (Cuckoo(64) took 127 adds, Quotient(64) 115, before throwing).
+- saturation -> number (decisions/0026): size / maxLoad in [0, 1]. 0 when maxLoad is Infinity
+  (Bloom class) or 0 (unbuilt static); 1 on a built static filter (full by construction); never NaN.
 - fpp() -> number: the CONFIGURED target while empty, else the fill-derived
   closed-form ESTIMATE (1 - e^(-k*n/m))^k. A formula, NOT a measurement -- measure
   your own keys with the bench.
@@ -53,8 +66,12 @@ behavior on your keys, instead of copying a number from a paper.
   same ArrayBuffer identity).
 
 Cross-cutting, mirrored from lite-lru:
-- keys:'int' strict-zero-alloc mode: 32-bit signed integer keys, mixed directly with
-  no string encoding. Out-of-range / non-integer keys throw a [lite-filter] TypeError.
+- keys:'int' strict-zero-alloc mode: 32-bit SIGNED integer keys [-2^31, 2^31-1], mixed
+  directly with no string encoding. Out-of-range / non-integer keys throw a [lite-filter]
+  TypeError. THE SIGNED-FOLD TRAP (decisions/0024): fold a composite signature with `| 0`,
+  NEVER `>>> 0` -- a `>>> 0` fold yields [2^31, 2^32) for half its domain and THROWS on the hot
+  path for exactly those keys (never a silent alias). The error text names the fix. Example:
+  add(((sid << 20) | (op << 12) | code) | 0).
 - Opt-in stats { stats: true }: a per-instance holder { adds, queries, hits, misses };
   OFF by default so the hot path writes nothing (_stats === null). stats()/resetStats()
   fail closed on a non-stats instance.
@@ -125,7 +142,8 @@ Cross-cutting, mirrored from lite-lru:
   BELOW the configured target because f rounds up (at fpp 0.01, f=10 -> 16-bit -> ~0.0078);
   fpp() reports that quantized rate once non-empty. Two honest fail-closed edges: (1) add
   on a full table (500 kicks exhausted) THROWS a [lite-filter] Error -- never a silent drop
-  (decisions/0014); headroom is observable via size vs capacity; (2) removing a
+  (decisions/0014); headroom is observable via saturation (size / maxLoad, maxLoad == nb*b, an
+  UPPER BOUND -- an add below it may still throw once the kick budget is exhausted); (2) removing a
   NEVER-INSERTED key whose fingerprint collides with a real key removes that other key's
   fingerprint -> a false negative for it (decisions/0015) -- only remove keys you inserted.
   Space ~2x Bloom at fpp 0.01 (byte-aligned slots). Good for: membership + deletes with an
@@ -151,7 +169,9 @@ Cross-cutting, mirrored from lite-lru:
   remainder-quantized to load*2^-r (typically UNDER target -- r rounds up); fpp() reports
   that. Two honest fail-closed edges: (1) add at the 0.90 load ceiling (or whose linear
   cluster shift would run off the end) THROWS a [lite-filter] Error and is a byte-identical
-  no-op (decisions/0016), never a silent drop; headroom via size vs capacity; (2) removing a
+  no-op (decisions/0016), never a silent drop; headroom via saturation (size / maxLoad, maxLoad
+  == floor(0.90*nslots), tracks resize(), an UPPER BOUND -- may still throw on a cluster-shift
+  run-off); (2) removing a
   NEVER-INSERTED key whose (quotient,remainder) collides with a real key removes that other
   key's fingerprint -> a false negative for it (decisions/0017) -- only remove keys you
   inserted. Space ~23 bits/item at fpp 0.01 (16-bit slot words + guard, metadata + shift
@@ -214,8 +234,9 @@ ceil(m/2) bytes (two 4-bit counters per byte) where Bloom stores ceil(m/32) 32-b
 BlockedBloom stores ceil(m/512)*16 words (nb 512-bit blocks) and clamps k to <= 512.
 Cuckoo sizes differently (decisions/0014): fingerprint width f = ceil(log2(8/fpp))
 byte-aligned to 8 or 16 bits, bucket count nb = pow2 >= ceil(capacity/(4*0.95)), store
-nb*4 slots (Uint8Array or Uint16Array); real slot capacity is nb*4, headroom via size vs
-capacity. Quotient sizes differently (decisions/0016): remainder width r = ceil(log2(1/fpp)),
+nb*4 slots (Uint8Array or Uint16Array); the real slot ceiling maxLoad == nb*4, headroom via
+saturation (an UPPER BOUND, decisions/0026).
+Quotient sizes differently (decisions/0016): remainder width r = ceil(log2(1/fpp)),
 slot word r+3 bits byte-aligned to 8 or 16 bits, slot count nslots = pow2 >= ceil(capacity/
 0.90), plus GUARD spillover slots (max(1024, nslots>>3)); q+r must fit one 32-bit hash.
 XorFilter sizes differently (decisions/0018): 3 segments of bl = ceil(1.23*n/3)+32 slots

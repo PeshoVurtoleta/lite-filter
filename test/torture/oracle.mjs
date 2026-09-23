@@ -235,6 +235,45 @@ export function differentialStaticInt(Ctor, opts) {
 }
 
 /**
+ * The NEGATIVE-int32 differential (audit N4 / lite-hud M5): every int-capable member must
+ * accept the NEGATIVE half of the keys:'int' domain with 0 false negatives. Adds a sample
+ * of INT_MIN..-1 keys PLUS the two edges INT_MIN and INT_MAX (INT_MAX is the positive edge
+ * of the signed domain, included so both boundary values are proven), then requeries every
+ * added key -- 0 false negatives is the hard one-sided law. Generic over dynamic members
+ * (`new Ctor(...).add`) and static members (`Ctor.from(...)`), selected by `opts.static`.
+ * Seeded + deterministic. The added keys stay valid signed int32, so nothing boxes.
+ *
+ * @param {Function} Ctor  the member constructor / static factory host
+ * @param {{ n:number, fpp:number, seed:number, static?:boolean }} opts
+ * @returns {{ falseNegatives:number, added:number }}
+ */
+export function differentialNegInt(Ctor, opts) {
+    const n = opts.n;
+    const rng = makePrng(opts.seed >>> 0);
+    const truth = new Set();
+    truth.add(-2147483648);  // INT_MIN edge
+    truth.add(2147483647);   // INT_MAX edge
+    // Fill the remainder from the negative half [-2^31, -1] (all valid signed int32).
+    while (truth.size < n) {
+        const key = -1 - (rng() >>> 1); // [-2^31, -1]
+        truth.add(key);
+    }
+
+    let falseNegatives = 0;
+    if (opts.static) {
+        const filter = Ctor.from(Array.from(truth), { fpp: opts.fpp, keys: "int", seed: opts.seed >>> 0 });
+        for (const key of truth) if (!filter.mightContain(key)) falseNegatives++;
+        return { falseNegatives: falseNegatives, added: truth.size };
+    }
+    // Dynamic member: size for headroom (2n) so a capacity-bounded add (Cuckoo/Quotient)
+    // never throws while proving the negative add path.
+    const filter = new Ctor(n * 2, { fpp: opts.fpp, keys: "int" });
+    for (const key of truth) filter.add(key);
+    for (const key of truth) if (!filter.mightContain(key)) falseNegatives++;
+    return { falseNegatives: falseNegatives, added: truth.size };
+}
+
+/**
  * The MERGE differential (Quotient): fill two identically-configured filters with DISJOINT
  * int key sets (A in the low quarter, B in the high quarter of the non-negative half),
  * `A.merge(B)`, then requery both sets -- membership MUST be preserved (0 false negatives)

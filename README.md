@@ -246,8 +246,9 @@ Two honest edges, both surfaced, never hidden:
 
 - **Fail-closed at capacity** (decisions/0014). When 500 kicks are exhausted the table is
   full and `add` THROWS a `[lite-filter]` Error -- it never silently drops a fingerprint
-  (which would be a false negative). Headroom is observable via `size` vs `capacity`. Size
-  up when it throws.
+  (which would be a false negative). Headroom is observable via `saturation` (`size / maxLoad`,
+  where `maxLoad === nb*b`), an UPPER BOUND -- an add below it may still throw once the 500-kick
+  budget is exhausted (decisions/0026). Size up when it throws.
 - **Only remove keys you inserted** (decisions/0015). Deleting a NEVER-INSERTED key whose
   fingerprint collides with a real key clears that other key's slot -> a later **false
   negative** for it. This is sharper than a Counting Bloom delete (which decrements a
@@ -306,7 +307,9 @@ Two honest edges, both surfaced, never hidden:
   off the end -- both checked BEFORE any write, so a thrown `add` is a BYTE-IDENTICAL no-op
   (no already-added key is dropped). A Quotient stores MULTIPLICITY (it does not dedup, like
   Cuckoo), so a duplicate-heavy stream fills toward the ceiling and fails closed, never a
-  silent drop. Headroom is observable via `size` vs `capacity`.
+  silent drop. Headroom is observable via `saturation` (`size / maxLoad`, where `maxLoad ===
+  floor(0.90 * nslots)` and tracks `resize()`), an UPPER BOUND -- an add below it may still
+  throw on a cluster-shift run-off (decisions/0026).
 - **Only remove keys you inserted** (decisions/0017). Deleting a NEVER-INSERTED key whose
   `(quotient, remainder)` collides with a real key clears that other key's slot -> a later
   **false negative** for it (a constructed non-vacuous example is in decisions/0017).
@@ -457,6 +460,10 @@ set, `fpp < 2^-16`, and 100 exhausted peel attempts (a degenerate key set).
 | `resize(n)` / `merge(other)` | `Quotient` | **Quotient only**: cold-path rebuild (grow/shrink) and union with an identical filter; preserve membership. |
 | `size` / `count` | `number` | Adds recorded (a plain counter, not a distinct-key count). **XorFilter** / **BinaryFuse**: the deduped key count. |
 | `capacity` | `number` | The item count the filter was sized for (**XorFilter** / **BinaryFuse**: == size). |
+| `keysMode` | `'int' \| 'arbitrary'` | The key mode the filter was constructed in (decisions/0025). O(1), 0-alloc -- detect a `keys:'int'` filter without catching an error or a full `dump()`. |
+| `seed` | `number` | The 32-bit unsigned hash seed (decisions/0025). Dynamic members: the validated ctor seed. **XorFilter** / **BinaryFuse**: the WINNING build seed (the build reseeds until the peel succeeds). |
+| `maxLoad` | `number` | The item ceiling as an **UPPER BOUND** (decisions/0026): an add past it CERTAINLY throws; below it MAY still throw on **Cuckoo** / **Quotient**. `Infinity` (Bloom class), `nb*b` (**Cuckoo**), `floor(0.90*nslots)` (**Quotient**, tracks `resize()`), `size` (static, always built). Not a promise of remaining room. |
+| `saturation` | `number` | `size / maxLoad` in `[0, 1]` (decisions/0026): 0 when `maxLoad` is `Infinity` or 0, 1 on a built static filter, never NaN. |
 | `fpp()` | `number` | Configured target while empty, else the fill-derived estimate (**Cuckoo** / **Quotient** / **XorFilter** / **BinaryFuse**: the width-quantized rate). |
 | `clear()` | `void` / `never` | Reset to empty (zeroes the store in place). **XorFilter** / **BinaryFuse**: static, **throws** `[lite-filter]`. |
 | `stats()` / `resetStats()` | -- | Require `{ stats: true }`; fail closed otherwise. |
@@ -470,13 +477,22 @@ set, `fpp < 2^-16`, and 100 exhausted peel attempts (a degenerate key set).
 const f = new Bloom(1_000_000, { fpp: 0.001, keys: 'int' });
 f.add(42);                 // mixed directly -- no string encoding, no allocation
 f.mightContain(42);        // true
-f.add(2 ** 31);            // throws [lite-filter]: keys:'int' requires a 32-bit signed integer
+f.add(2 ** 31);            // throws [lite-filter]: keys:'int' requires a 32-bit signed integer ...
+
+// Folding a composite signature? Use `| 0`, NEVER `>>> 0`:
+f.add(((sid << 20) | (op << 12) | code) | 0);   // signed int32 -- accepted, 0-alloc
 ```
 
-`keys: 'int'` restricts keys to 32-bit signed integers (`-2147483648 .. 2147483647`)
+`keys: 'int'` restricts keys to 32-bit **signed** integers (`-2147483648 .. 2147483647`)
 and takes an integer-mix hash path that never encodes a string -- the mode the perf
 gate proves is 0 B/op. String keys on the default backing are also alloc-free (they
 hash over their code units); only a non-string, non-int key pays a `String()` encode.
+
+**The signed-fold trap (decisions/0024).** The domain is SIGNED int32, so a composite
+signature MUST be folded with `| 0`, not `>>> 0`. A `>>> 0` fold yields values in
+`[2^31, 2^32)` for half its domain, and `add()`/`mightContain()` THROW fail-closed on
+exactly those keys (never a silent alias of two distinct numbers). The int-key error text
+names the fix. `((sid << 20) | (op << 12) | code) | 0` stays in range and allocates nothing.
 
 ### Stats -- opt-in runtime counters
 
@@ -540,7 +556,7 @@ const rows = runBench({ cap: 100000, fpp: 0.01 });
 
 | Export | Meaning |
 | --- | --- |
-| `VERSION` | the package version string (`"1.1.0"`) |
+| `VERSION` | the package version string (`"1.2.0"`) |
 | `Bloom` | the reference member (also the default export) |
 | `CountingBloom` | the deletable member (4-bit saturating counters; a real `remove`) |
 | `BlockedBloom` | the cache-local member (one 512-bit block per key; one cache miss per query, at a higher measured FPR) |
@@ -698,11 +714,13 @@ machine-local -- run `npm run bench`.
 
 ## Testing
 
-`node:test` only, zero runtime deps -- **497 deterministic tests** across the boundary
+`node:test` only, zero runtime deps -- **516 deterministic tests** across the boundary
 suite. The gates (`npm run verify` runs all of them):
 
 - `npm test` -- the boundary suite: every method, every one-sided law, every
-  fail-closed door, plus an ASCII-source guard.
+  fail-closed door, plus an ASCII-source guard and an introspection suite (the
+  `keysMode` / `seed` / `maxLoad` / `saturation` getters against MEASURED ceilings,
+  and the signed-fold door both ways).
 - `npm run test:types` -- `tsc --noEmit` proves `Bloom`, `CountingBloom`,
   `BlockedBloom`, `Cuckoo`, and `Quotient` satisfy `LiteFilter<K>`, that `CountingBloom`,
   `Cuckoo`, and `Quotient` `remove` are a real `boolean` (and `Quotient.resize`/`merge`
@@ -723,13 +741,18 @@ suite. The gates (`npm run verify` runs all of them):
   regression gate; MEASURED slots/item in [1.08, 1.13] (2dp) and bits/item <= 9.30; a non-vacuous
   width-quantized FPR; PROVEN fail-closed exhaustion + immutability + inconsistent-geometry
   restore throws; 50 build-then-drop retention cycles)
+  + a NEGATIVE int32 oracle lane (INT_MIN..-1 plus the INT_MIN / INT_MAX edges, 0 false
+  negatives on every int-capable member)
   + the `clear()` ArrayBuffer-identity check for the five mutable members.
 - `npm run torture:controls` -- the must-fail proof: a broken build MUST fail.
 - `npm run test:perf` -- the `@zakkster/lite-perf-gate` zero-alloc scenarios on
   `keys:'int'` (Bloom add-churn + query-hit; CountingBloom add-churn + query-hit +
   remove-churn; BlockedBloom add-churn + query-hit; Cuckoo add-churn + query-hit +
   remove-churn; Quotient add-churn + query-hit + remove-churn; XorFilter query-hit;
-  BinaryFuse query-hit), with an allocating mustFail for teeth.
+  BinaryFuse query-hit), a NEGATIVE-int32 lane per int-capable member (all `maxScavenges 0`),
+  plus ONE amortized default-backing lane (fractional / large numbers, String()-encoded) under
+  an explicit measured BYTE budget, with an allocating mustFail for teeth.
+- `npm run test:demo` -- the shipped demo's own boundary suite (`demo/Demo.test.mjs`).
 - `npm run bench` -- the measurement tool.
 
 ## What this is not

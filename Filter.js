@@ -101,7 +101,7 @@
  * @license MIT
  */
 
-export const VERSION = "1.1.0";
+export const VERSION = "1.2.0";
 
 /* -------------------------------------------------------------------------- *
  * Constants + fail-closed messages (built ONCE, thrown only on misuse).
@@ -112,9 +112,19 @@ export const VERSION = "1.1.0";
 const INT_MIN = -2147483648;
 const INT_MAX = 2147483647;
 
-/** Fail-closed message for a bad integer-mode key (decisions/0001). Built once. */
+/** The two keysMode strings (decisions/0025). Module constants, never built per call,
+ *  so the `keysMode` getter is O(1) and 0-alloc. `'int'` == the strict-zero-alloc integer
+ *  backing; `'arbitrary'` == the default (String()-encoding) backing. */
+const KEYS_INT = "int";
+const KEYS_ARBITRARY = "arbitrary";
+
+/** Fail-closed message for a bad integer-mode key (decisions/0001, 0024). The domain is a
+ *  SIGNED int32 [-2^31, 2^31 - 1]; a composite signature must be folded with `| 0`, never
+ *  `>>> 0` (which yields values in [2^31, 2^32) that this door rejects). The message names
+ *  the fix. Built once, thrown only on a bad key. */
 const INT_KEY_MSG =
-    "[lite-filter] keys:'int' requires a 32-bit signed integer key, got ";
+    "[lite-filter] keys:'int' requires a 32-bit signed integer key; fold a composite " +
+    "signature with `| 0`, never `>>> 0` (which yields [2^31, 2^32) and throws), got ";
 
 /** Fail-closed message for remove() on an add-only member (decisions/0003). Bloom
  *  cannot delete: clearing k bits would corrupt every other key that shares one of
@@ -202,7 +212,7 @@ const CUCKOO_FPP_MSG =
 const CUCKOO_FULL_MSG =
     "[lite-filter] Cuckoo insert failed after 500 kicks: the filter is at capacity (load " +
     "factor too high). Raise the capacity (size up) -- the overload is FAIL-CLOSED, never " +
-    "a silent drop. Observe headroom via size vs capacity before it bites.";
+    "a silent drop. Observe headroom via saturation (size / maxLoad); maxLoad is an upper bound.";
 
 /** Quotient filter load ceiling (decisions/0016): 0.90. The slot count is the
  *  smallest power of two `2^q >= ceil(capacity / 0.90)`, so a filter sized for
@@ -250,7 +260,7 @@ const QF_FULL_MSG =
     "[lite-filter] Quotient insert failed: the filter is at the 0.90 load ceiling (or the " +
     "cluster shift would run off the end). Raise the capacity (size up) or resize() -- the " +
     "overload is FAIL-CLOSED and a byte-identical no-op, never a silent drop. Observe " +
-    "headroom via size vs capacity before it bites.";
+    "headroom via saturation (size / maxLoad); maxLoad is an upper bound.";
 
 /** Fail-closed message when merge() is called with a filter of non-identical params
  *  (decisions/0016). merge requires the SAME seed, remainder width, fingerprint bit
@@ -1259,6 +1269,15 @@ export class Bloom {
     get count() { return this._count; }
     get capacity() { return this._cap; }
 
+    /** The configured key mode (decisions/0025); O(1), 0-alloc: 'int' | 'arbitrary'. */
+    get keysMode() { return this._int ? KEYS_INT : KEYS_ARBITRARY; }
+    /** The 32-bit unsigned hash seed (decisions/0025): the validated constructor seed. */
+    get seed() { return this._seed >>> 0; }
+    /** Item ceiling as an UPPER BOUND (decisions/0026): adds never fail here (Infinity); the FPR degrades instead -- watch fpp(). */
+    get maxLoad() { return Infinity; }
+    /** size / maxLoad in [0, 1] (decisions/0026); 0 when maxLoad is Infinity or 0, never NaN. */
+    get saturation() { const ml = this.maxLoad; return ml === Infinity || ml === 0 ? 0 : this._count / ml; }
+
     // --- hot path (zero allocation; strict on keys:'int') ---------------------
 
     /**
@@ -1565,6 +1584,15 @@ export class CountingBloom {
     get size() { return this._count; }
     get count() { return this._count; }
     get capacity() { return this._cap; }
+
+    /** The configured key mode (decisions/0025); O(1), 0-alloc: 'int' | 'arbitrary'. */
+    get keysMode() { return this._int ? KEYS_INT : KEYS_ARBITRARY; }
+    /** The 32-bit unsigned hash seed (decisions/0025): the validated constructor seed. */
+    get seed() { return this._seed >>> 0; }
+    /** Item ceiling as an UPPER BOUND (decisions/0026): adds never fail here (Infinity); the FPR degrades instead -- watch fpp(). */
+    get maxLoad() { return Infinity; }
+    /** size / maxLoad in [0, 1] (decisions/0026); 0 when maxLoad is Infinity or 0, never NaN. */
+    get saturation() { const ml = this.maxLoad; return ml === Infinity || ml === 0 ? 0 : this._count / ml; }
 
     // --- hot path (zero allocation; strict on keys:'int') ---------------------
 
@@ -1921,6 +1949,15 @@ export class BlockedBloom {
     get count() { return this._count; }
     get capacity() { return this._cap; }
 
+    /** The configured key mode (decisions/0025); O(1), 0-alloc: 'int' | 'arbitrary'. */
+    get keysMode() { return this._int ? KEYS_INT : KEYS_ARBITRARY; }
+    /** The 32-bit unsigned hash seed (decisions/0025): the validated constructor seed. */
+    get seed() { return this._seed >>> 0; }
+    /** Item ceiling as an UPPER BOUND (decisions/0026): adds never fail here (Infinity); the FPR degrades instead -- watch fpp(). */
+    get maxLoad() { return Infinity; }
+    /** size / maxLoad in [0, 1] (decisions/0026); 0 when maxLoad is Infinity or 0, never NaN. */
+    get saturation() { const ml = this.maxLoad; return ml === Infinity || ml === 0 ? 0 : this._count / ml; }
+
     // --- hot path (zero allocation; strict on keys:'int') ---------------------
 
     /**
@@ -2245,6 +2282,15 @@ export class Cuckoo {
     get size() { return this._count; }
     get count() { return this._count; }
     get capacity() { return this._cap; }
+
+    /** The configured key mode (decisions/0025); O(1), 0-alloc: 'int' | 'arbitrary'. */
+    get keysMode() { return this._int ? KEYS_INT : KEYS_ARBITRARY; }
+    /** The 32-bit unsigned hash seed (decisions/0025): the validated constructor seed. */
+    get seed() { return this._seed >>> 0; }
+    /** Item ceiling as an UPPER BOUND (decisions/0026): nb * b slots; an add below it may still throw when the 500-kick budget is exhausted. */
+    get maxLoad() { return this._nb * this._b; }
+    /** size / maxLoad in [0, 1] (decisions/0026); 0 when maxLoad is Infinity or 0, never NaN. */
+    get saturation() { const ml = this.maxLoad; return ml === Infinity || ml === 0 ? 0 : this._count / ml; }
 
     // --- hot path (zero allocation; strict on keys:'int') ---------------------
 
@@ -2705,6 +2751,15 @@ export class Quotient {
     get size() { return this._count; }
     get count() { return this._count; }
     get capacity() { return this._cap; }
+
+    /** The configured key mode (decisions/0025); O(1), 0-alloc: 'int' | 'arbitrary'. */
+    get keysMode() { return this._int ? KEYS_INT : KEYS_ARBITRARY; }
+    /** The 32-bit unsigned hash seed (decisions/0025): the validated constructor seed. */
+    get seed() { return this._seed >>> 0; }
+    /** Item ceiling as an UPPER BOUND (decisions/0026): floor(0.90 * nslots); an add below it may still throw on a cluster-shift run-off. */
+    get maxLoad() { return this._maxLoad; }
+    /** size / maxLoad in [0, 1] (decisions/0026); 0 when maxLoad is Infinity or 0, never NaN. */
+    get saturation() { const ml = this.maxLoad; return ml === Infinity || ml === 0 ? 0 : this._count / ml; }
 
     // --- hot path (zero allocation; strict on keys:'int') ---------------------
 
@@ -3410,6 +3465,15 @@ export class XorFilter {
     get count() { return this._count; }
     get capacity() { return this._cap; }
 
+    /** The configured key mode (decisions/0025); O(1), 0-alloc: 'int' | 'arbitrary'. */
+    get keysMode() { return this._int ? KEYS_INT : KEYS_ARBITRARY; }
+    /** The 32-bit unsigned hash seed (decisions/0025): the WINNING build seed (reseeds until peeling succeeds); the 0 sentinel is never observable (only from() / restore() construct). */
+    get seed() { return this._seed >>> 0; }
+    /** Item ceiling as an UPPER BOUND (decisions/0026): size once built (a static set is frozen; only from() / restore() construct). */
+    get maxLoad() { return this._count; }
+    /** size / maxLoad in [0, 1] (decisions/0026); 0 when maxLoad is Infinity or 0, never NaN. */
+    get saturation() { const ml = this.maxLoad; return ml === Infinity || ml === 0 ? 0 : this._count / ml; }
+
     // --- hot path (zero allocation; strict on keys:'int') ---------------------
 
     /**
@@ -3462,16 +3526,6 @@ export class XorFilter {
      *  set. THROWS `[lite-filter]` fail-closed rather than silently emptying a member whose
      *  whole contract is "the set it was built from" -- a cleared XOR filter is undefined. */
     clear() { throw new Error(XOR_STATIC_MSG); }
-
-    /**
-     * Hash an arbitrary key to a 32-bit base (decisions/0001). A string hashes over its
-     * code units (alloc-free); any other type is `String()`-encoded first (the honest
-     * amortized caveat). Never called on the keys:'int' path.
-     */
-    _hashKey(key) {
-        if (typeof key === "string") return hashStr(key, this._seed);
-        return hashStr(String(key), this._seed);
-    }
 
     // --- cold inspection ------------------------------------------------------
 
@@ -3780,6 +3834,15 @@ export class BinaryFuse {
     get count() { return this._count; }
     get capacity() { return this._cap; }
 
+    /** The configured key mode (decisions/0025); O(1), 0-alloc: 'int' | 'arbitrary'. */
+    get keysMode() { return this._int ? KEYS_INT : KEYS_ARBITRARY; }
+    /** The 32-bit unsigned hash seed (decisions/0025): the WINNING build seed (reseeds until peeling succeeds); the 0 sentinel is never observable (only from() / restore() construct). */
+    get seed() { return this._seed >>> 0; }
+    /** Item ceiling as an UPPER BOUND (decisions/0026): size once built (a static set is frozen; only from() / restore() construct). */
+    get maxLoad() { return this._count; }
+    /** size / maxLoad in [0, 1] (decisions/0026); 0 when maxLoad is Infinity or 0, never NaN. */
+    get saturation() { const ml = this.maxLoad; return ml === Infinity || ml === 0 ? 0 : this._count / ml; }
+
     // --- hot path (zero allocation; strict on keys:'int') ---------------------
 
     /**
@@ -3835,16 +3898,6 @@ export class BinaryFuse {
     /** A static filter has nothing to clear TO (decisions/0022): its identity IS its key set.
      *  THROWS `[lite-filter]` fail-closed rather than silently emptying it. */
     clear() { throw new Error(BF_STATIC_MSG); }
-
-    /**
-     * Hash an arbitrary key to a 32-bit base (decisions/0001). A string hashes over its code
-     * units (alloc-free); any other type is `String()`-encoded first (the honest amortized
-     * caveat). Never called on the keys:'int' path.
-     */
-    _hashKey(key) {
-        if (typeof key === "string") return hashStr(key, this._seed);
-        return hashStr(String(key), this._seed);
-    }
 
     // --- cold inspection ------------------------------------------------------
 

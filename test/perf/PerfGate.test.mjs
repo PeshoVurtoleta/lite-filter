@@ -29,6 +29,13 @@ import { Bloom, CountingBloom, BlockedBloom, Cuckoo, Quotient, XorFilter, Binary
 const CAP = 4096;
 const MASK = CAP - 1;
 
+/** The negative int32 lane domain (audit N4 / lite-hud M5): keys in
+ *  INT_MIN + [0, 2^30) -- deep negative territory, every value a valid int32 and a
+ *  V8 smi (no boxing on 64-bit), so add/query is strict zero-alloc just like the
+ *  positive half. INT_MIN itself is a member of the sampled band. */
+const INT_MIN = -2147483648;
+const NEG_MASK = 0x3fffffff;
+
 /** The zero-alloc counter: the bit store's byte length, fixed at construction. Its
  *  delta across the whole window must be 0 (the substrate never reallocates). */
 function bitsBytes(c) { return c._words.buffer.byteLength; }
@@ -333,6 +340,134 @@ const bfQueryHit = {
     statsOf(s) { return { grows: bfBytes(s.c) }; },
 };
 
+/* -------------------------------------------------------------------------- *
+ * NEGATIVE int32 lanes (audit N4 / lite-hud M5). One lane per int-capable member,
+ * keys drawn from INT_MIN + [0, 2^30) so the negative half of the keys:'int' domain
+ * is gated at maxScavenges 0 alongside the positive lanes -- proving the M5 negative
+ * signatures never box (measured 0 heap growth in the 2026-09-23 audit).
+ * -------------------------------------------------------------------------- */
+
+/** Bloom negative add-churn: fresh negative int keys, each setting k bits in place. */
+const negBloomAdd = {
+    name: "Bloom add-churn (negative int)",
+    setup() { return { c: new Bloom(CAP, { fpp: 0.01, keys: "int" }), k: 0 }; },
+    hot(s, n) {
+        const c = s.c;
+        let k = s.k | 0;
+        for (let i = 0; i < n; i++) { c.add((INT_MIN + (k & NEG_MASK)) | 0); k = (k + 1) | 0; }
+        s.k = k | 0;
+    },
+    statsOf(s) { return { grows: bitsBytes(s.c) }; },
+};
+
+/** CountingBloom negative add-churn: fresh negative int keys, nibble increments in place. */
+const negCbfAdd = {
+    name: "CountingBloom add-churn (negative int)",
+    setup() { return { c: new CountingBloom(CAP, { fpp: 0.01, keys: "int" }), k: 0 }; },
+    hot(s, n) {
+        const c = s.c;
+        let k = s.k | 0;
+        for (let i = 0; i < n; i++) { c.add((INT_MIN + (k & NEG_MASK)) | 0); k = (k + 1) | 0; }
+        s.k = k | 0;
+    },
+    statsOf(s) { return { grows: cntsBytes(s.c) }; },
+};
+
+/** BlockedBloom negative add-churn: fresh negative int keys, one block per op. */
+const negBbAdd = {
+    name: "BlockedBloom add-churn (negative int)",
+    setup() { return { c: new BlockedBloom(CAP, { fpp: 0.01, keys: "int" }), k: 0 }; },
+    hot(s, n) {
+        const c = s.c;
+        let k = s.k | 0;
+        for (let i = 0; i < n; i++) { c.add((INT_MIN + (k & NEG_MASK)) | 0); k = (k + 1) | 0; }
+        s.k = k | 0;
+    },
+    statsOf(s) { return { grows: bitsBytes(s.c) }; },
+};
+
+/** Cuckoo negative add-churn: fresh negative int keys; clear() at half load keeps the
+ *  table under the kick ceiling so no add throws -- both clear() and add() zero-alloc. */
+const negCfAdd = {
+    name: "Cuckoo add-churn (negative int)",
+    setup() {
+        const c = new Cuckoo(CAP, { fpp: 0.01, keys: "int" });
+        return { c, k: 0, limit: c._store.length >> 1 };
+    },
+    hot(s, n) {
+        const c = s.c;
+        let k = s.k | 0;
+        const lim = s.limit;
+        for (let i = 0; i < n; i++) {
+            if (c.size >= lim) c.clear();
+            c.add((INT_MIN + (k & NEG_MASK)) | 0);
+            k = (k + 1) | 0;
+        }
+        s.k = k | 0;
+    },
+    statsOf(s) { return { grows: storeBytes(s.c) }; },
+};
+
+/** Quotient negative add-churn: fresh negative int keys; clear() at ~0.45 load keeps
+ *  occupancy under the ceiling so no add throws -- both clear() and add() zero-alloc. */
+const negQfAdd = {
+    name: "Quotient add-churn (negative int)",
+    setup() {
+        const c = new Quotient(CAP, { fpp: 0.01, keys: "int" });
+        return { c, k: 0, limit: Math.floor(0.45 * c._nslots) };
+    },
+    hot(s, n) {
+        const c = s.c;
+        let k = s.k | 0;
+        const lim = s.limit;
+        for (let i = 0; i < n; i++) {
+            if (c.size >= lim) c.clear();
+            c.add((INT_MIN + (k & NEG_MASK)) | 0);
+            k = (k + 1) | 0;
+        }
+        s.k = k | 0;
+    },
+    statsOf(s) { return { grows: qfBytes(s.c) }; },
+};
+
+/** XOR negative query-hit: a STATIC filter built once from CAP negative int keys; every
+ *  op is a present-key positive (query-only, zero-alloc). Build is cold, in setup(). */
+const negXfQuery = {
+    name: "Xor query-hit (negative int)",
+    setup() {
+        const keys = new Array(CAP);
+        for (let i = 0; i < CAP; i++) keys[i] = (INT_MIN + i) | 0;
+        const c = XorFilter.from(keys, { fpp: 0.01, keys: "int" });
+        return { c, acc: 0 };
+    },
+    hot(s, n) {
+        const c = s.c;
+        let acc = s.acc | 0;
+        for (let i = 0; i < n; i++) acc = (acc + (c.mightContain((INT_MIN + (i & MASK)) | 0) ? 1 : 0)) | 0;
+        s.acc = acc | 0;
+    },
+    statsOf(s) { return { grows: xfBytes(s.c) }; },
+};
+
+/** BinaryFuse negative query-hit: a STATIC filter built once from CAP negative int keys;
+ *  every op is a present-key positive (query-only, zero-alloc). Build is cold, in setup(). */
+const negBfQuery = {
+    name: "BinaryFuse query-hit (negative int)",
+    setup() {
+        const keys = new Array(CAP);
+        for (let i = 0; i < CAP; i++) keys[i] = (INT_MIN + i) | 0;
+        const c = BinaryFuse.from(keys, { fpp: 0.01, keys: "int" });
+        return { c, acc: 0 };
+    },
+    hot(s, n) {
+        const c = s.c;
+        let acc = s.acc | 0;
+        for (let i = 0; i < n; i++) acc = (acc + (c.mightContain((INT_MIN + (i & MASK)) | 0) ? 1 : 0)) | 0;
+        s.acc = acc | 0;
+    },
+    statsOf(s) { return { grows: bfBytes(s.c) }; },
+};
+
 /**
  * The teeth: an object-key churn on the default backing that String()-encodes one
  * fresh object key per op -- it MUST trip the gate (scavenges scale with n).
@@ -353,8 +488,56 @@ zgcSuite({
     maxArrayBuffersKB: 0,
     counters: { grows: 0 },
     scenarios: [addChurn, queryHit, cbfAddChurn, cbfQueryHit, cbfRemoveChurn, bbAddChurn, bbQueryHit,
-        cfAddChurn, cfQueryHit, cfRemoveChurn, qfAddChurn, qfQueryHit, qfRemoveChurn, xfQueryHit, bfQueryHit],
+        cfAddChurn, cfQueryHit, cfRemoveChurn, qfAddChurn, qfQueryHit, qfRemoveChurn, xfQueryHit, bfQueryHit,
+        negBloomAdd, negCbfAdd, negBbAdd, negCfAdd, negQfAdd, negXfQuery, negBfQuery],
     mustFail: [mustFailAlloc],
+});
+
+/**
+ * The amortized DEFAULT-backing lane (audit N5, documented -- NOT zero-alloc). Fractional
+ * and large (> INT_MAX) numbers on the arbitrary-key backing String()-encode one transient
+ * string per op: honest AMORTIZED allocation, so it lives OUTSIDE the maxScavenges:0
+ * zgcSuite above, under an explicit BYTE budget instead. Measured 2026-09-23 on
+ * `node --max-semi-space-size=4` at N=200000: p95 ~= 51.6 B/op across 4x12 runs; the budget
+ * is p95 x2 = 104 B/op -- a ceiling on amortized bytes/op, so a per-op regression (a second
+ * encode, a boxed key) blows past it. Never widen it to pass; fix the code.
+ *
+ * A FLOOR pairs the ceiling (reviewer nit, H1): the lane is honestly amortized, never 0 --
+ * measured ~41-52 B/op across runs. A silent collapse to 0 (e.g. a broken measurement, or an
+ * accidental fast-path that stops encoding) would pass the ceiling vacuously and hide a real
+ * regression in the OTHER direction (the lane stops measuring anything). AMORT_FLOOR is a
+ * conservative lower bound, well under the measured range, never widened to chase a fluke.
+ */
+test("perf-gate amortized: default-backing fractional/large numbers stay under the byte budget", () => {
+    const AMORT_BUDGET = 104;   // B/op = measured p95 (~51.6) x 2
+    const AMORT_FLOOR = 8;      // B/op = conservative lower bound; measured range is ~41-52
+    const N = 200000;
+    const measureOnce = () => {
+        const c = new Bloom(1 << 16, {});          // default (arbitrary-key) backing
+        c.add(1.5); c.mightContain(1.5);           // warm the encode path outside the bracket
+        globalThis.gc(); globalThis.gc();
+        const before = process.memoryUsage().heapUsed;
+        let acc = 0;
+        for (let i = 0; i < N; i++) {
+            c.add(i + 0.5);                                       // fractional
+            acc += c.mightContain(9007199254740000 + i) ? 1 : 0; // large (> INT_MAX)
+        }
+        const after = process.memoryUsage().heapUsed;
+        if (acc === -1) throw new Error("unreachable");          // keep acc observable (no DCE)
+        return Math.max(0, (after - before) / N);
+    };
+    // Median of several runs to shed heapUsed sampling noise (the discipline torture uses
+    // for allocPerOp): a single GC-timing spike must not fail an amortized gate.
+    const runs = [];
+    for (let r = 0; r < 7; r++) runs.push(measureOnce());
+    runs.sort((a, b) => a - b);
+    const median = runs[runs.length >> 1];
+    assert.ok(median <= AMORT_BUDGET,
+        "amortized B/op " + median.toFixed(1) + " over budget " + AMORT_BUDGET +
+        " (measured p95 ~51.6 x2) -- a per-op regression, not noise");
+    assert.ok(median >= AMORT_FLOOR,
+        "amortized B/op " + median.toFixed(1) + " under floor " + AMORT_FLOOR +
+        " -- a collapse to ~0 B/op is a vacuous pass, not proof the lane still measures anything");
 });
 
 /** A plain cross-check (no measured window): the int hot paths never allocate a

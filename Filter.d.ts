@@ -111,7 +111,11 @@ export interface FilterOptions {
   fpp?: number;
   /** Hash seed (32-bit-coercible). Default is a fixed constant for determinism. */
   seed?: number;
-  /** Opt into the strict-zero-alloc 32-bit-integer backing. */
+  /** Opt into the strict-zero-alloc 32-bit-integer backing. The domain is a SIGNED int32
+   *  `[-2^31, 2^31 - 1]` (decisions/0001, 0024): fold a composite signature with `| 0`, NEVER
+   *  `>>> 0`. A `>>> 0` fold yields values in `[2^31, 2^32)` and THROWS on the hot path for
+   *  half its domain; `| 0` keeps the result in range and allocates nothing. Example:
+   *  `filter.add(((sid << 20) | (op << 12) | code) | 0)`. */
   keys?: "int";
   /** Mint the per-instance stats holder. OFF by default. */
   stats?: boolean;
@@ -143,6 +147,26 @@ export interface LiteFilter<K> {
   readonly count: number;
   /** The item count the filter was sized for at construction. */
   readonly capacity: number;
+  /** The key mode this filter was constructed in (decisions/0025): `'int'` for the
+   *  strict-zero-alloc integer backing, `'arbitrary'` for the default (String()-encoding)
+   *  backing. O(1), allocation-free. */
+  readonly keysMode: "int" | "arbitrary";
+  /** The 32-bit unsigned hash seed (decisions/0025). On the dynamic members it is the
+   *  validated constructor seed; on the STATIC members (XorFilter / BinaryFuse) it is the
+   *  WINNING build seed -- the build reseeds until the peel succeeds -- a static
+   *  instance is only reachable built (from() / restore()). O(1), allocation-free. */
+  readonly seed: number;
+  /** The hard item ceiling as an UPPER BOUND (decisions/0026): an add past `maxLoad`
+   *  CERTAINLY throws; an add below it MAY still throw on Cuckoo (kick budget) and Quotient
+   *  (cluster shift). `Infinity` on the Bloom-class members (adds never fail; the FPR
+   *  degrades -- watch `fpp()`); `nb*b` on Cuckoo; `floor(0.90*nslots)` on Quotient (tracks
+   *  `resize()`); `size` on a built static member (always built -- from() / restore() are the only doors). Do NOT read it as a
+   *  promise of remaining capacity. O(1), allocation-free. */
+  readonly maxLoad: number;
+  /** `size / maxLoad`, in [0, 1] (decisions/0026): a headroom gauge, NOT a promise. It is
+   *  0 when `maxLoad` is `Infinity` (Bloom class) or 0 (an unbuilt static filter), 1 on a
+   *  built static filter (full by construction), and NEVER NaN. O(1), allocation-free. */
+  readonly saturation: number;
   /** The configured target fpp while empty, else the fill-derived estimate. */
   fpp(): number;
   /** Reset to empty. Allocates nothing (zeroes the store in place). */
@@ -169,6 +193,14 @@ export class Bloom<K = unknown> implements LiteFilter<K> {
   readonly size: number;
   readonly count: number;
   readonly capacity: number;
+  /** The key mode (decisions/0025): `'int'` | `'arbitrary'`. O(1), allocation-free. */
+  readonly keysMode: "int" | "arbitrary";
+  /** The 32-bit unsigned hash seed -- the validated constructor seed (decisions/0025). */
+  readonly seed: number;
+  /** UPPER BOUND (decisions/0026): `Infinity` -- adds never fail; the FPR degrades, watch `fpp()`. */
+  readonly maxLoad: number;
+  /** `size / maxLoad` in [0, 1]; 0 here (`maxLoad` is `Infinity`), never NaN (decisions/0026). */
+  readonly saturation: number;
   fpp(): number;
   clear(): void;
   stats(): FilterStats;
@@ -199,6 +231,14 @@ export class CountingBloom<K = unknown> implements LiteFilter<K> {
   readonly size: number;
   readonly count: number;
   readonly capacity: number;
+  /** The key mode (decisions/0025): `'int'` | `'arbitrary'`. O(1), allocation-free. */
+  readonly keysMode: "int" | "arbitrary";
+  /** The 32-bit unsigned hash seed -- the validated constructor seed (decisions/0025). */
+  readonly seed: number;
+  /** UPPER BOUND (decisions/0026): `Infinity` -- adds never fail; the FPR degrades, watch `fpp()`. */
+  readonly maxLoad: number;
+  /** `size / maxLoad` in [0, 1]; 0 here (`maxLoad` is `Infinity`), never NaN (decisions/0026). */
+  readonly saturation: number;
   fpp(): number;
   clear(): void;
   stats(): FilterStats;
@@ -228,6 +268,14 @@ export class BlockedBloom<K = unknown> implements LiteFilter<K> {
   readonly size: number;
   readonly count: number;
   readonly capacity: number;
+  /** The key mode (decisions/0025): `'int'` | `'arbitrary'`. O(1), allocation-free. */
+  readonly keysMode: "int" | "arbitrary";
+  /** The 32-bit unsigned hash seed -- the validated constructor seed (decisions/0025). */
+  readonly seed: number;
+  /** UPPER BOUND (decisions/0026): `Infinity` -- adds never fail; the FPR degrades, watch `fpp()`. */
+  readonly maxLoad: number;
+  /** `size / maxLoad` in [0, 1]; 0 here (`maxLoad` is `Infinity`), never NaN (decisions/0026). */
+  readonly saturation: number;
   /** The plain-Bloom closed-form FLOOR (blocked runs OVER it); MEASURE the real rate. */
   fpp(): number;
   clear(): void;
@@ -263,6 +311,15 @@ export class Cuckoo<K = unknown> implements LiteFilter<K> {
   readonly size: number;
   readonly count: number;
   readonly capacity: number;
+  /** The key mode (decisions/0025): `'int'` | `'arbitrary'`. O(1), allocation-free. */
+  readonly keysMode: "int" | "arbitrary";
+  /** The 32-bit unsigned hash seed -- the validated constructor seed (decisions/0025). */
+  readonly seed: number;
+  /** UPPER BOUND (decisions/0026): `nb*b` slots. An add below it MAY still throw once the
+   *  500-kick eviction budget is exhausted -- read it as a ceiling, never as remaining room. */
+  readonly maxLoad: number;
+  /** `size / maxLoad` in [0, 1] (decisions/0026): a headroom gauge, not a promise. Never NaN. */
+  readonly saturation: number;
   /** The configured target while empty, else the width-quantized `2b/2^f`. MEASURE. */
   fpp(): number;
   clear(): void;
@@ -303,6 +360,15 @@ export class Quotient<K = unknown> implements LiteFilter<K> {
   readonly size: number;
   readonly count: number;
   readonly capacity: number;
+  /** The key mode (decisions/0025): `'int'` | `'arbitrary'`. O(1), allocation-free. */
+  readonly keysMode: "int" | "arbitrary";
+  /** The 32-bit unsigned hash seed -- the validated constructor seed (decisions/0025). */
+  readonly seed: number;
+  /** UPPER BOUND (decisions/0026): `floor(0.90*nslots)` (tracks `resize()`). An add below it
+   *  MAY still throw when the linear cluster shift runs off the end -- a ceiling, not room. */
+  readonly maxLoad: number;
+  /** `size / maxLoad` in [0, 1] (decisions/0026): a headroom gauge, not a promise. Never NaN. */
+  readonly saturation: number;
   /** The configured target while empty, else the remainder-quantized `load * 2^-r`. */
   fpp(): number;
   clear(): void;
@@ -358,6 +424,15 @@ export class XorFilter<K = unknown> {
   readonly count: number;
   /** The deduped key count (== size; an XOR filter is built from exactly its set). */
   readonly capacity: number;
+  /** The key mode (decisions/0025): `'int'` | `'arbitrary'`. O(1), allocation-free. */
+  readonly keysMode: "int" | "arbitrary";
+  /** The 32-bit unsigned hash seed: the WINNING build seed (the build reseeds until the peel
+   *  succeeds, decisions/0018, 0025). Only reachable built (from() / restore()). */
+  readonly seed: number;
+  /** UPPER BOUND (decisions/0026): `size` once built (a static set is frozen -- `add` throws). */
+  readonly maxLoad: number;
+  /** `size / maxLoad` in [0, 1] (decisions/0026): 1 on a built filter (full by construction), never NaN. */
+  readonly saturation: number;
   /** The width-quantized `2^-fw` (typically below the configured target). MEASURE. */
   fpp(): number;
   /** The live per-instance stats holder. Throws without `{ stats: true }`. */
@@ -412,6 +487,15 @@ export class BinaryFuse<K = unknown> {
   readonly count: number;
   /** The deduped key count (== size; a Binary Fuse filter is built from exactly its set). */
   readonly capacity: number;
+  /** The key mode (decisions/0025): `'int'` | `'arbitrary'`. O(1), allocation-free. */
+  readonly keysMode: "int" | "arbitrary";
+  /** The 32-bit unsigned hash seed: the WINNING build seed (the build reseeds until the peel
+   *  succeeds, decisions/0022, 0025). Only reachable built (from() / restore()). */
+  readonly seed: number;
+  /** UPPER BOUND (decisions/0026): `size` once built (a static set is frozen -- `add` throws). */
+  readonly maxLoad: number;
+  /** `size / maxLoad` in [0, 1] (decisions/0026): 1 on a built filter (full by construction), never NaN. */
+  readonly saturation: number;
   /** The width-quantized `2^-fw` (typically below the configured target). MEASURE. */
   fpp(): number;
   /** The live per-instance stats holder. Throws without `{ stats: true }`. */

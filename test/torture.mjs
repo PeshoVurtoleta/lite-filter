@@ -55,7 +55,7 @@ async function main() {
     const { Bloom, CountingBloom, BlockedBloom, Cuckoo, Quotient, XorFilter, BinaryFuse } = await import("../Filter.js");
     const { validate, validateCounting, validateBlocked, validateCuckoo, validateQuotient, validateXor, validateBinaryFuse } =
         await import("./validate.mjs");
-    const { differentialInt, differentialChurnInt, differentialResizeInt, differentialMergeInt, differentialStaticInt } =
+    const { differentialInt, differentialChurnInt, differentialResizeInt, differentialMergeInt, differentialStaticInt, differentialNegInt } =
         await import("./torture/oracle.mjs");
 
     const SEED = (process.env.TORTURE_SEED >>> 0) || 0x1f2e3d4c;
@@ -614,6 +614,20 @@ async function main() {
         for (let i = 0; i < 1000; i++) if (!sf.mightContain(i)) sabotageFn++;
     }
 
+    // ---- NEGATIVE int32 lane (audit N4 / lite-hud M5) ------------------------
+    // Every int-capable member must accept the NEGATIVE half of the keys:'int' domain
+    // (INT_MIN..-1) plus the INT_MIN / INT_MAX edges with 0 false negatives. The five
+    // dynamic members add incrementally; the two static members build via from(). A single
+    // false negative here voids the one-sided guarantee for the M5 negative-signature lane.
+    let negFn = 0;
+    negFn += differentialNegInt(Bloom, { n: 50000, fpp: 0.01, seed: SEED ^ 0x1a }).falseNegatives;
+    negFn += differentialNegInt(CountingBloom, { n: 50000, fpp: 0.01, seed: SEED ^ 0x2b }).falseNegatives;
+    negFn += differentialNegInt(BlockedBloom, { n: 50000, fpp: 0.01, seed: SEED ^ 0x3c }).falseNegatives;
+    negFn += differentialNegInt(Cuckoo, { n: 50000, fpp: 0.01, seed: SEED ^ 0x4d }).falseNegatives;
+    negFn += differentialNegInt(Quotient, { n: 50000, fpp: 0.01, seed: SEED ^ 0x5e }).falseNegatives;
+    negFn += differentialNegInt(XorFilter, { n: 50000, fpp: 0.01, seed: SEED ^ 0x6f, static: true }).falseNegatives;
+    negFn += differentialNegInt(BinaryFuse, { n: 50000, fpp: 0.01, seed: SEED ^ 0x70, static: true }).falseNegatives;
+
     // ---- verdict --------------------------------------------------------------
     const oracleOk =
         law1.falseNegatives === 0 &&
@@ -660,7 +674,8 @@ async function main() {
         bfBuildThrew === true &&
         bfMutThrew === true &&
         bfRestoreOk === true &&
-        snapChkOk === true;
+        snapChkOk === true &&
+        negFn === 0;
     const ok =
         report.ok &&
         live === 0 &&
@@ -712,6 +727,7 @@ async function main() {
         " buildThrew=" + bfBuildThrew + " mutThrew=" + bfMutThrew +
         " restoreOk=" + bfRestoreOk +
         " | snapChk=" + (snapChkOk ? "ok" : "FAIL") +
+        " negFn=" + negFn +
         " clearReuse=" + sameBuffer +
         " | " + (ok ? "ok" : "FAIL") + "\n");
 
@@ -809,6 +825,9 @@ async function main() {
             process.stderr.write("  BinaryFuse restore did NOT reject an inconsistent geometry / chk flip -- fail-open door broken (decisions/0021, 0022)\n");
         if (!snapChkOk)
             process.stderr.write("  SNAPSHOT CHECKSUM: a keys-mode / store-bit flip was NOT rejected -- the fail-open door is broken (decisions/0021)\n");
+        if (negFn > 0)
+            process.stderr.write("  NEGATIVE int32 FALSE NEGATIVE " + negFn +
+                " -- a member dropped an added key from the INT_MIN..-1 domain (audit N4 / M5)\n");
         if (law2.fpr > FPR_LIMIT)
             process.stderr.write("  FPR " + law2.fpr.toFixed(5) + " over limit " + FPR_LIMIT + "\n");
         if (bbLaw2.fpr > BB_FPR_LIMIT)
