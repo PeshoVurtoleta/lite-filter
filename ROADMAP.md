@@ -10,8 +10,8 @@
 > either proven by the shipped seeded bench in this repo or is a paper citation --
 > read `decisions/` and the bench for the shipped values, not this charter's targets.
 >
-> NEXT (2026-09-23): shipped at 1.1.0; post-audit hardening H1 -> 1.2.0 is planned in
-> section 12 (audit record: `RESEARCH.md`).
+> H1 COMPLETE (2026-09-23): post-audit hardening shipped and published as 1.2.0 --
+> section 12, audit record `RESEARCH.md`, rulings `decisions/0024..0026`.
 
 ASCII-only (`->`, `<=`, `>=`, `x`, "1.23x", never Unicode arrows or the
 multiplication sign). Suite law from `../CLAUDE.md` applies verbatim: npm scope
@@ -428,6 +428,12 @@ All six charter questions are now settled; the pointer after each is the shipped
 ---
 
 ## 12. Post-1.1 hardening -- H1 (1.2.0): the 2026-09-23 zero-GC audit close-out
+
+> COMPLETE (1.2.0, commit 1ec797d, published). Rulings: decisions/0024 (int32 stays signed; the error
+> names `| 0`), 0025 (keysMode / seed), 0026 (maxLoad as an UPPER BOUND + saturation). Exit gates:
+> 516/0 unit tests, torture ok (alloc=0 B/op, gc major=0, negFn=0), controls ok (3 arms), perf 30/0
+> (7 negative-int lanes at maxScavenges 0; amortized default-backing lane 8..104 B/op, median ~41),
+> test:demo 54 pass / 2 skipped, pack 8 files / 101.3 kB. N5 stays documented, not fixed.
 
 Source: the read-only adversarial audit of 2026-09-23 (RESEARCH.md). Verdict: the claim HOLDS for
 all seven members. Zero runtime deps, 0 B/op on every int hot path, a TRUE `maxScavenges: 0` perf
