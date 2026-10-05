@@ -453,7 +453,7 @@ set, `fpp < 2^-16`, and 100 exhausted peel attempts (a degenerate key set).
 
 | Method | Returns | Notes |
 | --- | --- | --- |
-| `add(key)` | `void` / `never` | Record a key. Zero-alloc on int + string keys. **XorFilter** / **BinaryFuse**: static, **throws** `[lite-filter]`. |
+| `add(key)` | `void` / `never` | Record a key. Zero-alloc on the int path (inline + non-inlined, both Smi widths); string path zero-alloc only inlined (H3). **XorFilter** / **BinaryFuse**: static, **throws** `[lite-filter]`. |
 | `mightContain(key)` | `boolean` | The query. NO false negatives; false positives bounded by `fpp`. |
 | `has(key)` | `boolean` | The sole alias of `mightContain`, same semantics. |
 | `remove(key)` | `never` / `boolean` | **Bloom** + **BlockedBloom** + **XorFilter** + **BinaryFuse**: **throw** `[lite-filter]`. **CountingBloom** + **Cuckoo** + **Quotient**: a real delete, returns `boolean` (member-specific). |
@@ -493,6 +493,16 @@ signature MUST be folded with `| 0`, not `>>> 0`. A `>>> 0` fold yields values i
 `[2^31, 2^32)` for half its domain, and `add()`/`mightContain()` THROW fail-closed on
 exactly those keys (never a silent alias of two distinct numbers). The int-key error text
 names the fix. `((sid << 20) | (op << 12) | code) | 0` stays in range and allocates nothing.
+
+**The 31-bit-Smi caller caveat (decisions/0027).** The int hot path is zero-alloc inline AND
+non-inlined, on 32-bit-Smi (Node) and 31-bit-Smi (Chrome / d8) engines. But on a 31-bit-Smi
+engine a key outside `[-2^30, 2^30)` is boxed into a HeapNumber by **your own** `add(k)` /
+`has(k)` expression, *before* this library runs. If your consumer runs on Chrome / d8 and you
+need every lookup box-free, fold to a 31-bit signed key with `(x << 1) >> 1` (not just `| 0`). That
+fold is LOSSY -- `x` and `x ^ 0x80000000` collide -- so it can only add false positives, never a
+false negative (the one-sided contract is preserved).
+On Node (32-bit Smis) `| 0` is enough. The string path is zero-alloc only when the hash
+**inlines** into the caller; a non-inlined string path boxes its 32-bit word on 31-bit-Smi engines (Node partly unmeasured) -- deferred to H3.
 
 ### Stats -- opt-in runtime counters
 
@@ -556,7 +566,7 @@ const rows = runBench({ cap: 100000, fpp: 0.01 });
 
 | Export | Meaning |
 | --- | --- |
-| `VERSION` | the package version string (`"1.2.0"`) |
+| `VERSION` | the package version string (`"1.2.1"`) |
 | `Bloom` | the reference member (also the default export) |
 | `CountingBloom` | the deletable member (4-bit saturating counters; a real `remove`) |
 | `BlockedBloom` | the cache-local member (one 512-bit block per key; one cache miss per query, at a higher measured FPR) |
@@ -600,11 +610,15 @@ parsed straight out of a foreign binary buffer, with no intermediate `Set`.
 
 | Operation | Allocation (keys:'int') | Allocation (string) | Allocation (arbitrary) |
 | --- | --- | --- | --- |
-| `add` | 0 B | 0 B | 1 `String()` (amortized) |
-| `mightContain` / `has` | 0 B | 0 B | 1 `String()` (amortized) |
+| `add` | 0 B (inline + non-inlined) | 0 B inlined (non-inlined: H3) | 1 `String()` (amortized) |
+| `mightContain` / `has` | 0 B (inline + non-inlined) | 0 B inlined (non-inlined: H3) | 1 `String()` (amortized) |
 | `clear` | 0 B (same ArrayBuffer) | 0 B | 0 B |
 | `fpp` / `size` / `stats` | 0 B | 0 B | 0 B |
 | `dump` | O(words) -- cold, allowed | -- | -- |
+
+The `keys:'int'` column holds on **both** 32-bit-Smi (Node) and 31-bit-Smi (Chrome / d8) engines,
+provided the caller keeps keys in `[-2^30, 2^30)` on the 31-bit engines (decisions/0027 -- see the
+integer-keys section). The string column is 0 B only when the hash **inlines** into the caller.
 
 - **One preallocated `Uint32Array`** of `ceil(m/32)` words, sized once from
   `(n, fpp)`, never grown, never reallocated. `clear()` zeroes it in place -- the
@@ -614,6 +628,12 @@ parsed straight out of a foreign binary buffer, with no intermediate `Set`.
   `k`-length array -- zero scratch storage, two real hashes per op.
 - **`Math.imul` throughout** the murmur3 `fmix32` mixer -- exact 32-bit multiplies,
   never a boxed heap double.
+- **Smi-width-proof int path** (decisions/0027): no 32-bit hash word crosses a call
+  boundary where a non-inlining engine would box it. Each member's int mixer runs the
+  `fmix32` body in its own frame (reading the double-field seeds in-frame) and hands words
+  to the caller through a module `Int32Array` scratch, or -- for the static members' single
+  query site -- inlines them as locals. So the int path stays 0 B even when the consumer's
+  hot path is too large to inline, on 32-bit- and 31-bit-Smi engines alike.
 - **Opt-in stats guard** (`_stats === null`) is the ONLY extra hot-path branch, and
   it is free when stats are off.
 
@@ -642,6 +662,23 @@ with a width-quantized measured FPR **<= 0.0050** (~0.0039, under the configured
 decisions/0020) that is strictly **> 0** (non-vacuous) at **~9.84 bits/item**, plus a PROVEN
 fail-closed 100-attempt exhaustion throw on a degenerate set. ns/op figures are
 machine-local -- run `npm run bench`.
+
+**No-inline + 31-bit-Smi lanes (decisions/0027).** Every member's `keys:'int'` `add` /
+`mightContain` / `remove` (and the Cuckoo kick path) reads **0 scavenges at 1.6M ops** not
+only inline but also under `--max-inlined-bytecode-size=0` -- the shape a large, polymorphic
+consumer forces -- on **both** Node (32-bit Smis) and V8 d8 (31-bit Smis, Chrome's width).
+`npm run test:perf` runs the Node lanes (`test/perf/SmiWidth.test.mjs`); `npm run test:perf:d8`
+runs the d8 lanes (`test/perf/SmiWidthD8.test.mjs`) and **fails closed** -- never skips -- when
+d8 is absent. Install d8 with `npx jsvu --os=<mac64arm|mac64|linux64|win64> --engines=v8` (the gate
+looks for `~/.jsvu/engines/v8/d8`), or set `$D8`. CALLER
+CAVEAT: on a 31-bit-Smi engine keep int keys in `[-2^30, 2^30)` (fold `(x << 1) >> 1` -- lossy,
+adds only false positives); a key
+outside it boxes at your own call site before the library runs. The Quotient int path is
+Smi-width-proof for `nslots <= 2^30` (the next size up, `2^31` slots, boxes its array-index
+arguments on 31-bit-Smi engines; hash words are unaffected). The string path is zero-alloc only
+when inlined -- a Smi-width-proof string path is H3. Behaviour is byte-for-byte identical to
+1.2.0 (`npm test` runs `test/Parity.test.js`: **3,521,664 checks, 0 differences** vs the frozen
+`test/fixtures/Filter.1.2.0.js`, same digest on Node and d8).
 
 </details>
 
@@ -714,13 +751,16 @@ machine-local -- run `npm run bench`.
 
 ## Testing
 
-`node:test` only, zero runtime deps -- **516 deterministic tests** across the boundary
+`node:test` only, zero runtime deps -- **532 deterministic tests** across the boundary
 suite. The gates (`npm run verify` runs all of them):
 
 - `npm test` -- the boundary suite: every method, every one-sided law, every
   fail-closed door, plus an ASCII-source guard and an introspection suite (the
   `keysMode` / `seed` / `maxLoad` / `saturation` getters against MEASURED ceilings,
-  and the signed-fold door both ways).
+  and the signed-fold door both ways). Includes `test/Parity.test.js`: the int-path
+  rewrite is byte-for-byte parity with the frozen 1.2.0 (`test/fixtures/Filter.1.2.0.js`)
+  over every member x {int, string} x 4 seeds -- 3,521,664 checks, 0 differences -- with
+  a seed-perturb control and a re-entrancy control (both must have teeth).
 - `npm run test:types` -- `tsc --noEmit` proves `Bloom`, `CountingBloom`,
   `BlockedBloom`, `Cuckoo`, and `Quotient` satisfy `LiteFilter<K>`, that `CountingBloom`,
   `Cuckoo`, and `Quotient` `remove` are a real `boolean` (and `Quotient.resize`/`merge`
@@ -751,7 +791,17 @@ suite. The gates (`npm run verify` runs all of them):
   remove-churn; Quotient add-churn + query-hit + remove-churn; XorFilter query-hit;
   BinaryFuse query-hit), a NEGATIVE-int32 lane per int-capable member (all `maxScavenges 0`),
   plus ONE amortized default-backing lane (fractional / large numbers, String()-encoded) under
-  an explicit measured BYTE budget, with an allocating mustFail for teeth.
+  an explicit measured BYTE budget, with an allocating mustFail for teeth. Also runs
+  `test/perf/SmiWidth.test.mjs`: every member's int `add` / `mightContain` = **0 scavenges at
+  1.6M ops** under BOTH inline and `--max-inlined-bytecode-size=0` (the deletable churn and Cuckoo
+  kick lanes are gated NO-INLINE only -- inline measures 0 too but is not asserted), with nop /
+  object / box control lanes that must grow.
+- `npm run test:perf:d8` -- the 31-bit-Smi lane (`test/perf/SmiWidthD8.test.mjs`) on V8 **d8**
+  (Chrome's Smi width): the same members and ops read **0 scavenges** no-inline, and the parity
+  file runs on d8 with a digest identical to Node. **Fails closed** (never skips) when d8 is
+  absent -- install with `npx jsvu --os=<mac64arm|mac64|linux64|win64> --engines=v8` (the gate looks
+  for `~/.jsvu/engines/v8/d8`), or set `$D8`. Part of
+  `npm run verify`.
 - `npm run test:demo` -- the shipped demo's own boundary suite (`demo/Demo.test.mjs`).
 - `npm run bench` -- the measurement tool.
 

@@ -1,7 +1,7 @@
 {
   "name": "@zakkster/lite-filter",
   "author": "Zahary Shinikchiev <shinikchiev@yahoo.com>",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Zero-dependency, zero-GC approximate-membership filter family under one LiteFilter<K> surface. Seven members: Bloom (reference), CountingBloom (deletable), BlockedBloom (cache-local), Cuckoo (fingerprint), Quotient (mergeable/resizable), XorFilter (static, space-optimal) and BinaryFuse (static, smallest -- ~9 bits/item), with a shipped bench that measures actual vs theoretical false-positive rate on your own keys.",
   "type": "module",
   "main": "./Filter.js",
@@ -30,13 +30,14 @@
     "test:types": "tsc -p test/types/tsconfig.json",
     "torture": "node --expose-gc test/torture.mjs",
     "torture:controls": "node test/controls.mjs",
-    "test:perf": "node --expose-gc --max-semi-space-size=4 --test test/perf/PerfGate.test.mjs",
+    "test:perf": "node --expose-gc --max-semi-space-size=4 --test test/perf/PerfGate.test.mjs test/perf/SmiWidth.test.mjs",
+    "test:perf:d8": "node --test test/perf/SmiWidthD8.test.mjs",
     "test:demo": "node --test demo/Demo.test.mjs",
     "bench": "node benchmark/Bench.mjs",
     "demo": "node demo/Visualize.mjs",
     "demo:peel": "node demo/peel.mjs",
     "demo:serve": "node demo/serve.mjs",
-    "verify": "npm test && npm run test:types && npm run torture && npm run torture:controls && npm run test:perf"
+    "verify": "npm test && npm run test:types && npm run torture && npm run torture:controls && npm run test:perf && npm run test:perf:d8"
   },
   "keywords": [
     "bloom",

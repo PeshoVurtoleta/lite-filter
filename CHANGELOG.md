@@ -7,6 +7,85 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The `VERSION` constant, `package.json` `version`, and `llms.txt` are bumped
 together (three-place version sync) at release.
 
+## [1.2.1] - 2026-10-05
+
+H2 -- the Smi-width-proof int hot path (ROADMAP section 13, decisions/0027), requested by the
+lite-hud M5 integration, whose peer probe gates every dependency under
+`--max-inlined-bytecode-size=0`. No API, wire, snapshot (`litefilter/3`) or hash-output change:
+behaviour is byte-for-byte identical to 1.2.0 (`test/Parity.test.js` -- 3,521,664 checks, 0
+differences vs the frozen `test/fixtures/Filter.1.2.0.js`, same digest on Node and d8).
+
+### Added
+
+- **`test/perf/SmiWidth.test.mjs`** (in `npm run test:perf`): per-member int lanes at 0 scavenges /
+  1.6M ops under inline AND `--max-inlined-bytecode-size=0`, full int32 keys, with nop / object /
+  box control lanes that must grow, an every-op `add` lane, and a Cuckoo kick lane (~0.93 of the
+  real `maxLoad`, sliding window, fails closed if it never kicks). Churn and kick lanes are gated
+  no-inline only. A pointer-compressed Node build fails closed with a message. On 1.2.0: 10 of 13
+  tests fail.
+- **`test/perf/SmiWidthD8.test.mjs`** + **`npm run test:perf:d8`**: the 31-bit-Smi lane on V8 d8
+  (Chrome's Smi width), keys in `[-2^30, 2^30)`. Fails CLOSED -- never skips -- when d8 is absent
+  (install with `npx jsvu --os=<mac64arm|mac64|linux64|win64> --engines=v8` -- the gate looks for
+  `~/.jsvu/engines/v8/d8` -- or set `$D8`). d8 runs as a child process from a `node:test` file, so
+  no runtime dependency is added. On 1.2.0: 9 of 14 tests fail; on the Node-only prototype V3: 9 of 14.
+- **`test/Parity.test.js`** + **`test/parity/parity.mjs`** + **`test/fixtures/Filter.1.2.0.js`**
+  (in `npm test`): the engine-neutral byte-for-byte parity witness vs the frozen 1.2.0 (sha256
+  pinned). It passes on 1.2.0 by construction; its teeth are a seed-perturb control and a
+  re-entrancy control, both must-fail.
+- **`test/SmiWidthBoundary.test.js`** (in `npm test`, 12 cases): int edge keys incl. `+-2^30`, key
+  doors, throw-unwind, restore round-trips, cross-version restore; teeth proven against planted bugs.
+- Test count 516 -> 532.
+
+### Changed
+
+- **`npm run verify`** now ends with `npm run test:perf:d8`; `npm run test:perf` also runs
+  `SmiWidth.test.mjs` (30 -> 43 tests).
+- **`test/torture.mjs`**: one settle `gc()` immediately before the profiler window, so garbage from
+  the pre-window XorFilter / BinaryFuse builds is not collected inside the window. Budgets unchanged
+  (`maxMajor: 0`); the break control still fails (`gc major=3`). Without it: 1.2.0 major=0 minor=1,
+  1.2.1 major=1 minor=1; with it, both 0/0; in-window heap growth 1 B/op (1.2.1) vs 3 B/op (1.2.0).
+- **Internal hashing:** each member's int path mixes through a per-class `_mixInt` (Quotient:
+  `_hash`) that writes a module `Int32Array` scratch instead of returning a word; the XorFilter /
+  BinaryFuse queries mix as locals; `mulhiU32` takes `(h >>> 16, h & 0xffff, scl)`; `fmix32` /
+  `hashStr` return signed words, `>>> 0` applied by the caller. Not exported; outputs unchanged.
+- **Performance** (int `has` ops/s vs 1.2.0, `research/h2-proto/opsps.mjs`: K=7 interleaved
+  per-process pairs per member, best-of-5 per child, N=30M ops/trial, Node 26.8.2, quiet machine;
+  ratio of medians [per-pair min..max]): Bloom 0.972 [0.924..1.041], CountingBloom 0.970
+  [0.860..0.994], BlockedBloom 0.992 [0.961..1.028], Cuckoo 0.919 [0.895..0.934], Quotient 0.931
+  [0.923..0.939], XorFilter 0.856 [0.838..0.973] (second independent K=7 run: 0.886
+  [0.841..0.970]), BinaryFuse 1.037 [1.020..1.058]. Cuckoo and Quotient are below 1.0 on every pair,
+  within the 10% budget. XorFilter exceeds it (ROADMAP 13 justification): its query does the same
+  arithmetic -- four mixes, three `%` reductions -- with the hash words now signed locals read as
+  `>>> 0` at the `%` instead of unsigned returns from inlined `fmix32` calls; the gap is code
+  generation, ~10 ns per query (16.0 -> 13.7 Mops/s). It is accepted for the zero-box int path on
+  both engines; BinaryFuse, the recommended static filter, is ~10x faster than XorFilter.
+
+### Fixed
+
+- **No-inline boxing on the `keys:'int'` hot path, every member.** A 32-bit hash word crossed a
+  call boundary (`fmix32` / `_hash` / `hashStr` returns, BinaryFuse's `mulhiU32` argument) that V8
+  did not inline; an unsigned value `>= 2^31` is not a Smi there and was boxed into a ~16 B
+  HeapNumber. 1.2.0 read 3..12 scavenges at 1.6M ops non-inlined on Node; 1.2.1 reads 0 for
+  every member's int `add` / `mightContain` / `remove` and the Cuckoo kick path, inline and
+  non-inlined.
+- **BinaryFuse boxing even when inlined** (1.2.0: 0 -> 3 scavenges inline). `mulhiU32` received the
+  full unsigned `h`; it now takes two 16-bit Smi halves.
+- **Chrome / d8 31-bit-Smi boxing.** On a pointer-compressed engine a signed value outside
+  `[-2^30, 2^30)` is not a Smi either (1.2.0 on d8, non-inlined: 8..25 scavenges at 1.6M ops). The int
+  path keeps every word in-frame or in the module scratch: 0 scavenges on d8, inline and non-inlined.
+
+### Known limits
+
+- **Caller key range on 31-bit-Smi engines:** keep int keys in `[-2^30, 2^30)`; a key outside it is
+  boxed by the caller's own `add(k)` / `has(k)` expression before this library runs. Fold with
+  `(x << 1) >> 1`, not just `| 0` (Node-clean only). The fold is lossy (`x` and `x ^ 0x80000000`
+  collide), so it can add false positives, never a false negative. Documented in README,
+  `llms.txt` and `Filter.d.ts`.
+- **String path (H3):** zero-alloc only when the hash inlines into the caller; non-inlined it boxes
+  its 32-bit word on 31-bit-Smi engines (on Node partly unmeasured -- decisions/0027 section 6).
+- **Quotient array indices** are Smi-width-proof for `nslots <= 2^30`; a `2^31`-slot store boxes its
+  index arguments on 31-bit-Smi engines (hash words are unaffected).
+
 ## [1.2.0] - 2026-09-23
 
 H1 hardening -- the close-out of the 2026-09-23 zero-GC audit (RESEARCH.md, ROADMAP section 12).

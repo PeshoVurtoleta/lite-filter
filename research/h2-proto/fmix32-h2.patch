@@ -1,0 +1,511 @@
+--- Filter.orig.js	2026-10-05 03:25:21
++++ Filter.v3.js	2026-10-05 03:26:46
+@@ -148,7 +148,7 @@
+  *  detectable break rather than a silent misread. Bumped to `litefilter/2` in v0.6.0
+  *  (every snapshot carries an integrity checksum `chk`, decisions/0021). Bumped to
+  *  `litefilter/3` in 1.1.0 (decisions/0023): the XOR / Binary Fuse string-key second
+- *  hash `g` changed from `fmix32(h ^ seed2)` to an INDEPENDENT `hashStr(s, seed2)`, so a
++ *  hash `g` changed from `(fmix32(h ^ seed2) >>> 0)` to an INDEPENDENT `hashStr(s, seed2)`, so a
+  *  `litefilter/2` XOR/BF snapshot would read back false negatives on string keys. One tag
+  *  is ONE algorithm for the whole family: even members whose bytes are unchanged (Bloom,
+  *  int-mode filters) are re-tagged, so a stale snapshot is a clean detectable break rather
+@@ -489,7 +489,7 @@
+     h ^= h >>> 13;
+     h = Math.imul(h, 0xc2b2ae35);
+     h ^= h >>> 16;
+-    return h >>> 0;
++    return h | 0;
+ }
+ 
+ /**
+@@ -788,7 +788,7 @@
+  *
+  * The two-step SegmentCount clamp in the reference (which underflows through uint32 wrap for
+  * n <= 1) reduces exactly to `max(1, initSegmentCount)`; we clamp explicitly rather than rely
+- * on wraparound. `scl` is the multiply-shift domain: a key's first slot is `mulhiU32(h, scl)`
++ * on wraparound. `scl` is the multiply-shift domain: a key's first slot is `mulhiU32(h | 0, scl)`
+  * in `[0, scl)`, its second/third are one/two segments further, so every slot stays in
+  * `[0, arrayLen)`. Fails closed on `n < 1` (a filter over zero keys is undefined; null is not
+  * zero) and on a request whose array would exceed the too-large cap. Cold -- called once by
+@@ -847,16 +847,16 @@
+ /** Fold one number into the running 32-bit checksum by its 64-bit bit pattern. Cold. */
+ function _chkNum(h, x) {
+     _CHK_F64[0] = +x;
+-    h = fmix32((h ^ _CHK_U32[0]) >>> 0);
+-    h = fmix32((h ^ _CHK_U32[1]) >>> 0);
++    h = (fmix32((h ^ _CHK_U32[0]) >>> 0) >>> 0);
++    h = (fmix32((h ^ _CHK_U32[1]) >>> 0) >>> 0);
+     return h >>> 0;
+ }
+ 
+ /** Fold one ASCII token (the tag, the member name, the keys-mode) into the checksum,
+  *  length included so a truncation cannot collide. Cold. */
+ function _chkStr(h, s) {
+-    h = fmix32((h ^ hashStr(s, 0x9e3779b9)) >>> 0);
+-    h = fmix32((h ^ (s.length >>> 0)) >>> 0);
++    h = (fmix32((h ^ (hashStr(s, 0x9e3779b9) >>> 0)) >>> 0) >>> 0);
++    h = (fmix32((h ^ (s.length >>> 0)) >>> 0) >>> 0);
+     return h >>> 0;
+ }
+ 
+@@ -929,7 +929,7 @@
+  * @param {Array} keys   the deduped keys (int32 numbers when int, else arbitrary)
+  * @param {boolean} int  the keys:'int' backing (no String encode)
+  * @param {number} seed  the attempt seed (32-bit unsigned)
+- * @param {number} seed2 the derived second seed word (fmix32(seed ^ 0x9e3779b9))
++ * @param {number} seed2 the derived second seed word ((fmix32(seed ^ 0x9e3779b9) >>> 0))
+  * @param {number} n     the deduped key count (edge count)
+  * @param {number} bl    the per-segment length
+  * @param {number} fw    the fingerprint width (8 or 16)
+@@ -951,18 +951,18 @@
+         const key = keys[e];
+         let h, g;
+         if (int) {
+-            h = fmix32((key ^ seed) | 0);
+-            g = fmix32((Math.imul(key | 0, 0x9e3779b1) ^ seed2) | 0);
++            h = (fmix32((key ^ seed) | 0) >>> 0);
++            g = (fmix32((Math.imul(key | 0, 0x9e3779b1) ^ seed2) | 0) >>> 0);
+         } else {
+             const s = (typeof key === "string") ? key : String(key);
+-            h = hashStr(s, seed);
+-            g = hashStr(s, seed2);
++            h = (hashStr(s, seed) >>> 0);
++            g = (hashStr(s, seed2) >>> 0);
+         }
+-        const t = fmix32((h ^ g) | 0);
++        const t = (fmix32((h ^ g) | 0) >>> 0);
+         eh0[e] = h % bl;
+         eh1[e] = bl + (g % bl);
+         eh2[e] = 2 * bl + (t % bl);
+-        efp[e] = fmix32((h + g) | 0) & fpMask;
++        efp[e] = (fmix32((h + g) | 0) >>> 0) & fpMask;
+     }
+ 
+     // Incidence: per-vertex edge COUNT and XOR-of-edge-indices. When a vertex's count is
+@@ -1022,7 +1022,7 @@
+  * -- build the 3-uniform hypergraph, peel degree-1 vertices, and (ONLY on a complete peel)
+  * reverse-assign so a key's three slots XOR to its fingerprint -- with a SINGLE change: the
+  * three slot positions are the OVERLAPPING fuse segments, not XOR's three disjoint ones. The
+- * first slot is `mulhiU32(h, scl)` (a multiply-shift into `[0, scl)`); the second and third
++ * first slot is `mulhiU32(h | 0, scl)` (a multiply-shift into `[0, scl)`); the second and third
+  * are one and two segments further, each perturbed within its segment by `^ (g & segMask)` /
+  * `^ (t & segMask)`. Because `segLen` is a power of two, adding it never disturbs the low
+  * `log2(segLen)` bits, so the three slots always land in three DISTINCT consecutive segments
+@@ -1038,7 +1038,7 @@
+  * @param {Array} keys   the deduped keys (int32 numbers when int, else arbitrary)
+  * @param {boolean} int  the keys:'int' backing (no String encode)
+  * @param {number} seed  the attempt seed (32-bit unsigned)
+- * @param {number} seed2 the derived second seed word (fmix32(seed ^ 0x9e3779b9))
++ * @param {number} seed2 the derived second seed word ((fmix32(seed ^ 0x9e3779b9) >>> 0))
+  * @param {number} n     the deduped key count (edge count)
+  * @param {{segLen:number,segCount:number,arrayLen:number,scl:number}} dims  the geometry
+  * @param {number} fw    the fingerprint width (8 or 16)
+@@ -1053,7 +1053,7 @@
+ 
+     // Per-edge geometry: the three ABSOLUTE slot positions (one per consecutive segment) and
+     // the fingerprint. Computed with EXACTLY the math the query hot path uses, so a key in the
+-    // set always reads true. `mulhiU32(h, scl)` is the segment-base selector (multiply-shift,
++    // set always reads true. `mulhiU32(h | 0, scl)` is the segment-base selector (multiply-shift,
+     // zero-branch); `^ (g & segMask)` / `^ (t & segMask)` place the other two within-segment.
+     // NOTE (decisions/0022): h0 is the raw segment base with NO within-segment perturbation --
+     // this MATCHES the FastFilter reference geometry (arity 3: the first slot is the multiply-
+@@ -1068,19 +1068,19 @@
+         const key = keys[e];
+         let h, g;
+         if (int) {
+-            h = fmix32((key ^ seed) | 0);
+-            g = fmix32((Math.imul(key | 0, 0x9e3779b1) ^ seed2) | 0);
++            h = (fmix32((key ^ seed) | 0) >>> 0);
++            g = (fmix32((Math.imul(key | 0, 0x9e3779b1) ^ seed2) | 0) >>> 0);
+         } else {
+             const s = (typeof key === "string") ? key : String(key);
+-            h = hashStr(s, seed);
+-            g = hashStr(s, seed2);
++            h = (hashStr(s, seed) >>> 0);
++            g = (hashStr(s, seed2) >>> 0);
+         }
+-        const t = fmix32((h ^ g) | 0);
+-        const hi = mulhiU32(h, scl);
++        const t = (fmix32((h ^ g) | 0) >>> 0);
++        const hi = mulhiU32(h | 0, scl);
+         eh0[e] = hi;
+         eh1[e] = (hi + segLen) ^ (g & segMask);
+         eh2[e] = (hi + 2 * segLen) ^ (t & segMask);
+-        efp[e] = fmix32((h + g) | 0) & fpMask;
++        efp[e] = (fmix32((h + g) | 0) >>> 0) & fpMask;
+     }
+ 
+     // Incidence: per-vertex edge COUNT and XOR-of-edge-indices. The three positions of an edge
+@@ -1249,7 +1249,7 @@
+         this._seed = validateSeed(options && options.seed);
+         // A second, independent seed for the b base hash, derived from the first so
+         // one `{ seed }` still fully determines behavior (decisions/0001).
+-        this._seed2 = fmix32(this._seed ^ 0x9e3779b9);
++        this._seed2 = (fmix32(this._seed ^ 0x9e3779b9) >>> 0);
+ 
+         // The ONE preallocated bit store: ceil(m/32) 32-bit words, sized once and
+         // reused forever. `clear()` zeroes it in place -- same ArrayBuffer identity.
+@@ -1294,11 +1294,11 @@
+             if (!Number.isInteger(key) || key < INT_MIN || key > INT_MAX) {
+                 throw new TypeError(INT_KEY_MSG + String(key));
+             }
+-            a = fmix32((key ^ this._seed) | 0);
+-            b = (fmix32((Math.imul(key | 0, 0x9e3779b1) ^ this._seed2) | 0) | 1) >>> 0;
++            a = (fmix32((key ^ this._seed) | 0) >>> 0);
++            b = ((fmix32((Math.imul(key | 0, 0x9e3779b1) ^ this._seed2) | 0) >>> 0) | 1) >>> 0;
+         } else {
+             a = this._hashKey(key);
+-            b = (fmix32(a ^ this._seed2) | 1) >>> 0;
++            b = ((fmix32(a ^ this._seed2) >>> 0) | 1) >>> 0;
+         }
+         const words = this._words;
+         const k = this._k;
+@@ -1322,11 +1322,11 @@
+             if (!Number.isInteger(key) || key < INT_MIN || key > INT_MAX) {
+                 throw new TypeError(INT_KEY_MSG + String(key));
+             }
+-            a = fmix32((key ^ this._seed) | 0);
+-            b = (fmix32((Math.imul(key | 0, 0x9e3779b1) ^ this._seed2) | 0) | 1) >>> 0;
++            a = (fmix32((key ^ this._seed) | 0) >>> 0);
++            b = ((fmix32((Math.imul(key | 0, 0x9e3779b1) ^ this._seed2) | 0) >>> 0) | 1) >>> 0;
+         } else {
+             a = this._hashKey(key);
+-            b = (fmix32(a ^ this._seed2) | 1) >>> 0;
++            b = ((fmix32(a ^ this._seed2) >>> 0) | 1) >>> 0;
+         }
+         const words = this._words;
+         const k = this._k;
+@@ -1353,8 +1353,8 @@
+      * honest amortized caveat). Never called on the keys:'int' path.
+      */
+     _hashKey(key) {
+-        if (typeof key === "string") return hashStr(key, this._seed);
+-        return hashStr(String(key), this._seed);
++        if (typeof key === "string") return (hashStr(key, this._seed) >>> 0);
++        return (hashStr(String(key), this._seed) >>> 0);
+     }
+ 
+     // --- add-only door (decisions/0003) ---------------------------------------
+@@ -1563,7 +1563,7 @@
+ 
+         this._int = validateKeys(options && options.keys);
+         this._seed = validateSeed(options && options.seed);
+-        this._seed2 = fmix32(this._seed ^ 0x9e3779b9);
++        this._seed2 = (fmix32(this._seed ^ 0x9e3779b9) >>> 0);
+ 
+         // The ONE preallocated counter store: ceil(m/2) bytes, two 4-bit counters per
+         // byte (decisions/0007). Sized once, reused forever; clear() zeroes it in
+@@ -1609,11 +1609,11 @@
+             if (!Number.isInteger(key) || key < INT_MIN || key > INT_MAX) {
+                 throw new TypeError(INT_KEY_MSG + String(key));
+             }
+-            a = fmix32((key ^ this._seed) | 0);
+-            b = (fmix32((Math.imul(key | 0, 0x9e3779b1) ^ this._seed2) | 0) | 1) >>> 0;
++            a = (fmix32((key ^ this._seed) | 0) >>> 0);
++            b = ((fmix32((Math.imul(key | 0, 0x9e3779b1) ^ this._seed2) | 0) >>> 0) | 1) >>> 0;
+         } else {
+             a = this._hashKey(key);
+-            b = (fmix32(a ^ this._seed2) | 1) >>> 0;
++            b = ((fmix32(a ^ this._seed2) >>> 0) | 1) >>> 0;
+         }
+         const cnts = this._cnts;
+         const k = this._k;
+@@ -1642,11 +1642,11 @@
+             if (!Number.isInteger(key) || key < INT_MIN || key > INT_MAX) {
+                 throw new TypeError(INT_KEY_MSG + String(key));
+             }
+-            a = fmix32((key ^ this._seed) | 0);
+-            b = (fmix32((Math.imul(key | 0, 0x9e3779b1) ^ this._seed2) | 0) | 1) >>> 0;
++            a = (fmix32((key ^ this._seed) | 0) >>> 0);
++            b = ((fmix32((Math.imul(key | 0, 0x9e3779b1) ^ this._seed2) | 0) >>> 0) | 1) >>> 0;
+         } else {
+             a = this._hashKey(key);
+-            b = (fmix32(a ^ this._seed2) | 1) >>> 0;
++            b = ((fmix32(a ^ this._seed2) >>> 0) | 1) >>> 0;
+         }
+         const cnts = this._cnts;
+         const k = this._k;
+@@ -1681,11 +1681,11 @@
+             if (!Number.isInteger(key) || key < INT_MIN || key > INT_MAX) {
+                 throw new TypeError(INT_KEY_MSG + String(key));
+             }
+-            a = fmix32((key ^ this._seed) | 0);
+-            b = (fmix32((Math.imul(key | 0, 0x9e3779b1) ^ this._seed2) | 0) | 1) >>> 0;
++            a = (fmix32((key ^ this._seed) | 0) >>> 0);
++            b = ((fmix32((Math.imul(key | 0, 0x9e3779b1) ^ this._seed2) | 0) >>> 0) | 1) >>> 0;
+         } else {
+             a = this._hashKey(key);
+-            b = (fmix32(a ^ this._seed2) | 1) >>> 0;
++            b = ((fmix32(a ^ this._seed2) >>> 0) | 1) >>> 0;
+         }
+         const cnts = this._cnts;
+         const k = this._k;
+@@ -1720,8 +1720,8 @@
+      * honest amortized caveat). Never called on the keys:'int' path.
+      */
+     _hashKey(key) {
+-        if (typeof key === "string") return hashStr(key, this._seed);
+-        return hashStr(String(key), this._seed);
++        if (typeof key === "string") return (hashStr(key, this._seed) >>> 0);
++        return (hashStr(String(key), this._seed) >>> 0);
+     }
+ 
+     // --- cold inspection ------------------------------------------------------
+@@ -1915,7 +1915,7 @@
+ 
+         this._int = validateKeys(options && options.keys);
+         this._seed = validateSeed(options && options.seed);
+-        this._seed2 = fmix32(this._seed ^ 0x9e3779b9);
++        this._seed2 = (fmix32(this._seed ^ 0x9e3779b9) >>> 0);
+ 
+         // Block count: ceil(m / 512). m >= 1 (sizeFor guarantees), so _nb >= 1 always;
+         // assert it fail-closed regardless (null is not zero -- a 0-block filter is
+@@ -1972,11 +1972,11 @@
+             if (!Number.isInteger(key) || key < INT_MIN || key > INT_MAX) {
+                 throw new TypeError(INT_KEY_MSG + String(key));
+             }
+-            a = fmix32((key ^ this._seed) | 0);
+-            b = (fmix32((Math.imul(key | 0, 0x9e3779b1) ^ this._seed2) | 0) | 1) >>> 0;
++            a = (fmix32((key ^ this._seed) | 0) >>> 0);
++            b = ((fmix32((Math.imul(key | 0, 0x9e3779b1) ^ this._seed2) | 0) >>> 0) | 1) >>> 0;
+         } else {
+             a = this._hashKey(key);
+-            b = (fmix32(a ^ this._seed2) | 1) >>> 0;
++            b = ((fmix32(a ^ this._seed2) >>> 0) | 1) >>> 0;
+         }
+         const words = this._words;
+         const k = this._k;
+@@ -2003,11 +2003,11 @@
+             if (!Number.isInteger(key) || key < INT_MIN || key > INT_MAX) {
+                 throw new TypeError(INT_KEY_MSG + String(key));
+             }
+-            a = fmix32((key ^ this._seed) | 0);
+-            b = (fmix32((Math.imul(key | 0, 0x9e3779b1) ^ this._seed2) | 0) | 1) >>> 0;
++            a = (fmix32((key ^ this._seed) | 0) >>> 0);
++            b = ((fmix32((Math.imul(key | 0, 0x9e3779b1) ^ this._seed2) | 0) >>> 0) | 1) >>> 0;
+         } else {
+             a = this._hashKey(key);
+-            b = (fmix32(a ^ this._seed2) | 1) >>> 0;
++            b = ((fmix32(a ^ this._seed2) >>> 0) | 1) >>> 0;
+         }
+         const words = this._words;
+         const k = this._k;
+@@ -2035,8 +2035,8 @@
+      * amortized caveat). Never called on the keys:'int' path.
+      */
+     _hashKey(key) {
+-        if (typeof key === "string") return hashStr(key, this._seed);
+-        return hashStr(String(key), this._seed);
++        if (typeof key === "string") return (hashStr(key, this._seed) >>> 0);
++        return (hashStr(String(key), this._seed) >>> 0);
+     }
+ 
+     // --- add-only door (decisions/0003) ---------------------------------------
+@@ -2249,7 +2249,7 @@
+ 
+         this._int = validateKeys(options && options.keys);
+         this._seed = validateSeed(options && options.seed);
+-        this._seed2 = fmix32(this._seed ^ 0x9e3779b9);
++        this._seed2 = (fmix32(this._seed ^ 0x9e3779b9) >>> 0);
+ 
+         // The ONE preallocated fingerprint store: nb*b slots, 8-bit or 16-bit per the
+         // derived width. Slot value 0 is the empty sentinel (decisions/0014). Sized once
+@@ -2308,18 +2308,18 @@
+             if (!Number.isInteger(key) || key < INT_MIN || key > INT_MAX) {
+                 throw new TypeError(INT_KEY_MSG + String(key));
+             }
+-            a = fmix32((key ^ this._seed) | 0);
+-            fpsrc = fmix32((Math.imul(key | 0, 0x9e3779b1) ^ this._seed2) | 0);
++            a = (fmix32((key ^ this._seed) | 0) >>> 0);
++            fpsrc = (fmix32((Math.imul(key | 0, 0x9e3779b1) ^ this._seed2) | 0) >>> 0);
+         } else {
+             a = this._hashKey(key);
+-            fpsrc = fmix32(a ^ this._seed2);
++            fpsrc = (fmix32(a ^ this._seed2) >>> 0);
+         }
+         const store = this._store;
+         const mask = this._mask;
+         // Nonzero fingerprint: 0 is the empty-slot sentinel, so map 0 -> 1 (decisions/0014).
+         let fp = fpsrc & this._fpMask;
+         if (fp === 0) fp = 1;
+-        const hf = fmix32(Math.imul(fp, 0x5bd1e995));   // hash(fp) for the alt-bucket XOR
++        const hf = (fmix32(Math.imul(fp, 0x5bd1e995)) >>> 0);   // hash(fp) for the alt-bucket XOR
+         const i1 = a & mask;
+         const i2 = (i1 ^ hf) & mask;
+ 
+@@ -2354,7 +2354,7 @@
+             store[idx] = victim;              // place the carried fingerprint (bucket i is its candidate)
+             victim = e;                       // now carry the evicted one
+             // The evicted fingerprint was in bucket i, so its alternate is (i XOR hash(fp)).
+-            const vf = fmix32(Math.imul(victim, 0x5bd1e995));
++            const vf = (fmix32(Math.imul(victim, 0x5bd1e995)) >>> 0);
+             i = (i ^ vf) & mask;
+             const b2 = i << 2;
+             if (store[b2] === 0) { store[b2] = victim; this._rng = r; this._count++; if (this._stats !== null) this._stats.adds++; return; }
+@@ -2392,17 +2392,17 @@
+             if (!Number.isInteger(key) || key < INT_MIN || key > INT_MAX) {
+                 throw new TypeError(INT_KEY_MSG + String(key));
+             }
+-            a = fmix32((key ^ this._seed) | 0);
+-            fpsrc = fmix32((Math.imul(key | 0, 0x9e3779b1) ^ this._seed2) | 0);
++            a = (fmix32((key ^ this._seed) | 0) >>> 0);
++            fpsrc = (fmix32((Math.imul(key | 0, 0x9e3779b1) ^ this._seed2) | 0) >>> 0);
+         } else {
+             a = this._hashKey(key);
+-            fpsrc = fmix32(a ^ this._seed2);
++            fpsrc = (fmix32(a ^ this._seed2) >>> 0);
+         }
+         const store = this._store;
+         const mask = this._mask;
+         let fp = fpsrc & this._fpMask;
+         if (fp === 0) fp = 1;
+-        const hf = fmix32(Math.imul(fp, 0x5bd1e995));
++        const hf = (fmix32(Math.imul(fp, 0x5bd1e995)) >>> 0);
+         const i1 = a & mask;
+         const i2 = (i1 ^ hf) & mask;
+         const b1 = i1 << 2;
+@@ -2437,17 +2437,17 @@
+             if (!Number.isInteger(key) || key < INT_MIN || key > INT_MAX) {
+                 throw new TypeError(INT_KEY_MSG + String(key));
+             }
+-            a = fmix32((key ^ this._seed) | 0);
+-            fpsrc = fmix32((Math.imul(key | 0, 0x9e3779b1) ^ this._seed2) | 0);
++            a = (fmix32((key ^ this._seed) | 0) >>> 0);
++            fpsrc = (fmix32((Math.imul(key | 0, 0x9e3779b1) ^ this._seed2) | 0) >>> 0);
+         } else {
+             a = this._hashKey(key);
+-            fpsrc = fmix32(a ^ this._seed2);
++            fpsrc = (fmix32(a ^ this._seed2) >>> 0);
+         }
+         const store = this._store;
+         const mask = this._mask;
+         let fp = fpsrc & this._fpMask;
+         if (fp === 0) fp = 1;
+-        const hf = fmix32(Math.imul(fp, 0x5bd1e995));
++        const hf = (fmix32(Math.imul(fp, 0x5bd1e995)) >>> 0);
+         const i1 = a & mask;
+         const i2 = (i1 ^ hf) & mask;
+         let base = i1 << 2;
+@@ -2469,8 +2469,8 @@
+      * amortized caveat). Never called on the keys:'int' path.
+      */
+     _hashKey(key) {
+-        if (typeof key === "string") return hashStr(key, this._seed);
+-        return hashStr(String(key), this._seed);
++        if (typeof key === "string") return (hashStr(key, this._seed) >>> 0);
++        return (hashStr(String(key), this._seed) >>> 0);
+     }
+ 
+     // --- cold inspection ------------------------------------------------------
+@@ -2773,8 +2773,8 @@
+             }
+             return fmix32((key ^ this._seed) | 0);
+         }
+-        if (typeof key === "string") return hashStr(key, this._seed);
+-        return hashStr(String(key), this._seed);
++        if (typeof key === "string") return (hashStr(key, this._seed) >>> 0);
++        return (hashStr(String(key), this._seed) >>> 0);
+     }
+ 
+     /**
+@@ -3432,7 +3432,7 @@
+         let seed2 = 0;
+         for (let attempt = 0; attempt < XOR_MAX_ATTEMPTS; attempt++) {
+             const trySeed = (baseSeed ^ Math.imul(attempt, 0x9e3779b1)) >>> 0;
+-            const trySeed2 = fmix32(trySeed ^ 0x9e3779b9);
++            const trySeed2 = (fmix32(trySeed ^ 0x9e3779b9) >>> 0);
+             const built = _xorTryBuild(keys, int, trySeed, trySeed2, n, bl, fw);
+             if (built !== null) { arr = built; seed = trySeed; seed2 = trySeed2; break; }
+         }
+@@ -3491,15 +3491,15 @@
+             if (!Number.isInteger(key) || key < INT_MIN || key > INT_MAX) {
+                 throw new TypeError(INT_KEY_MSG + String(key));
+             }
+-            h = fmix32((key ^ this._seed) | 0);
+-            g = fmix32((Math.imul(key | 0, 0x9e3779b1) ^ this._seed2) | 0);
++            h = (fmix32((key ^ this._seed) | 0) >>> 0);
++            g = (fmix32((Math.imul(key | 0, 0x9e3779b1) ^ this._seed2) | 0) >>> 0);
+         } else {
+             const s = (typeof key === "string") ? key : String(key);
+-            h = hashStr(s, this._seed);
+-            g = hashStr(s, this._seed2);
++            h = (hashStr(s, this._seed) >>> 0);
++            g = (hashStr(s, this._seed2) >>> 0);
+         }
+-        const t = fmix32((h ^ g) | 0);
+-        const fp = fmix32((h + g) | 0) & this._fpMask;
++        const t = (fmix32((h ^ g) | 0) >>> 0);
++        const fp = (fmix32((h + g) | 0) >>> 0) & this._fpMask;
+         const arr = this._fp;
+         const h0 = h % bl;
+         const h1 = bl + (g % bl);
+@@ -3679,7 +3679,7 @@
+         inst._fp = fw <= 8 ? new Uint8Array(m) : new Uint16Array(m);
+         for (let i = 0; i < m; i++) inst._fp[i] = fp[i];
+         inst._seed = snap.seed >>> 0;
+-        inst._seed2 = fmix32(inst._seed ^ 0x9e3779b9);
++        inst._seed2 = (fmix32(inst._seed ^ 0x9e3779b9) >>> 0);
+         inst._bl = bl;
+         inst._fw = fw;
+         inst._fpMask = fpMask;
+@@ -3698,7 +3698,7 @@
+  *
+  * SHAPE (decisions/0022): a single fingerprint array over OVERLAPPING fuse segments.
+  * A key touches 3 slots, one in each of 3 CONSECUTIVE segments; the first is chosen by
+- * a multiply-shift (`mulhiU32(h, scl)`), the next two are one/two segments further,
++ * a multiply-shift (`mulhiU32(h | 0, scl)`), the next two are one/two segments further,
+  * perturbed within-segment. The slots are assigned by peeling a 3-uniform hypergraph so
+  * a key's three slots XOR to its fingerprint -- the same peel as XOR, tighter geometry.
+  *
+@@ -3797,7 +3797,7 @@
+         let seed2 = 0;
+         for (let attempt = 0; attempt < BF_MAX_ATTEMPTS; attempt++) {
+             const trySeed = (baseSeed ^ Math.imul(attempt, 0x9e3779b1)) >>> 0;
+-            const trySeed2 = fmix32(trySeed ^ 0x9e3779b9);
++            const trySeed2 = (fmix32(trySeed ^ 0x9e3779b9) >>> 0);
+             const built = _bfTryBuild(keys, int, trySeed, trySeed2, n, dims, fw);
+             if (built !== null) { arr = built; seed = trySeed; seed2 = trySeed2; break; }
+         }
+@@ -3847,7 +3847,7 @@
+ 
+     /**
+      * The query (decisions/0022). Computes the key's fingerprint and its 3 slot positions --
+-     * `mulhiU32(h, scl)` selects the first segment base, `+segLen` / `+2*segLen` step to the
++     * `mulhiU32(h | 0, scl)` selects the first segment base, `+segLen` / `+2*segLen` step to the
+      * next two segments, each perturbed within-segment by `^ (g & segMask)` / `^ (t & segMask)`
+      * -- then tests `fp === (arr[h0] ^ arr[h1] ^ arr[h2])`. One-sided: a key in the built set
+      * ALWAYS reads true (the complete-peel assignment guarantees it -- 0 false negatives); a
+@@ -3863,17 +3863,17 @@
+             if (!Number.isInteger(key) || key < INT_MIN || key > INT_MAX) {
+                 throw new TypeError(INT_KEY_MSG + String(key));
+             }
+-            h = fmix32((key ^ this._seed) | 0);
+-            g = fmix32((Math.imul(key | 0, 0x9e3779b1) ^ this._seed2) | 0);
++            h = (fmix32((key ^ this._seed) | 0) >>> 0);
++            g = (fmix32((Math.imul(key | 0, 0x9e3779b1) ^ this._seed2) | 0) >>> 0);
+         } else {
+             const s = (typeof key === "string") ? key : String(key);
+-            h = hashStr(s, this._seed);
+-            g = hashStr(s, this._seed2);
++            h = (hashStr(s, this._seed) >>> 0);
++            g = (hashStr(s, this._seed2) >>> 0);
+         }
+-        const t = fmix32((h ^ g) | 0);
+-        const fp = fmix32((h + g) | 0) & this._fpMask;
++        const t = (fmix32((h ^ g) | 0) >>> 0);
++        const fp = (fmix32((h + g) | 0) >>> 0) & this._fpMask;
+         const arr = this._fp;
+-        const hi = mulhiU32(h, scl);
++        const hi = mulhiU32(h | 0, scl);
+         const h0 = hi;
+         const h1 = (hi + segLen) ^ (g & segMask);
+         const h2 = (hi + 2 * segLen) ^ (t & segMask);
+@@ -4053,7 +4053,7 @@
+         inst._fp = fw <= 8 ? new Uint8Array(m) : new Uint16Array(m);
+         for (let i = 0; i < m; i++) inst._fp[i] = fp[i];
+         inst._seed = snap.seed >>> 0;
+-        inst._seed2 = fmix32(inst._seed ^ 0x9e3779b9);
++        inst._seed2 = (fmix32(inst._seed ^ 0x9e3779b9) >>> 0);
+         inst._segLen = dims.segLen;
+         inst._segMask = dims.segLen - 1;
+         inst._segCount = dims.segCount;

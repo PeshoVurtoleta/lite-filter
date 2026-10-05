@@ -115,7 +115,10 @@ export interface FilterOptions {
    *  `[-2^31, 2^31 - 1]` (decisions/0001, 0024): fold a composite signature with `| 0`, NEVER
    *  `>>> 0`. A `>>> 0` fold yields values in `[2^31, 2^32)` and THROWS on the hot path for
    *  half its domain; `| 0` keeps the result in range and allocates nothing. Example:
-   *  `filter.add(((sid << 20) | (op << 12) | code) | 0)`. */
+   *  `filter.add(((sid << 20) | (op << 12) | code) | 0)`. On a 31-bit-Smi engine (Chrome / d8)
+   *  additionally keep keys IN `[-2^30, 2^30)`: a key outside it is boxed by your OWN `add(k)` /
+   *  `has(k)` expression, before this library runs -- fold with `(x << 1) >> 1`, not just `| 0`
+   *  (a LOSSY fold: `x` and `x ^ 0x80000000` collide, so it can only add false positives). */
   keys?: "int";
   /** Mint the per-instance stats holder. OFF by default. */
   stats?: boolean;
@@ -135,9 +138,14 @@ export interface FilterRestoreOptions {
  * always correct on an add-only member -- there are NO false negatives.
  */
 export interface LiteFilter<K> {
-  /** Record a key. Zero allocation on the int + string paths. */
+  /** Record a key. Zero-alloc on the int path -- inline AND non-inlined, on 32-bit-Smi (Node)
+   *  and 31-bit-Smi (Chrome / d8) engines (keys in `[-2^30, 2^30)` there; see `keys`). The
+   *  string path is zero-alloc only when the hash inlines into the caller (non-inlined string
+   *  hashing boxes its 32-bit word -- deferred to H3). (Quotient: while `nslots <= 2^30` -- decisions/0027.) */
   add(key: K): void;
-  /** Query membership. NO false negatives; false positives bounded by `fpp`. */
+  /** Query membership. NO false negatives; false positives bounded by `fpp`. Same zero-alloc
+   *  gating as `add`: the int path is zero-alloc inline and non-inlined on both Smi widths; the
+   *  string path is zero-alloc only when inlined (H3). (Quotient: while `nslots <= 2^30` -- decisions/0027.) */
   mightContain(key: K): boolean;
   /** The sole alias of `mightContain`, same one-sided semantics. */
   has(key: K): boolean;
@@ -408,7 +416,8 @@ export class Quotient<K = unknown> implements LiteFilter<K> {
 export class XorFilter<K = unknown> {
   private constructor();
   /** Query membership. NO false negatives for a key in the built set; false positives
-   *  bounded by the width-quantized `2^-fw`. Zero allocation on the int + string paths. */
+   *  bounded by the width-quantized `2^-fw`. Zero-alloc on the int path (inline + non-inlined,
+   *  both Smi widths; string path zero-alloc only inlined -- H3). */
   mightContain(key: K): boolean;
   /** The sole alias of `mightContain`, same one-sided semantics. */
   has(key: K): boolean;
@@ -471,7 +480,8 @@ export class XorFilter<K = unknown> {
 export class BinaryFuse<K = unknown> {
   private constructor();
   /** Query membership. NO false negatives for a key in the built set; false positives
-   *  bounded by the width-quantized `2^-fw`. Zero allocation on the int + string paths. */
+   *  bounded by the width-quantized `2^-fw`. Zero-alloc on the int path (inline + non-inlined,
+   *  both Smi widths; string path zero-alloc only inlined -- H3). */
   mightContain(key: K): boolean;
   /** The sole alias of `mightContain`, same one-sided semantics. */
   has(key: K): boolean;

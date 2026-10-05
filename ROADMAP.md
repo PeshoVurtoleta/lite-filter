@@ -12,6 +12,9 @@
 >
 > H1 COMPLETE (2026-09-23): post-audit hardening shipped and published as 1.2.0 --
 > section 12, audit record `RESEARCH.md`, rulings `decisions/0024..0026`.
+>
+> H2 OPEN (2026-10-05): Smi-width-proof int hot path for lite-hud M5, 1.2.1 -- section 13,
+> evidence `RESEARCH.md` section 2, prototype `research/h2-proto/`.
 
 ASCII-only (`->`, `<=`, `>=`, `x`, "1.23x", never Unicode arrows or the
 multiplication sign). Suite law from `../CLAUDE.md` applies verbatim: npm scope
@@ -480,6 +483,168 @@ GATES
 - controls: the three break arms unchanged and still failing for their matched reason.
 - Version trinity (package.json / Filter.js VERSION / llms.txt), CHANGELOG head, README + llms.txt +
   d.ts for the getters; pack still 8 files with demo/test/decisions absent.
+
+## 13. H2 (1.2.1): Smi-width-proof int hot path -- requested by lite-hud M5 (2026-10-05)
+
+> OPEN (code + gates + docs DONE; awaiting `/release 1.2.1`). BLOCKING for lite-hud M5 (its
+> `--max-inlined-bytecode-size=0` lane). Evidence: RESEARCH.md section 2 (2.1-2.5 Node, 2.6 d8,
+> 2.7 outcome). Prototype + probes: `research/h2-proto/` (not shipped).
+> Patch release: no API, wire, snapshot or hash-output change.
+> SETTLED 2026-10-05 (maintainer): scope is SMI-WIDTH-PROOF, not Node-only. The 31-bit-Smi
+> lane runs on d8 (V8 15.7.37, `~/.jsvu/engines/v8/d8`, or `$D8`).
+>
+> STATUS 2026-10-05: planner -> coder -> reviewer (APPROVED, 2 REJECT rounds on gate teeth) ->
+> docs DONE. Ruling: decisions/0027. The two PERF gates are green on the rewrite and revert-checked
+> RED on 1.2.0 (Node SmiWidth 10/13 red, d8 SmiWidthD8 9/14 red); Parity is a WITNESS that passes on
+> 1.2.0 by construction -- its teeth are the seed-perturb + re-entrancy must-fail controls. TASKS 1-5 shipped; per-class `_mixInt`
+> + field-free `_ckAlt`/`mulhiU32`; Xor/BF query inlines as locals; Xor/BF build stays on fmix32;
+> Quotient Smi-width-proof for nslots <= 2^30 (documented). TASK 6 (docs) DONE: README, llms.txt,
+> Filter.d.ts, decisions/0027, CHANGELOG [Unreleased], RESEARCH 2.7. Exit gates: npm test 532/0,
+> test:perf 43/0, test:perf:d8 14/0 (+ in verify), torture ok (FPR identical to 1.2.0), controls
+> ok, parity 3,521,664 checks / 0 diffs (Node + d8 same digest). Stays OPEN until `/release 1.2.1`;
+> revert-check the new gates before release.
+
+Defect: the H1 audit measured with inlining ON only (RESEARCH 1.3). With inlining OFF, every
+member allocates on the int hot path, and BinaryFuse allocates even inlined. Cause: a 32-bit hash
+crosses a call boundary that V8 did not inline, and is not a Smi there, so it is boxed as a ~16 B
+HeapNumber. Which values are not Smis depends on the engine:
+- Node (no pointer compression, 32-bit Smis): unsigned values >= 2^31 -- half of all hashes.
+- Chrome / d8 (pointer compression, 31-bit Smis): anything outside [-2^30, 2^30) -- half of all
+  SIGNED hashes, three quarters of unsigned ones. Hash outputs are uniform over 32 bits regardless
+  of key magnitude, so no key-range proxy (p30 lane) can model this; only a 31-bit engine can.
+Boundaries on the int path today: `fmix32`'s argument and return, `hashStr`'s return, the members'
+`_hash` / `_hashKey` returns, and BinaryFuse's `mulhiU32(h, scl)` argument. A consumer's hot path
+is the non-inlined case: lite-hud's `write()` is large and polymorphic.
+
+The prototype V3 (signed returns, `>>> 0` at the caller) reads 0 -> 0 on Node but only trims d8:
+Bloom 2 -> 14 becomes 1 -> 11, BinaryFuse 3 -> 25 becomes 3 -> 23 (RESEARCH 2.6). V3 is therefore
+NOT the fix; it is the parity reference and the Node evidence.
+
+THE RULE (code-review law for this file, hot paths): no value that can leave [-2^30, 2^30) crosses
+a call boundary, as an argument or a return. Only tagged references (the filter, the caller's own
+key), Smis (16-bit halves, indices, counts) and `undefined` cross. A 32-bit word is produced and
+consumed in ONE frame, or handed over through a module typed-array scratch slot.
+
+SETTLED 2026-10-05 (maintainer, from the H2 planner): PER-CLASS mixer methods, not one shared
+helper. A shared helper would see 7 maps (> V8 polymorphic limit 4); the megamorphic LoadIC re-boxes
+the double-representation `_seed` / `_seed2` into a fresh HeapNumber per load -- the very box being
+removed -- and the one-member-per-process lanes cannot see it. Rejected too: the caller stages seeds
+into the scratch for a shared helper (a forgotten store hashes with another instance's seed =
+false negatives, fail-OPEN). Field-free module helpers are allowed: `_ckAlt(fp)` (Cuckoo alt
+bucket, `fp` < 2^16) and `_mixTail()` (Xor/BF `t` and `fp` words, reads/writes `_HG` only).
+Xor/BF BUILD stays on plain `fmix32` (cold: every attempt allocates scaffold) -- new ADR.
+The helpers are PERMITTED, not mandated. Mixing as LOCALS inside the hot method's own frame is THE
+RULE's first form and is preferred where the `_HG` round-trips cost: the Xor/BF int query inlines
+its four fmix bodies as locals (coder measurement: BinaryFuse int has 0.75x -> 0.90x vs 1.2.0).
+
+Boundaries the first draft of this section MISSED (planner enumeration, confirmed in HEAD):
+- XorFilter query `t = fmix32((h ^ g) | 0)` / `fp = fmix32((h + g) | 0)` (Filter.js:3501-3502) and
+  BinaryFuse query (Filter.js:3873-3874): four mixer calls per query, not two -- why V3 still reads
+  3 -> 20 / 3 -> 23 on d8.
+- Cuckoo kick loop `vf = fmix32(Math.imul(victim, 0x5bd1e995))` (Filter.js:2357), once per kick.
+- Quotient `_runStart` / `_place` index arguments: Smis unless nslots > 2^30 (>= 1 GiB store).
+  Accepted with a code note.
+- The snapshot API is static `restore(snap, opts)`, not `load`.
+Re-entrancy invariant: no user code (`String()`, `toString`, `valueOf`) may run between a write
+to `_HG` and its read.
+
+TASKS
+1. Int mixer: the int hot path of every member stops calling `fmix32`. It calls a mixer that takes
+   only tagged refs -- `(this, key)` -- runs the fmix32 body in its OWN frame, reads `_seed` /
+   `_seed2` there (double-representation fields; a load inside the frame never boxes, a load passed
+   as an argument does), and writes the words into a module `Int32Array` scratch (`_HG`). The caller
+   reads `_HG[i] >>> 0` locally. Spike (RESEARCH 2.6): Bloom only, 0 -> 0 on d8 AND Node no-inline,
+   parity 0 differences. Planner decides: one shared helper (megamorphic `_seed` loads across 7
+   maps -- measure it in the perf lane) vs a per-class method, and whether a member needs one word
+   (Quotient), two (Bloom family, Xor/BF h + g) or a different input (Cuckoo's alt-bucket
+   `fmix32(Math.imul(fp, 0x5bd1e995))`, Filter.js:2322). Each mixer copy must stay byte-identical
+   to fmix32 -- a parity witness per member, not "looks the same".
+2. BinaryFuse: `mulhiU32` takes 16-bit halves, `mulhiU32(h >>> 16, h & 0xffff, scl)` (query
+   Filter.js:3876 and `_bfTryBuild` Filter.js:1079). Its body already reads its first argument only
+   as `>>> 16` / `& 0xffff`. Its return is < `scl` <= `BF_MAX_SLOTS` (0x3fffffff), a Smi on both
+   engines. `scl` is also passed; confirm it is a Smi on the build path (it is < 2^30 by cap).
+3. Quotient: the int branch of `_hash` goes through the TASK 1 mixer; the `_hash` return is consumed
+   only as `& this._pMask` (Filter.js:2814, 2907, 2946), so the caller can read the scratch slot
+   directly and `_hash` need not return a word at all on the int path.
+4. `fmix32` / `hashStr` themselves: keep them for cold and string paths. Return signed (`| 0`) with
+   `>>> 0` at the caller (the V3 change) where that is byte-identical and cheap; it removes the Node
+   boxing on the string path for free. There are 64 `fmix32(` call sites (68 occurrences = 1
+   definition + 3 doc comments + 64) and 19 `hashStr(` call sites. The V3 patch was a blind sed that
+   also rewrote a doc comment (Filter.js:151); the coder edits code only, and doc comments only
+   where the text becomes false.
+   - The cold checksum (Filter.js:850-859) passes `>>> 0` arguments; switch them to `| 0`
+     (byte-identical: fmix32 opens with `h ^= h >>> 16`) or leave them with a one-line note -- cold
+     is outside THE RULE, but say so.
+   - `_hashKey` (Filter.js:1355, 1722, 2037, 2471): V2 failed because callers consume `a`
+     non-bitwise. If `_hashKey` returns signed, its callers do `this._hashKey(key) >>> 0`.
+5. STRING path is OUT of 1.2.1's zero-box claim. `hashStr(key, this._seed)` passes a double-field
+   seed and returns a 32-bit word, so it boxes per op in a non-inlined consumer on either engine.
+   Inline lanes stay 0 (unchanged). Docs say so; the Smi-width-proof string path is H3 with its own
+   lane (same pattern: `(this, str)` in, scratch out).
+6. Docs: README / llms.txt / d.ts zero-GC wording states the gated lanes exactly -- int keys, inline
+   and no-inline, Node and d8 -- and that the CALLER must pass keys in [-2^30, 2^30) on 31-bit-Smi
+   engines (a key outside it is boxed at the caller's own `has(k)` call, before the library runs).
+   Fix the mightContain doc comment "Zero allocation on the int + string paths" to the gated truth.
+   CHANGELOG 1.2.1. RESEARCH 1.6 already carries the correction note.
+
+GATES (each must FAIL on 1.2.0 -- revert-check before /release)
+- Perf, Node: `--max-inlined-bytecode-size=0` lane AND inline lane, every member, int keys over the
+  full int32 range (`Math.imul(i + 1, 2654435761) | 0`; insert 2048, probe 4096 = half hits / half
+  misses; plus the +-2^31 edges), maxScavenges 0. 1.2.0 reads 3..12 no-inline (Quotient 0 -> 3 is
+  the low end) and BinaryFuse 0 -> 3 inline. The current "BinaryFuse query-hit" lane passes on
+  1.2.0, so it lacks teeth.
+- Perf, d8 (31-bit Smis): same members and op mix, keys in [-2^30, 2^30)
+  (`Math.imul(i + 1, 2654435761) >> 1`, so the CALLER never boxes and every scavenge is the
+  library's), inline and no-inline, maxScavenges 0, with a `nop` control lane that must read 0.
+  Template: `research/h2-proto/probe-d8.mjs` + `run-d8.mjs` (`KS=smi31`). 1.2.0 reads 1..3 -> 8..25
+  no-inline; V3 reads 1..3 -> 7..23, so this lane also rejects V3.
+  - FAIL CLOSED when d8 is absent: the lane is a FAIL with the install hint, never a skip
+    (suite law: no gate output is a FAIL). It lives in its own npm script (`test:perf:d8`) and
+    `verify` runs it. d8 lanes run as child processes from a node:test file (no runtime dep).
+- Parity vs `git show HEAD:Filter.js`: every member x {int, string} x seeds {default, 1,
+  0xdeadbeef, 0x80000000}: identical `add` / `remove` outcomes (including throws), `has` over 50k
+  probe keys, `size` / `seed` / `capacity`, and `dump()` bytes. Template:
+  `research/h2-proto/parity.mjs` (160,308 checks; V3 reads 0 differences). Add a `load(dump())`
+  round-trip, and run the parity file on d8 as well (the arithmetic must not depend on the engine).
+- Unchanged: 516 unit tests, torture (same FPR figures -- FPR identical to 1.2.0 is itself a parity
+  witness), controls, perf 30 + the new lanes. Wall-clock: report ops/s for the int `has` lane vs
+  1.2.0 on Node inline; a regression over 10% needs a written justification in the CHANGELOG.
+
+SESSION PLAN (2026-10-05)
+0. Done this session: harness copied to `research/h2-proto/` (parity + Node probe reproduce exactly);
+   d8 installed and verified 31-bit (`%IsSmi(2**30) === false`); d8 probe + Bloom spike (`mk-v4.mjs`).
+1. planner (read-only): spec + atomic tasks + falsifiable assertions from this section; enumerate
+   every int hot-path boundary per member; settle shared-vs-per-class mixer.
+2. coder: GATES first (both perf lanes + parity file), proven red on 1.2.0 and on V3; then TASKS 1-4
+   member by member, Node + d8 lanes after each; then `node --expose-gc test/torture.mjs`.
+3. reviewer (read-only): THE RULE audit over the diff (every argument and return on the int path),
+   gate teeth, doc truth. REJECTED goes back to coder.
+4. coder: TASK 6 docs. qa: boundary suite + ASSERTIONS + `npm run verify` incl. `test:perf:d8`.
+5. Revert-check every new gate against 1.2.0, then hand to the maintainer for `/release 1.2.1`.
+   lite-hud M5 then pins `>= 1.2.1` and adopts the [-2^30, 2^30) key fold (RESEARCH 2.6).
+
+### H2 rejection ledger (what was measured and NOT shipped)
+
+- V2 -- signed `hashStr` with unwrapped callers: FAILED parity (BlockedBloom string `has` / `dump`
+  changed; XorFilter string `from()` threw) -- some string-path consumers use the word non-bitwise.
+- V3 -- signed returns + `>>> 0` at the caller: Node-clean (0 -> 0) but d8 still boxes (Bloom
+  1 -> 11, BinaryFuse 3 -> 23 non-inlined). Node-only; superseded by the scratch / locals design.
+- One shared mixer helper: 7 maps > the polymorphic limit 4; the megamorphic LoadIC re-boxes the
+  double-representation `_seed` per load. Invisible to one-member-per-process lanes.
+- Caller stages seeds into the scratch for a shared helper: 2 extra stores per hot body, and a
+  forgotten store hashes with another instance's seed (false negatives = fail-OPEN).
+- `_mixTail()` + `_HG` hand-off for the Xor/BF query: correct, but the round-trips cost; the
+  query mixes as locals instead (helper deleted, no callers).
+- Exact 2-product float mulhi inlined in the BinaryFuse query
+  (`floor(((h>>>16)*scl + floor((h&0xffff)*scl/2^16))/2^16)`, 0 mismatches vs BigInt over 2M
+  inputs): 0.71x ops/s vs 1.2.0 in the shared-process harness -- slower than the integer halves.
+- XorFilter query with UNSIGNED hash locals (`>>> 0` at the mixer tail, raw `%`): parity-clean,
+  d8 0 scavenges, 0.885 [0.842..0.924] -- inside the noise of the shipped form (0.856 / 0.886), so
+  the approved code was not changed for it.
+- Capping Quotient `MAX_NSLOTS` at 2^30 to make indices Smis: a behaviour change; the bound is
+  documented instead (decisions/0027).
+- Shared-process `opsps` (OLD then NEW through one `f.has` site): biased against the new code
+  (BinaryFuse read 0.75 / 0.87 there vs ~1.03 isolated). Replaced by interleaved per-process pairs.
 
 ## See also
 

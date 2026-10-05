@@ -238,6 +238,15 @@ async function main() {
     // so heapUsed climbs and the major-GC / pause gate rejects the window.
     const sink = BREAK ? [] : null;
 
+    // Settle the heap on a CLEAN slate before opening the profiler window. The gc() at the
+    // end of phase 1 (above) runs BEFORE the seven phase-2 instances are built -- and the two
+    // STATIC builds (XorFilter.from / BinaryFuse.from over the full 2^16 key set) allocate
+    // large transient peel scaffolds that are garbage by the time the window opens. Reclaiming
+    // that pre-window garbage is a ONE-TIME major GC that V8 may schedule inside the window; it
+    // is NOT a hot-loop allocation and must not be miscounted against the steady-state gate
+    // (maxMajor:0 is unchanged -- the budget is not widened). This matches the torture-harness
+    // skill template, which gc()s immediately before the measured loop.
+    globalThis.gc();
     const gc = new GcProfiler().start();
     const heapBefore = process.memoryUsage().heapUsed;
     let acc = 0;

@@ -18,7 +18,7 @@ via <Member>.from(keys) and throw on add/remove/clear. Single-file ESM, zero run
 dependencies, node:test only. Ships a runnable + importable bench (Bench.mjs) that measures
 ACTUAL vs THEORETICAL false-positive rate on your own keys, checked against a real Set oracle.
 
-## Status: 1.2.0 - introspection getters (keysMode, seed, maxLoad, saturation) + signed-fold int-key guidance; litefilter/3 snapshots unchanged. Family complete and API frozen since 1.0.0 - Bloom (reference) + CountingBloom (deletable) + BlockedBloom (cache-local) + Cuckoo (fingerprint) + Quotient (mergeable/resizable) + XorFilter (static, space-optimal) + BinaryFuse (static, smallest).
+## Status: 1.2.1 - Smi-width-proof int hot path: zero-alloc inline and non-inlined on Node and 31-bit-Smi engines (Chrome; gated on V8 d8); byte-identical to 1.2.0, litefilter/3 snapshots unchanged. 1.2.0 added introspection getters (keysMode, seed, maxLoad, saturation) + signed-fold int-key guidance. Family complete and API frozen since 1.0.0 - Bloom (reference) + CountingBloom (deletable) + BlockedBloom (cache-local) + Cuckoo (fingerprint) + Quotient (mergeable/resizable) + XorFilter (static, space-optimal) + BinaryFuse (static, smallest).
 
 The problem it solves: "have I seen this key?" -- dedup, set membership, cache
 admission -- at a handful of BITS per entry instead of the tens of bytes a Set costs
@@ -33,8 +33,12 @@ behavior on your keys, instead of copying a number from a paper.
 
 ## The surface (LiteFilter<K>)
 
-- add(key) -> void: record a key. Zero allocation on keys:'int' and string paths;
-  arbitrary keys are amortized where they must String()-encode.
+- add(key) -> void: record a key. Zero-alloc on the keys:'int' path INLINE and NON-INLINED,
+  on 32-bit-Smi (Node) and 31-bit-Smi (Chrome/d8) engines; the string path is zero-alloc only
+  when the hash inlines into the caller (a non-inlined string path boxes its 32-bit word on 31-bit-Smi engines; Node partly unmeasured -- H3).
+  Arbitrary keys are amortized where they must String()-encode. On a 31-bit-Smi engine keep int
+  keys in [-2^30, 2^30) -- a key outside it is boxed by your OWN add(k)/has(k), before this
+  library runs (fold with (x << 1) >> 1, not just | 0 -- a lossy fold, adds only false positives).
 - mightContain(key) -> boolean: the query. NO false negatives -- an added key ALWAYS
   reads true. A true on a never-added key is a false POSITIVE, bounded by the
   configured fpp. One-sided: false positives only.
@@ -71,7 +75,10 @@ Cross-cutting, mirrored from lite-lru:
   TypeError. THE SIGNED-FOLD TRAP (decisions/0024): fold a composite signature with `| 0`,
   NEVER `>>> 0` -- a `>>> 0` fold yields [2^31, 2^32) for half its domain and THROWS on the hot
   path for exactly those keys (never a silent alias). The error text names the fix. Example:
-  add(((sid << 20) | (op << 12) | code) | 0).
+  add(((sid << 20) | (op << 12) | code) | 0). THE 31-BIT-SMI CALLER CAVEAT (decisions/0027):
+  on Chrome/d8 (31-bit Smis) additionally keep keys in [-2^30, 2^30) -- a key outside it is boxed
+  by your OWN call before the library runs; fold with (x << 1) >> 1, not just | 0 (a LOSSY fold:
+  x and x ^ 0x80000000 collide, so it can only add false positives, never a false negative).
 - Opt-in stats { stats: true }: a per-instance holder { adds, queries, hits, misses };
   OFF by default so the hot path writes nothing (_stats === null). stats()/resetStats()
   fail closed on a non-stats instance.
@@ -262,8 +269,15 @@ is a hypothesis, not your filter's behavior on your keys -- MEASURE.
 
 ## Guarantees
 
-- Zero allocation on add + mightContain (strict on keys:'int'; string keys too).
-  Proven by node --expose-gc test/torture.mjs and the lite-perf-gate scenarios.
+- Zero-alloc on the keys:'int' add/mightContain path INLINE and NON-INLINED, on 32-bit-Smi
+  (Node) and 31-bit-Smi (Chrome/d8) engines -- 0 scavenges at 1.6M ops for every member, gated
+  by test/perf/SmiWidth.test.mjs (Node) and test/perf/SmiWidthD8.test.mjs (d8; fails CLOSED, not
+  skipped, when d8 is absent). The string path is zero-alloc only when the hash inlines into the
+  caller (a non-inlined string path boxes its 32-bit word on 31-bit-Smi engines; Node partly unmeasured -- deferred to H3). On a 31-bit-Smi
+  engine the caller must keep int keys in [-2^30, 2^30) (a key outside it boxes at the caller's
+  own add(k)/has(k), before this library runs; fold (x << 1) >> 1 -- lossy, adds only false
+  positives -- decisions/0027). Proven by
+  node --expose-gc test/torture.mjs and the lite-perf-gate scenarios.
 - No false negatives: 1e6 adds then requery = exactly 0 false negatives (torture).
 - Bounded FPR: n=1e5, fpp=0.01, 1e6 disjoint probes -> measured FPR <= 0.0125
   (<= 25% over the formula), checked against a Set oracle (torture).
@@ -290,6 +304,8 @@ is a hypothesis, not your filter's behavior on your keys -- MEASURE.
   small over-filled filter PROVABLY THROWS at the 0.90 load ceiling and a thrown add is a
   byte-identical no-op (torture, decisions/0016). metadata-set-slot count == size and
   per-cluster #homes == #runs after churn (validateQuotient -- the shift-back repair proof).
+  The int path is Smi-width-proof for nslots <= 2^30 (the next size up, 2^31 slots, boxes its
+  array-index arguments on 31-bit-Smi engines; hash words are unaffected -- decisions/0027).
 - XorFilter static + space-optimal + fail-closed: mightContain on keys:'int' is 0 scavenges
   at N=200000 and 8N=1600000 (perf-gate; 3 hashes, 3 modulo reductions, an XOR-compare, no
   scratch); a filter built from 1e6 distinct keys reads back with EXACTLY 0 false negatives
@@ -313,10 +329,14 @@ is a hypothesis, not your filter's behavior on your keys -- MEASURE.
 
 ## Testing
 
-node:test only. npm test (boundary suite), npm run test:types (tsc surface gate),
-npm run torture (leak + GC gate + differential oracle), npm run torture:controls
-(the must-fail proof), npm run test:perf (lite-perf-gate zero-alloc scenarios),
-npm run bench (the measurement tool), npm run verify (all of the gates).
+node:test only. npm test (boundary suite + Parity vs the frozen 1.2.0 fixture),
+npm run test:types (tsc surface gate), npm run torture (leak + GC gate + differential
+oracle), npm run torture:controls (the must-fail proof), npm run test:perf (lite-perf-gate
++ SmiWidth zero-alloc scenarios, Node inline AND --max-inlined-bytecode-size=0),
+npm run test:perf:d8 (the 31-bit-Smi lane on V8 d8 -- fails CLOSED if d8 is absent; get d8
+via `npx jsvu --os=<mac64arm|mac64|linux64|win64> --engines=v8` -- the gate looks for
+~/.jsvu/engines/v8/d8 -- or set $D8), npm run bench (the measurement tool),
+npm run verify (all of the gates, incl. test:perf:d8).
 
 ## What this is not
 

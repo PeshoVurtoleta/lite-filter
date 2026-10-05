@@ -101,7 +101,7 @@
  * @license MIT
  */
 
-export const VERSION = "1.2.1";
+export const VERSION = "1.2.0";
 
 /* -------------------------------------------------------------------------- *
  * Constants + fail-closed messages (built ONCE, thrown only on misuse).
@@ -148,7 +148,7 @@ const STATS_OFF_MSG =
  *  detectable break rather than a silent misread. Bumped to `litefilter/2` in v0.6.0
  *  (every snapshot carries an integrity checksum `chk`, decisions/0021). Bumped to
  *  `litefilter/3` in 1.1.0 (decisions/0023): the XOR / Binary Fuse string-key second
- *  hash `g` changed from `fmix32(h ^ seed2)` to an INDEPENDENT `hashStr(s, seed2)`, so a
+ *  hash `g` changed from `(fmix32(h ^ seed2) >>> 0)` to an INDEPENDENT `hashStr(s, seed2)`, so a
  *  `litefilter/2` XOR/BF snapshot would read back false negatives on string keys. One tag
  *  is ONE algorithm for the whole family: even members whose bytes are unchanged (Bloom,
  *  int-mode filters) are re-tagged, so a stale snapshot is a clean detectable break rather
@@ -481,11 +481,7 @@ const LN2SQ = Math.LN2 * Math.LN2;
 /**
  * murmur3 fmix32 -- the 32-bit avalanche finalizer. `Math.imul` is an EXACT 32-bit
  * multiply (zero-alloc), and `>>>` coerces to unsigned, so a single set bit in the
- * input spreads across the whole word. Returns a SIGNED 32-bit integer (`h | 0`): a
- * signed return is a Smi on a 32-bit-Smi engine, so it does not box on the string /
- * cold paths that still call this (ROADMAP 13). The hot int paths do NOT call this --
- * they use a per-class `_mixInt` with a byte-identical body. Callers that consume the
- * result NON-bitwise (`%`, `+`) wrap `>>> 0`; purely bitwise callers read it raw.
+ * input spreads across the whole word. Returns an unsigned 32-bit integer.
  */
 function fmix32(h) {
     h ^= h >>> 16;
@@ -497,20 +493,15 @@ function fmix32(h) {
 }
 
 /**
- * The high 32 bits of the 32x32 -> 64-bit unsigned product `x * b`, where `x = (ah << 16) | al`
- * (decisions/0022). This IS Lemire's multiply-shift range reduction:
- * `mulhiU32(x >>> 16, x & 0xffff, N) === floor(x * N / 2^32)`, a value uniformly in `[0, N)` for a
- * well-mixed 32-bit `x` -- the Binary Fuse segment-base selector. Computed via four 16x16 partial
- * products so every intermediate stays a safe integer (the full `x * b` would exceed 2^53 and lose
- * precision). Zero allocation -- pure integer arithmetic -- so it is safe on the query hot path.
- * Returns an unsigned 32-bit int.
- *
- * The first operand is passed as its two 16-bit halves (`ah = h >>> 16`, `al = h & 0xffff`)
- * -- both Smis -- so THE RULE holds: a full 32-bit word never crosses this call boundary to
- * be boxed on a 31-bit-Smi engine (ROADMAP 13). `b` (= `scl`) is < 2^30 (a Smi) by
- * construction, and the return is < `scl` (< 2^30), a Smi on both engines.
+ * The high 32 bits of the 32x32 -> 64-bit unsigned product `a * b` (decisions/0022). This
+ * IS Lemire's multiply-shift range reduction: `mulhiU32(x, N) === floor(x * N / 2^32)`, a
+ * value uniformly in `[0, N)` for a well-mixed 32-bit `x` -- the Binary Fuse segment-base
+ * selector. Computed via four 16x16 partial products so every intermediate stays a safe
+ * integer (`a*b` alone would exceed 2^53 and lose precision). Zero allocation -- pure
+ * integer arithmetic -- so it is safe on the query hot path. Returns an unsigned 32-bit int.
  */
-function mulhiU32(ah, al, b) {
+function mulhiU32(a, b) {
+    const ah = a >>> 16, al = a & 0xffff;
     const bh = b >>> 16, bl = b & 0xffff;
     const albl = al * bl;
     const albh = al * bh;
@@ -520,78 +511,11 @@ function mulhiU32(ah, al, b) {
     return (ahbh + (albh >>> 16) + (ahbl >>> 16) + carry) >>> 0;
 }
 
-/* -------------------------------------------------------------------------- *
- * THE RULE (ROADMAP 13, SETTLED -- Smi-width-proof int hot path). On a hot path NO
- * value that can leave [-2^30, 2^30) crosses a call boundary (argument OR return): on
- * a pointer-compressed engine (31-bit Smis, e.g. Chrome/d8) such a value is boxed into
- * a ~16 B HeapNumber whenever the boundary is not inlined, and a consumer's hot path is
- * the non-inlined case. Only tagged refs (`this`, the caller's own key), Smis (16-bit
- * halves, indices, counts) and `undefined` may cross. A 32-bit hash word is produced
- * and consumed in ONE frame, or handed over through the module scratch `_HG`; a caller
- * reads `_HG[i] >>> 0` where the word is consumed NON-bitwise (`%`, `+`) and the raw
- * signed `_HG[i]` where consumption is purely bitwise (`&`, `^`, `| 1`).
- *
- * RE-ENTRANCY INVARIANT: no user code (`String()`, `toString`, `valueOf`) may run
- * between a write to `_HG` and its read. On the int path no user code runs at all; on
- * the string path `String(key)` is evaluated BEFORE the `_HG` write, never between.
- *
- * GATED SCOPE (what "zero-alloc" means, exactly). The INT path (`keys:'int'`) is zero-alloc
- * both INLINE and NON-INLINED, on 32-bit-Smi engines (Node, keys >= 2^31) AND 31-bit-Smi
- * engines (Chrome/d8, keys outside [-2^30, 2^30)) -- gated at 0 scavenges / 1.6M ops per member
- * by test/perf/SmiWidth.test.mjs (Node) and SmiWidthD8.test.mjs (d8). CALLER CAVEAT: on a
- * 31-bit-Smi engine the caller must pass int keys IN [-2^30, 2^30) -- a key outside it is boxed
- * by the caller's OWN `has(k)` / `add(k)` expression, before this library runs (fold with
- * `(x << 1) >> 1`, not just `| 0` -- a LOSSY fold: `x` and `x ^ 0x80000000` collide, so it can
- * only add false positives, never a false negative). The STRING path is zero-alloc only when
- * `hashStr` INLINES into the caller; a non-inlined string path boxes its 32-bit return (H3).
- *
- * Each member's int mixer is a PER-CLASS method (`_mixInt`, or Quotient's `_hash`): a
- * shared helper would see 7 maps (> V8's polymorphic limit of 4) and the megamorphic
- * LoadIC would re-box the double-representation `_seed` / `_seed2` per load -- the very
- * box being removed (ROADMAP 13 SETTLED). Each mixer reads `this._seed` / `this._seed2`
- * in its OWN frame (a load inside the frame never boxes; a load passed as an argument
- * does) and is BYTE-IDENTICAL to `fmix32` -- proven per member by test/parity/parity.mjs.
- * `_mixInt` serves the mutable members (Bloom family, Cuckoo), whose add / query / remove
- * SHARE one mixer across call sites, so its two words are handed over through `_HG`. The
- * STATIC members (XorFilter, BinaryFuse) have a SINGLE query call site, so they inline all
- * four fmix32 bodies as locals -- THE RULE's primary "one frame" clause, no `_HG` hop (the
- * faster path; ROADMAP 13 permits, not mandates, the field-free helpers). Two FIELD-FREE hot
- * helpers exist: `_ckAlt(fp)` (writes `_HG[2]`, reads no `_HG`) and `mulhiU32(ah, al, b)`
- * (takes three Smis, reads no fields); both take only Smis / read no double-field, so they
- * stay monomorphic across every member that calls them.
- *
- * QUOTIENT INDEX BOUND: the Quotient int path is Smi-width-proof for `nslots <= 2^30`. Its
- * `_runStart` / `_place` index arguments (`q`, `s`, run/slot indices) are < `nslots`; `nslots`
- * is a power of two <= MAX_NSLOTS (2^31), so an index is a Smi on a 31-bit-Smi engine ONLY
- * while `nslots <= 2^30` (`nslots === 2^30` is INSIDE the bound; the first size above it is the
- * next power of two, `nslots === 2^31`, whose indices box on such engines). Hash words are
- * unaffected; this is purely the array-index geometry.
- * -------------------------------------------------------------------------- */
-
-/** Module hash scratch (ROADMAP 13). [0] = h, [1] = g are the two base words handed from a
- *  per-class `_mixInt` (or Quotient's `_hash`, [0] only) to its caller; [2] is the Cuckoo
- *  alt-bucket hash from `_ckAlt`. An Int32Array slot stores signed bits; a caller reads
- *  `>>> 0` only where the word is consumed non-bitwise. Single-threaded by construction. */
-const _HG = new Int32Array(3);
-
-/** Cuckoo alt-bucket hash `fmix32(Math.imul(fp, 0x5bd1e995))`, written to `_HG[2]`. `fp`
- *  is a fingerprint Smi (< 2^16), so it crosses as a Smi. Field-free -> monomorphic. The
- *  body is byte-identical to `fmix32`; the result is consumed bitwise (`i ^ _HG[2]`), so
- *  the caller reads the raw signed slot (no `>>> 0`). */
-function _ckAlt(fp) {
-    let h = Math.imul(fp, 0x5bd1e995) | 0;
-    h ^= h >>> 16; h = Math.imul(h, 0x85ebca6b); h ^= h >>> 13; h = Math.imul(h, 0xc2b2ae35); h ^= h >>> 16;
-    _HG[2] = h;
-}
-
 /**
  * murmur3-style 32-bit hash over a string's UTF-16 code units (decisions/0001).
  * `charCodeAt` returns a number -- the loop allocates NOTHING -- so string keys are
  * zero-alloc on the default backing too; only a non-string, non-int key pays a
- * `String()` encode (the honest AMORTIZED caveat). Returns a SIGNED 32-bit int (it
- * finishes with `fmix32`, now `| 0`); callers that consume it non-bitwise wrap `>>> 0`.
- * The string path is NOT in the 1.2.1 zero-box claim (a double-field seed + a 32-bit
- * return still box in a non-inlined consumer); H3 makes it Smi-width-proof.
+ * `String()` encode (the honest AMORTIZED caveat). Returns an unsigned 32-bit int.
  */
 function hashStr(str, seed) {
     let h = seed >>> 0;
@@ -605,7 +529,7 @@ function hashStr(str, seed) {
         h = (Math.imul(h, 5) + 0xe6546b64) | 0;
     }
     h ^= len;
-    return fmix32(h);
+    return (fmix32(h) >>> 0);
 }
 
 /* -------------------------------------------------------------------------- *
@@ -864,7 +788,7 @@ function _xorGuard(n) {
  *
  * The two-step SegmentCount clamp in the reference (which underflows through uint32 wrap for
  * n <= 1) reduces exactly to `max(1, initSegmentCount)`; we clamp explicitly rather than rely
- * on wraparound. `scl` is the multiply-shift domain: a key's first slot is `mulhiU32(h >>> 16, h & 0xffff, scl)`
+ * on wraparound. `scl` is the multiply-shift domain: a key's first slot is `mulhiU32(h, scl)`
  * in `[0, scl)`, its second/third are one/two segments further, so every slot stays in
  * `[0, arrayLen)`. Fails closed on `n < 1` (a filter over zero keys is undefined; null is not
  * zero) and on a request whose array would exceed the too-large cap. Cold -- called once by
@@ -920,21 +844,19 @@ const _CHK_BUF = new ArrayBuffer(8);
 const _CHK_F64 = new Float64Array(_CHK_BUF);
 const _CHK_U32 = new Uint32Array(_CHK_BUF);
 
-/** Fold one number into the running 32-bit checksum by its 64-bit bit pattern. Cold --
- *  outside THE RULE. `fmix32` now returns signed, but every use of its result here is
- *  bitwise (`h ^ ...`) or the final `h >>> 0`, so the checksum is byte-identical to 1.2.0. */
+/** Fold one number into the running 32-bit checksum by its 64-bit bit pattern. Cold. */
 function _chkNum(h, x) {
     _CHK_F64[0] = +x;
-    h = fmix32((h ^ _CHK_U32[0]) >>> 0);
-    h = fmix32((h ^ _CHK_U32[1]) >>> 0);
+    h = (fmix32((h ^ _CHK_U32[0]) >>> 0) >>> 0);
+    h = (fmix32((h ^ _CHK_U32[1]) >>> 0) >>> 0);
     return h >>> 0;
 }
 
 /** Fold one ASCII token (the tag, the member name, the keys-mode) into the checksum,
  *  length included so a truncation cannot collide. Cold. */
 function _chkStr(h, s) {
-    h = fmix32((h ^ hashStr(s, 0x9e3779b9)) >>> 0);
-    h = fmix32((h ^ (s.length >>> 0)) >>> 0);
+    h = (fmix32((h ^ hashStr(s, 0x9e3779b9)) >>> 0) >>> 0);
+    h = (fmix32((h ^ (s.length >>> 0)) >>> 0) >>> 0);
     return h >>> 0;
 }
 
@@ -1007,7 +929,7 @@ function verifySnapChecksum(snap, mem, dims, store) {
  * @param {Array} keys   the deduped keys (int32 numbers when int, else arbitrary)
  * @param {boolean} int  the keys:'int' backing (no String encode)
  * @param {number} seed  the attempt seed (32-bit unsigned)
- * @param {number} seed2 the derived second seed word (fmix32(seed ^ 0x9e3779b9))
+ * @param {number} seed2 the derived second seed word ((fmix32(seed ^ 0x9e3779b9) >>> 0))
  * @param {number} n     the deduped key count (edge count)
  * @param {number} bl    the per-segment length
  * @param {number} fw    the fingerprint width (8 or 16)
@@ -1033,8 +955,8 @@ function _xorTryBuild(keys, int, seed, seed2, n, bl, fw) {
             g = (fmix32((Math.imul(key | 0, 0x9e3779b1) ^ seed2) | 0) >>> 0);
         } else {
             const s = (typeof key === "string") ? key : String(key);
-            h = (hashStr(s, seed) >>> 0);
-            g = (hashStr(s, seed2) >>> 0);
+            h = hashStr(s, seed);
+            g = hashStr(s, seed2);
         }
         const t = (fmix32((h ^ g) | 0) >>> 0);
         eh0[e] = h % bl;
@@ -1100,7 +1022,7 @@ function _xorTryBuild(keys, int, seed, seed2, n, bl, fw) {
  * -- build the 3-uniform hypergraph, peel degree-1 vertices, and (ONLY on a complete peel)
  * reverse-assign so a key's three slots XOR to its fingerprint -- with a SINGLE change: the
  * three slot positions are the OVERLAPPING fuse segments, not XOR's three disjoint ones. The
- * first slot is `mulhiU32(h >>> 16, h & 0xffff, scl)` (a multiply-shift into `[0, scl)`); the second and third
+ * first slot is `mulhiU32(h, scl)` (a multiply-shift into `[0, scl)`); the second and third
  * are one and two segments further, each perturbed within its segment by `^ (g & segMask)` /
  * `^ (t & segMask)`. Because `segLen` is a power of two, adding it never disturbs the low
  * `log2(segLen)` bits, so the three slots always land in three DISTINCT consecutive segments
@@ -1116,7 +1038,7 @@ function _xorTryBuild(keys, int, seed, seed2, n, bl, fw) {
  * @param {Array} keys   the deduped keys (int32 numbers when int, else arbitrary)
  * @param {boolean} int  the keys:'int' backing (no String encode)
  * @param {number} seed  the attempt seed (32-bit unsigned)
- * @param {number} seed2 the derived second seed word (fmix32(seed ^ 0x9e3779b9))
+ * @param {number} seed2 the derived second seed word ((fmix32(seed ^ 0x9e3779b9) >>> 0))
  * @param {number} n     the deduped key count (edge count)
  * @param {{segLen:number,segCount:number,arrayLen:number,scl:number}} dims  the geometry
  * @param {number} fw    the fingerprint width (8 or 16)
@@ -1131,7 +1053,7 @@ function _bfTryBuild(keys, int, seed, seed2, n, dims, fw) {
 
     // Per-edge geometry: the three ABSOLUTE slot positions (one per consecutive segment) and
     // the fingerprint. Computed with EXACTLY the math the query hot path uses, so a key in the
-    // set always reads true. `mulhiU32(h >>> 16, h & 0xffff, scl)` is the segment-base selector (multiply-shift,
+    // set always reads true. `mulhiU32(h, scl)` is the segment-base selector (multiply-shift,
     // zero-branch); `^ (g & segMask)` / `^ (t & segMask)` place the other two within-segment.
     // NOTE (decisions/0022): h0 is the raw segment base with NO within-segment perturbation --
     // this MATCHES the FastFilter reference geometry (arity 3: the first slot is the multiply-
@@ -1150,11 +1072,11 @@ function _bfTryBuild(keys, int, seed, seed2, n, dims, fw) {
             g = (fmix32((Math.imul(key | 0, 0x9e3779b1) ^ seed2) | 0) >>> 0);
         } else {
             const s = (typeof key === "string") ? key : String(key);
-            h = (hashStr(s, seed) >>> 0);
-            g = (hashStr(s, seed2) >>> 0);
+            h = hashStr(s, seed);
+            g = hashStr(s, seed2);
         }
         const t = (fmix32((h ^ g) | 0) >>> 0);
-        const hi = mulhiU32(h >>> 16, h & 0xffff, scl);
+        const hi = mulhiU32(h, scl);
         eh0[e] = hi;
         eh1[e] = (hi + segLen) ^ (g & segMask);
         eh2[e] = (hi + 2 * segLen) ^ (t & segMask);
@@ -1360,7 +1282,7 @@ export class Bloom {
 
     /**
      * Record a key. Sets `k` bits derived from two base hashes via enhanced double
-     * hashing (decisions/0001). Zero-alloc on the int path (inline + non-inlined, both Smi widths -- see THE RULE); string path zero-alloc only inlined (H3); an
+     * hashing (decisions/0001). Zero allocation on the int + string paths; an
      * arbitrary key is amortized where it must `String()`-encode. Add-only -- there
      * is no `remove` (decisions/0003).
      */
@@ -1372,12 +1294,11 @@ export class Bloom {
             if (!Number.isInteger(key) || key < INT_MIN || key > INT_MAX) {
                 throw new TypeError(INT_KEY_MSG + String(key));
             }
-            this._mixInt(key);
-            a = _HG[0] >>> 0;
-            b = (_HG[1] | 1) >>> 0;
+            a = (fmix32((key ^ this._seed) | 0) >>> 0);
+            b = ((fmix32((Math.imul(key | 0, 0x9e3779b1) ^ this._seed2) | 0) >>> 0) | 1) >>> 0;
         } else {
             a = this._hashKey(key);
-            b = (fmix32(a ^ this._seed2) | 1) >>> 0;
+            b = ((fmix32(a ^ this._seed2) >>> 0) | 1) >>> 0;
         }
         const words = this._words;
         const k = this._k;
@@ -1392,7 +1313,7 @@ export class Bloom {
     /**
      * The query. Returns true only if ALL `k` bits are set. One-sided: NO false
      * negatives (an added key always reads true), only false POSITIVES bounded by
-     * the configured fpp. Zero-alloc on the int path (inline + non-inlined, both Smi widths -- see THE RULE); string path zero-alloc only inlined (H3).
+     * the configured fpp. Zero allocation on the int + string paths.
      */
     mightContain(key) {
         const m = this._m;
@@ -1401,12 +1322,11 @@ export class Bloom {
             if (!Number.isInteger(key) || key < INT_MIN || key > INT_MAX) {
                 throw new TypeError(INT_KEY_MSG + String(key));
             }
-            this._mixInt(key);
-            a = _HG[0] >>> 0;
-            b = (_HG[1] | 1) >>> 0;
+            a = (fmix32((key ^ this._seed) | 0) >>> 0);
+            b = ((fmix32((Math.imul(key | 0, 0x9e3779b1) ^ this._seed2) | 0) >>> 0) | 1) >>> 0;
         } else {
             a = this._hashKey(key);
-            b = (fmix32(a ^ this._seed2) | 1) >>> 0;
+            b = ((fmix32(a ^ this._seed2) >>> 0) | 1) >>> 0;
         }
         const words = this._words;
         const k = this._k;
@@ -1427,29 +1347,14 @@ export class Bloom {
      *  false negatives). One canonical name + one alias, never three. */
     has(key) { return this.mightContain(key); }
 
-    /** Smi-width-proof int mixer (ROADMAP 13, THE RULE). Runs two byte-identical fmix32
-     *  bodies in THIS frame, reading `this._seed` / `this._seed2` here (never passed as an
-     *  argument, which would box them), and writes the two base words to `_HG[0]` / `_HG[1]`.
-     *  Returns NOTHING -- no 32-bit word crosses the call boundary. The caller reads the
-     *  slots, applying `>>> 0` only where it consumes a word non-bitwise. Per-class (not a
-     *  shared helper) so the `_seed` loads stay monomorphic (ROADMAP 13 SETTLED). */
-    _mixInt(key) {
-        let h = (key ^ this._seed) | 0;
-        h ^= h >>> 16; h = Math.imul(h, 0x85ebca6b); h ^= h >>> 13; h = Math.imul(h, 0xc2b2ae35); h ^= h >>> 16;
-        _HG[0] = h;
-        let g = (Math.imul(key | 0, 0x9e3779b1) ^ this._seed2) | 0;
-        g ^= g >>> 16; g = Math.imul(g, 0x85ebca6b); g ^= g >>> 13; g = Math.imul(g, 0xc2b2ae35); g ^= g >>> 16;
-        _HG[1] = g;
-    }
-
     /**
      * Hash an arbitrary key to a 32-bit base (decisions/0001). A string hashes over
      * its code units (alloc-free); any other type is `String()`-encoded first (the
      * honest amortized caveat). Never called on the keys:'int' path.
      */
     _hashKey(key) {
-        if (typeof key === "string") return (hashStr(key, this._seed) >>> 0);
-        return (hashStr(String(key), this._seed) >>> 0);
+        if (typeof key === "string") return hashStr(key, this._seed);
+        return hashStr(String(key), this._seed);
     }
 
     // --- add-only door (decisions/0003) ---------------------------------------
@@ -1695,7 +1600,7 @@ export class CountingBloom {
      * Record a key. Increments `k` 4-bit counters derived from two base hashes via
      * enhanced double hashing (decisions/0001). Each increment SATURATES at 15
      * (decisions/0008): a counter already at 15 stays 15, it never wraps to 0. Zero
-     * allocation on the int path (string path only inlined -- H3); nibble read/modify/write is pure int ops.
+     * allocation on the int + string paths; nibble read/modify/write is pure int ops.
      */
     add(key) {
         const m = this._m;
@@ -1704,12 +1609,11 @@ export class CountingBloom {
             if (!Number.isInteger(key) || key < INT_MIN || key > INT_MAX) {
                 throw new TypeError(INT_KEY_MSG + String(key));
             }
-            this._mixInt(key);
-            a = _HG[0] >>> 0;
-            b = (_HG[1] | 1) >>> 0;
+            a = (fmix32((key ^ this._seed) | 0) >>> 0);
+            b = ((fmix32((Math.imul(key | 0, 0x9e3779b1) ^ this._seed2) | 0) >>> 0) | 1) >>> 0;
         } else {
             a = this._hashKey(key);
-            b = (fmix32(a ^ this._seed2) | 1) >>> 0;
+            b = ((fmix32(a ^ this._seed2) >>> 0) | 1) >>> 0;
         }
         const cnts = this._cnts;
         const k = this._k;
@@ -1738,12 +1642,11 @@ export class CountingBloom {
             if (!Number.isInteger(key) || key < INT_MIN || key > INT_MAX) {
                 throw new TypeError(INT_KEY_MSG + String(key));
             }
-            this._mixInt(key);
-            a = _HG[0] >>> 0;
-            b = (_HG[1] | 1) >>> 0;
+            a = (fmix32((key ^ this._seed) | 0) >>> 0);
+            b = ((fmix32((Math.imul(key | 0, 0x9e3779b1) ^ this._seed2) | 0) >>> 0) | 1) >>> 0;
         } else {
             a = this._hashKey(key);
-            b = (fmix32(a ^ this._seed2) | 1) >>> 0;
+            b = ((fmix32(a ^ this._seed2) >>> 0) | 1) >>> 0;
         }
         const cnts = this._cnts;
         const k = this._k;
@@ -1778,12 +1681,11 @@ export class CountingBloom {
             if (!Number.isInteger(key) || key < INT_MIN || key > INT_MAX) {
                 throw new TypeError(INT_KEY_MSG + String(key));
             }
-            this._mixInt(key);
-            a = _HG[0] >>> 0;
-            b = (_HG[1] | 1) >>> 0;
+            a = (fmix32((key ^ this._seed) | 0) >>> 0);
+            b = ((fmix32((Math.imul(key | 0, 0x9e3779b1) ^ this._seed2) | 0) >>> 0) | 1) >>> 0;
         } else {
             a = this._hashKey(key);
-            b = (fmix32(a ^ this._seed2) | 1) >>> 0;
+            b = ((fmix32(a ^ this._seed2) >>> 0) | 1) >>> 0;
         }
         const cnts = this._cnts;
         const k = this._k;
@@ -1812,29 +1714,14 @@ export class CountingBloom {
         return true;
     }
 
-    /** Smi-width-proof int mixer (ROADMAP 13, THE RULE). Runs two byte-identical fmix32
-     *  bodies in THIS frame, reading `this._seed` / `this._seed2` here (never passed as an
-     *  argument, which would box them), and writes the two base words to `_HG[0]` / `_HG[1]`.
-     *  Returns NOTHING -- no 32-bit word crosses the call boundary. The caller reads the
-     *  slots, applying `>>> 0` only where it consumes a word non-bitwise. Per-class (not a
-     *  shared helper) so the `_seed` loads stay monomorphic (ROADMAP 13 SETTLED). */
-    _mixInt(key) {
-        let h = (key ^ this._seed) | 0;
-        h ^= h >>> 16; h = Math.imul(h, 0x85ebca6b); h ^= h >>> 13; h = Math.imul(h, 0xc2b2ae35); h ^= h >>> 16;
-        _HG[0] = h;
-        let g = (Math.imul(key | 0, 0x9e3779b1) ^ this._seed2) | 0;
-        g ^= g >>> 16; g = Math.imul(g, 0x85ebca6b); g ^= g >>> 13; g = Math.imul(g, 0xc2b2ae35); g ^= g >>> 16;
-        _HG[1] = g;
-    }
-
     /**
      * Hash an arbitrary key to a 32-bit base (decisions/0001). A string hashes over
      * its code units (alloc-free); any other type is `String()`-encoded first (the
      * honest amortized caveat). Never called on the keys:'int' path.
      */
     _hashKey(key) {
-        if (typeof key === "string") return (hashStr(key, this._seed) >>> 0);
-        return (hashStr(String(key), this._seed) >>> 0);
+        if (typeof key === "string") return hashStr(key, this._seed);
+        return hashStr(String(key), this._seed);
     }
 
     // --- cold inspection ------------------------------------------------------
@@ -2076,7 +1963,7 @@ export class BlockedBloom {
     /**
      * Record a key. Routes the key to ONE 512-bit block (from the first base hash) and
      * sets k bits INSIDE it via an odd-stride walk (decisions/0012), so a whole add
-     * touches one cache line. Zero-alloc on the int path (inline + non-inlined, both Smi widths -- see THE RULE); string path zero-alloc only inlined (H3). Add-only --
+     * touches one cache line. Zero allocation on the int + string paths. Add-only --
      * there is no remove (decisions/0003).
      */
     add(key) {
@@ -2085,12 +1972,11 @@ export class BlockedBloom {
             if (!Number.isInteger(key) || key < INT_MIN || key > INT_MAX) {
                 throw new TypeError(INT_KEY_MSG + String(key));
             }
-            this._mixInt(key);
-            a = _HG[0] >>> 0;
-            b = (_HG[1] | 1) >>> 0;
+            a = (fmix32((key ^ this._seed) | 0) >>> 0);
+            b = ((fmix32((Math.imul(key | 0, 0x9e3779b1) ^ this._seed2) | 0) >>> 0) | 1) >>> 0;
         } else {
             a = this._hashKey(key);
-            b = (fmix32(a ^ this._seed2) | 1) >>> 0;
+            b = ((fmix32(a ^ this._seed2) >>> 0) | 1) >>> 0;
         }
         const words = this._words;
         const k = this._k;
@@ -2109,7 +1995,7 @@ export class BlockedBloom {
      * The query. Returns true only if ALL k block-local bits are set. One-sided: NO
      * false negatives (an added key always reads true), only false POSITIVES -- whose
      * MEASURED rate runs OVER the plain-Bloom formula (decisions/0013). Zero allocation
-     * on the int path (string path only inlined -- H3); returns false on the first unset bit (no alloc).
+     * on the int + string paths; returns false on the first unset bit (no alloc).
      */
     mightContain(key) {
         let a, b;
@@ -2117,12 +2003,11 @@ export class BlockedBloom {
             if (!Number.isInteger(key) || key < INT_MIN || key > INT_MAX) {
                 throw new TypeError(INT_KEY_MSG + String(key));
             }
-            this._mixInt(key);
-            a = _HG[0] >>> 0;
-            b = (_HG[1] | 1) >>> 0;
+            a = (fmix32((key ^ this._seed) | 0) >>> 0);
+            b = ((fmix32((Math.imul(key | 0, 0x9e3779b1) ^ this._seed2) | 0) >>> 0) | 1) >>> 0;
         } else {
             a = this._hashKey(key);
-            b = (fmix32(a ^ this._seed2) | 1) >>> 0;
+            b = ((fmix32(a ^ this._seed2) >>> 0) | 1) >>> 0;
         }
         const words = this._words;
         const k = this._k;
@@ -2144,29 +2029,14 @@ export class BlockedBloom {
     /** The SOLE alias of `mightContain` (decisions/0003), same one-sided semantics. */
     has(key) { return this.mightContain(key); }
 
-    /** Smi-width-proof int mixer (ROADMAP 13, THE RULE). Runs two byte-identical fmix32
-     *  bodies in THIS frame, reading `this._seed` / `this._seed2` here (never passed as an
-     *  argument, which would box them), and writes the two base words to `_HG[0]` / `_HG[1]`.
-     *  Returns NOTHING -- no 32-bit word crosses the call boundary. The caller reads the
-     *  slots, applying `>>> 0` only where it consumes a word non-bitwise. Per-class (not a
-     *  shared helper) so the `_seed` loads stay monomorphic (ROADMAP 13 SETTLED). */
-    _mixInt(key) {
-        let h = (key ^ this._seed) | 0;
-        h ^= h >>> 16; h = Math.imul(h, 0x85ebca6b); h ^= h >>> 13; h = Math.imul(h, 0xc2b2ae35); h ^= h >>> 16;
-        _HG[0] = h;
-        let g = (Math.imul(key | 0, 0x9e3779b1) ^ this._seed2) | 0;
-        g ^= g >>> 16; g = Math.imul(g, 0x85ebca6b); g ^= g >>> 13; g = Math.imul(g, 0xc2b2ae35); g ^= g >>> 16;
-        _HG[1] = g;
-    }
-
     /**
      * Hash an arbitrary key to a 32-bit base (decisions/0001). A string hashes over its
      * code units (alloc-free); any other type is `String()`-encoded first (the honest
      * amortized caveat). Never called on the keys:'int' path.
      */
     _hashKey(key) {
-        if (typeof key === "string") return (hashStr(key, this._seed) >>> 0);
-        return (hashStr(String(key), this._seed) >>> 0);
+        if (typeof key === "string") return hashStr(key, this._seed);
+        return hashStr(String(key), this._seed);
     }
 
     // --- add-only door (decisions/0003) ---------------------------------------
@@ -2428,7 +2298,7 @@ export class Cuckoo {
      * Record a key (decisions/0014). Computes a nonzero fingerprint and two candidate
      * buckets, scans i1 then i2 for an empty slot, and on a full pair KICKS a random
      * victim to its alternate bucket up to 500 times using a SINGLE scalar victim register
-     * (no scratch array -- zero allocation on the int path, string path only inlined -- H3). If 500 kicks are
+     * (no scratch array -- zero allocation on the int + string paths). If 500 kicks are
      * exhausted the table is at capacity and this THROWS (fail closed -- never a silent
      * drop, decisions/0014). Uniform surface: `add(key) -> void`, headroom via size/capacity.
      */
@@ -2438,20 +2308,18 @@ export class Cuckoo {
             if (!Number.isInteger(key) || key < INT_MIN || key > INT_MAX) {
                 throw new TypeError(INT_KEY_MSG + String(key));
             }
-            this._mixInt(key);
-            a = _HG[0];
-            fpsrc = _HG[1];
+            a = (fmix32((key ^ this._seed) | 0) >>> 0);
+            fpsrc = (fmix32((Math.imul(key | 0, 0x9e3779b1) ^ this._seed2) | 0) >>> 0);
         } else {
             a = this._hashKey(key);
-            fpsrc = fmix32(a ^ this._seed2);
+            fpsrc = (fmix32(a ^ this._seed2) >>> 0);
         }
         const store = this._store;
         const mask = this._mask;
         // Nonzero fingerprint: 0 is the empty-slot sentinel, so map 0 -> 1 (decisions/0014).
         let fp = fpsrc & this._fpMask;
         if (fp === 0) fp = 1;
-        _ckAlt(fp);                       // hash(fp) for the alt-bucket XOR -> _HG[2]
-        const hf = _HG[2];
+        const hf = (fmix32(Math.imul(fp, 0x5bd1e995)) >>> 0);   // hash(fp) for the alt-bucket XOR
         const i1 = a & mask;
         const i2 = (i1 ^ hf) & mask;
 
@@ -2486,8 +2354,8 @@ export class Cuckoo {
             store[idx] = victim;              // place the carried fingerprint (bucket i is its candidate)
             victim = e;                       // now carry the evicted one
             // The evicted fingerprint was in bucket i, so its alternate is (i XOR hash(fp)).
-            _ckAlt(victim);
-            i = (i ^ _HG[2]) & mask;
+            const vf = (fmix32(Math.imul(victim, 0x5bd1e995)) >>> 0);
+            i = (i ^ vf) & mask;
             const b2 = i << 2;
             if (store[b2] === 0) { store[b2] = victim; this._rng = r; this._count++; if (this._stats !== null) this._stats.adds++; return; }
             if (store[b2 + 1] === 0) { store[b2 + 1] = victim; this._rng = r; this._count++; if (this._stats !== null) this._stats.adds++; return; }
@@ -2516,7 +2384,7 @@ export class Cuckoo {
      * The query (decisions/0014). Returns true iff the key's fingerprint is present in
      * either candidate bucket. One-sided: NO false negatives for a key that is currently
      * present (decisions/0015 states the delete-misuse exception), only false POSITIVES
-     * bounded by ~2b/2^f. Zero-alloc on the int path (inline + non-inlined, both Smi widths -- see THE RULE); string path zero-alloc only inlined (H3); b=4 slots unrolled.
+     * bounded by ~2b/2^f. Zero allocation on the int + string paths; b=4 slots unrolled.
      */
     mightContain(key) {
         let a, fpsrc;
@@ -2524,19 +2392,17 @@ export class Cuckoo {
             if (!Number.isInteger(key) || key < INT_MIN || key > INT_MAX) {
                 throw new TypeError(INT_KEY_MSG + String(key));
             }
-            this._mixInt(key);
-            a = _HG[0];
-            fpsrc = _HG[1];
+            a = (fmix32((key ^ this._seed) | 0) >>> 0);
+            fpsrc = (fmix32((Math.imul(key | 0, 0x9e3779b1) ^ this._seed2) | 0) >>> 0);
         } else {
             a = this._hashKey(key);
-            fpsrc = fmix32(a ^ this._seed2);
+            fpsrc = (fmix32(a ^ this._seed2) >>> 0);
         }
         const store = this._store;
         const mask = this._mask;
         let fp = fpsrc & this._fpMask;
         if (fp === 0) fp = 1;
-        _ckAlt(fp);
-        const hf = _HG[2];
+        const hf = (fmix32(Math.imul(fp, 0x5bd1e995)) >>> 0);
         const i1 = a & mask;
         const i2 = (i1 ^ hf) & mask;
         const b1 = i1 << 2;
@@ -2571,19 +2437,17 @@ export class Cuckoo {
             if (!Number.isInteger(key) || key < INT_MIN || key > INT_MAX) {
                 throw new TypeError(INT_KEY_MSG + String(key));
             }
-            this._mixInt(key);
-            a = _HG[0];
-            fpsrc = _HG[1];
+            a = (fmix32((key ^ this._seed) | 0) >>> 0);
+            fpsrc = (fmix32((Math.imul(key | 0, 0x9e3779b1) ^ this._seed2) | 0) >>> 0);
         } else {
             a = this._hashKey(key);
-            fpsrc = fmix32(a ^ this._seed2);
+            fpsrc = (fmix32(a ^ this._seed2) >>> 0);
         }
         const store = this._store;
         const mask = this._mask;
         let fp = fpsrc & this._fpMask;
         if (fp === 0) fp = 1;
-        _ckAlt(fp);
-        const hf = _HG[2];
+        const hf = (fmix32(Math.imul(fp, 0x5bd1e995)) >>> 0);
         const i1 = a & mask;
         const i2 = (i1 ^ hf) & mask;
         let base = i1 << 2;
@@ -2599,29 +2463,14 @@ export class Cuckoo {
         return false;
     }
 
-    /** Smi-width-proof int mixer (ROADMAP 13, THE RULE). Runs two byte-identical fmix32
-     *  bodies in THIS frame, reading `this._seed` / `this._seed2` here (never passed as an
-     *  argument, which would box them), and writes the two base words to `_HG[0]` / `_HG[1]`.
-     *  Returns NOTHING -- no 32-bit word crosses the call boundary. The caller reads the
-     *  slots, applying `>>> 0` only where it consumes a word non-bitwise. Per-class (not a
-     *  shared helper) so the `_seed` loads stay monomorphic (ROADMAP 13 SETTLED). */
-    _mixInt(key) {
-        let h = (key ^ this._seed) | 0;
-        h ^= h >>> 16; h = Math.imul(h, 0x85ebca6b); h ^= h >>> 13; h = Math.imul(h, 0xc2b2ae35); h ^= h >>> 16;
-        _HG[0] = h;
-        let g = (Math.imul(key | 0, 0x9e3779b1) ^ this._seed2) | 0;
-        g ^= g >>> 16; g = Math.imul(g, 0x85ebca6b); g ^= g >>> 13; g = Math.imul(g, 0xc2b2ae35); g ^= g >>> 16;
-        _HG[1] = g;
-    }
-
     /**
      * Hash an arbitrary key to a 32-bit base (decisions/0001). A string hashes over its
      * code units (alloc-free); any other type is `String()`-encoded first (the honest
      * amortized caveat). Never called on the keys:'int' path.
      */
     _hashKey(key) {
-        if (typeof key === "string") return (hashStr(key, this._seed) >>> 0);
-        return (hashStr(String(key), this._seed) >>> 0);
+        if (typeof key === "string") return hashStr(key, this._seed);
+        return hashStr(String(key), this._seed);
     }
 
     // --- cold inspection ------------------------------------------------------
@@ -2914,24 +2763,18 @@ export class Quotient {
 
     // --- hot path (zero allocation; strict on keys:'int') ---------------------
 
-    /** The base hash for a key (decisions/0016), written to the module scratch `_HG[0]`;
-     *  returns NOTHING. This IS Quotient's Smi-width-proof int mixer (ROADMAP 13, THE RULE):
-     *  on the int path the fmix32 body runs in THIS frame (reading `this._seed` here, never
-     *  as an argument) so no 32-bit word crosses the call boundary. The string path writes
-     *  the (boxed -- H3) hashStr word to `_HG[0]` too, after `String()` has run. Quotient
-     *  needs ONE word (no `_seed2`). Every caller reads `_HG[0] & this._pMask`. */
+    /** The 32-bit base hash for a key (decisions/0016). keys:'int' mixes the int directly;
+     *  otherwise a string hashes over its code units (any other type is String()-encoded).
+     *  Masked to the fixed p = q + r bit budget by the caller. */
     _hash(key) {
         if (this._int) {
             if (!Number.isInteger(key) || key < INT_MIN || key > INT_MAX) {
                 throw new TypeError(INT_KEY_MSG + String(key));
             }
-            let h = (key ^ this._seed) | 0;
-            h ^= h >>> 16; h = Math.imul(h, 0x85ebca6b); h ^= h >>> 13; h = Math.imul(h, 0xc2b2ae35); h ^= h >>> 16;
-            _HG[0] = h;
-            return;
+            return (fmix32((key ^ this._seed) | 0) >>> 0);
         }
-        if (typeof key === "string") { _HG[0] = hashStr(key, this._seed); return; }
-        _HG[0] = hashStr(String(key), this._seed);
+        if (typeof key === "string") return hashStr(key, this._seed);
+        return hashStr(String(key), this._seed);
     }
 
     /**
@@ -2939,8 +2782,6 @@ export class Quotient {
      * allocation. Treats `q` as a home even if its is_occupied bit is not yet set (so the
      * insert path can locate where a brand-new run goes), by stopping the home walk at `q`.
      * Precondition for a QUERY: is_occupied(q) is set (checked by the caller).
-     * THE RULE (ROADMAP 13): `q` and the returned index are < nslots, so they are Smis (and
-     * never box across this boundary on a 31-bit-Smi engine) ONLY while nslots <= 2^30.
      */
     _runStart(q) {
         const store = this._store;
@@ -2963,15 +2804,14 @@ export class Quotient {
     /**
      * Record a key (decisions/0016). Splits the base hash into (quotient, remainder),
      * locates the run, inserts the remainder in sorted order, and shifts the cluster tail
-     * FORWARD. Zero-alloc on the int path (inline + non-inlined, both Smi widths -- see THE RULE); string path zero-alloc only inlined (H3). Fail-closed: an insert that would
+     * FORWARD. Zero allocation on the int + string paths. Fail-closed: an insert that would
      * push occupancy past the 0.90 ceiling, or whose shift would run off the end of the
      * slot array, THROWS a [lite-filter] Error and is a BYTE-IDENTICAL no-op (all mutations
      * happen AFTER the last throw point). A Quotient stores MULTIPLICITY (it does NOT dedup,
      * like Cuckoo), so re-adding the same key consumes another slot. add(key) -> void.
      */
     add(key) {
-        this._hash(key);
-        const hv = _HG[0] & this._pMask;
+        const hv = this._hash(key) & this._pMask;
         const r = hv & this._rMask;
         const q = (hv >>> this._r) & this._qMask;
         // Load-ceiling door: fail closed BEFORE any mutation (byte-identical no-op).
@@ -2988,8 +2828,6 @@ export class Quotient {
      * decisions/0016) and returns true. THROWS a byte-identical [lite-filter] no-op when the
      * linear shift would run off the end (no write happens before the throw check). The
      * shared insert core for add() and the cold merge/resize/delete-rebuild paths.
-     * THE RULE (ROADMAP 13): `q`, `r` and every slot index are < nslots -- Smis that do not box
-     * across this boundary on a 31-bit-Smi engine ONLY while nslots <= 2^30 (see THE RULE block).
      */
     _place(q, r) {
         const store = this._store;
@@ -3063,11 +2901,10 @@ export class Quotient {
      * The query (decisions/0016). Returns true iff the key's (quotient, remainder) is
      * stored. One-sided: NO false negatives for a currently-present key (decisions/0017
      * states the delete-misuse exception), only false POSITIVES bounded by the
-     * remainder-quantized rate. Zero-alloc on the int path (inline + non-inlined, both Smi widths -- see THE RULE); string path zero-alloc only inlined (H3).
+     * remainder-quantized rate. Zero allocation on the int + string paths.
      */
     mightContain(key) {
-        this._hash(key);
-        const hv = _HG[0] & this._pMask;
+        const hv = this._hash(key) & this._pMask;
         const r = hv & this._rMask;
         const q = (hv >>> this._r) & this._qMask;
         const store = this._store;
@@ -3106,8 +2943,7 @@ export class Quotient {
      * the other key. Only remove keys you actually inserted.
      */
     remove(key) {
-        this._hash(key);
-        const hv = _HG[0] & this._pMask;
+        const hv = this._hash(key) & this._pMask;
         const r = hv & this._rMask;
         const q = (hv >>> this._r) & this._qMask;
         const store = this._store;
@@ -3645,40 +3481,29 @@ export class XorFilter {
      * (one per segment), then tests `fp === (arr[h0] ^ arr[h1] ^ arr[h2])`. One-sided: a
      * key in the built set ALWAYS reads true (the complete-peel assignment guarantees it --
      * 0 false negatives); a never-added key reads true only on a fingerprint collision
-     * (~2^-fw). Zero-alloc on the int path (inline + non-inlined, both Smi widths -- see THE RULE); string path zero-alloc only inlined (H3); NO branch on build state (a
+     * (~2^-fw). Zero allocation on the int + string paths; NO branch on build state (a
      * returned instance is always fully built).
      */
     mightContain(key) {
         const bl = this._bl;
-        // Smi-width-proof by THE RULE's PRIMARY clause (ROADMAP 13): the four hash words are
-        // produced AND consumed in THIS one frame, so no 32-bit word crosses a call boundary
-        // (no _HG hand-off needed -- query is a single call site). The two base fmix32 bodies
-        // are inlined (reading this._seed / this._seed2 here, never as an argument); `t` and
-        // `fp` are two more inlined fmix32 bodies, each byte-identical to fmix32. The string
-        // path still calls hashStr (boxed per op -- H3, out of scope).
         let h, g;
         if (this._int) {
             if (!Number.isInteger(key) || key < INT_MIN || key > INT_MAX) {
                 throw new TypeError(INT_KEY_MSG + String(key));
             }
-            h = (key ^ this._seed) | 0;
-            h ^= h >>> 16; h = Math.imul(h, 0x85ebca6b); h ^= h >>> 13; h = Math.imul(h, 0xc2b2ae35); h ^= h >>> 16;
-            g = (Math.imul(key | 0, 0x9e3779b1) ^ this._seed2) | 0;
-            g ^= g >>> 16; g = Math.imul(g, 0x85ebca6b); g ^= g >>> 13; g = Math.imul(g, 0xc2b2ae35); g ^= g >>> 16;
+            h = (fmix32((key ^ this._seed) | 0) >>> 0);
+            g = (fmix32((Math.imul(key | 0, 0x9e3779b1) ^ this._seed2) | 0) >>> 0);
         } else {
             const s = (typeof key === "string") ? key : String(key);
             h = hashStr(s, this._seed);
             g = hashStr(s, this._seed2);
         }
-        let t = (h ^ g) | 0;
-        t ^= t >>> 16; t = Math.imul(t, 0x85ebca6b); t ^= t >>> 13; t = Math.imul(t, 0xc2b2ae35); t ^= t >>> 16;
-        let fpw = (h + g) | 0;
-        fpw ^= fpw >>> 16; fpw = Math.imul(fpw, 0x85ebca6b); fpw ^= fpw >>> 13; fpw = Math.imul(fpw, 0xc2b2ae35); fpw ^= fpw >>> 16;
+        const t = (fmix32((h ^ g) | 0) >>> 0);
+        const fp = (fmix32((h + g) | 0) >>> 0) & this._fpMask;
         const arr = this._fp;
-        const fp = fpw & this._fpMask;              // bitwise -> raw local
-        const h0 = (h >>> 0) % bl;                  // h / g / t consumed non-bitwise -> >>> 0
-        const h1 = bl + ((g >>> 0) % bl);
-        const h2 = 2 * bl + ((t >>> 0) % bl);
+        const h0 = h % bl;
+        const h1 = bl + (g % bl);
+        const h2 = 2 * bl + (t % bl);
         const hit = fp === (arr[h0] ^ arr[h1] ^ arr[h2]);
         if (this._stats !== null) {
             this._stats.queries++;
@@ -3873,7 +3698,7 @@ export class XorFilter {
  *
  * SHAPE (decisions/0022): a single fingerprint array over OVERLAPPING fuse segments.
  * A key touches 3 slots, one in each of 3 CONSECUTIVE segments; the first is chosen by
- * a multiply-shift (`mulhiU32(h >>> 16, h & 0xffff, scl)`), the next two are one/two segments further,
+ * a multiply-shift (`mulhiU32(h, scl)`), the next two are one/two segments further,
  * perturbed within-segment. The slots are assigned by peeling a 3-uniform hypergraph so
  * a key's three slots XOR to its fingerprint -- the same peel as XOR, tighter geometry.
  *
@@ -4022,47 +3847,36 @@ export class BinaryFuse {
 
     /**
      * The query (decisions/0022). Computes the key's fingerprint and its 3 slot positions --
-     * `mulhiU32(h >>> 16, h & 0xffff, scl)` selects the first segment base, `+segLen` / `+2*segLen` step to the
+     * `mulhiU32(h, scl)` selects the first segment base, `+segLen` / `+2*segLen` step to the
      * next two segments, each perturbed within-segment by `^ (g & segMask)` / `^ (t & segMask)`
      * -- then tests `fp === (arr[h0] ^ arr[h1] ^ arr[h2])`. One-sided: a key in the built set
      * ALWAYS reads true (the complete-peel assignment guarantees it -- 0 false negatives); a
      * never-added key reads true only on a fingerprint collision (~2^-fw). Zero allocation on
-     * the int path (string path only inlined -- H3); NO branch on build state.
+     * the int + string paths; NO branch on build state.
      */
     mightContain(key) {
         const segLen = this._segLen;
         const segMask = this._segMask;
         const scl = this._scl;
-        // Smi-width-proof by THE RULE's PRIMARY clause (ROADMAP 13): the four hash words are
-        // produced AND consumed in THIS one frame (no _HG hand-off -- query is a single call
-        // site). The two base fmix32 bodies are inlined (reading this._seed / this._seed2 here,
-        // never as an argument); `t` and `fp` are two more inlined fmix32 bodies. `h` crosses
-        // into mulhiU32 as two 16-bit halves (Smis), never a full word. The string path still
-        // calls hashStr (boxed per op -- H3, out of scope).
         let h, g;
         if (this._int) {
             if (!Number.isInteger(key) || key < INT_MIN || key > INT_MAX) {
                 throw new TypeError(INT_KEY_MSG + String(key));
             }
-            h = (key ^ this._seed) | 0;
-            h ^= h >>> 16; h = Math.imul(h, 0x85ebca6b); h ^= h >>> 13; h = Math.imul(h, 0xc2b2ae35); h ^= h >>> 16;
-            g = (Math.imul(key | 0, 0x9e3779b1) ^ this._seed2) | 0;
-            g ^= g >>> 16; g = Math.imul(g, 0x85ebca6b); g ^= g >>> 13; g = Math.imul(g, 0xc2b2ae35); g ^= g >>> 16;
+            h = (fmix32((key ^ this._seed) | 0) >>> 0);
+            g = (fmix32((Math.imul(key | 0, 0x9e3779b1) ^ this._seed2) | 0) >>> 0);
         } else {
             const s = (typeof key === "string") ? key : String(key);
             h = hashStr(s, this._seed);
             g = hashStr(s, this._seed2);
         }
-        let t = (h ^ g) | 0;
-        t ^= t >>> 16; t = Math.imul(t, 0x85ebca6b); t ^= t >>> 13; t = Math.imul(t, 0xc2b2ae35); t ^= t >>> 16;
-        let fpw = (h + g) | 0;
-        fpw ^= fpw >>> 16; fpw = Math.imul(fpw, 0x85ebca6b); fpw ^= fpw >>> 13; fpw = Math.imul(fpw, 0xc2b2ae35); fpw ^= fpw >>> 16;
+        const t = (fmix32((h ^ g) | 0) >>> 0);
+        const fp = (fmix32((h + g) | 0) >>> 0) & this._fpMask;
         const arr = this._fp;
-        const fp = fpw & this._fpMask;              // bitwise -> raw local
-        const hi = mulhiU32(h >>> 16, h & 0xffff, scl); // h as two Smi halves
+        const hi = mulhiU32(h, scl);
         const h0 = hi;
-        const h1 = (hi + segLen) ^ (g & segMask);   // g masked -> raw local
-        const h2 = (hi + 2 * segLen) ^ (t & segMask); // t masked -> raw local
+        const h1 = (hi + segLen) ^ (g & segMask);
+        const h2 = (hi + 2 * segLen) ^ (t & segMask);
         const hit = fp === (arr[h0] ^ arr[h1] ^ arr[h2]);
         if (this._stats !== null) {
             this._stats.queries++;
